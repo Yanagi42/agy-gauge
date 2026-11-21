@@ -1,0 +1,11 @@
+# Rust build outputs
+rust/target/
+*.exe
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
