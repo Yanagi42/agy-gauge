@@ -25,7 +25,7 @@ use crate::d2d::{
     theme_for, with_alpha, BarItem, D2DFactories, Fonts, Theme, WindowSurface,
 };
 use crate::stats::{
-    filter_snapshot, fmt_commas, fmt_compact, fmt_num, iso_week_key, iso_week_range_label,
+    filter_snapshot, fmt_commas, fmt_compact, fmt_gap, fmt_num, iso_week_key, iso_week_range_label,
     weekday_cn, workspace_short_name, AggregatedStats, DateScope, ScanSnapshot, SessionInfo,
     SessionSort, TokenCounts,
 };
@@ -132,6 +132,8 @@ pub struct DashboardView {
     max_scroll: usize,
     sessions_vis_rows: usize,
     hit_boxes: Vec<HitBox>,
+    plot_rects: Vec<D2D_RECT_F>,
+    last_hover_sig: (Option<usize>, bool),
     copied_until: Option<Instant>,
     session_copied_until: Option<Instant>,
     cached_sessions: Vec<SessionInfo>,
@@ -173,6 +175,8 @@ impl DashboardView {
             max_scroll: 0,
             sessions_vis_rows: 6,
             hit_boxes: Vec::new(),
+            plot_rects: Vec::new(),
+            last_hover_sig: (None, false),
             copied_until: None,
             session_copied_until: None,
             cached_sessions: Vec::new(),
@@ -263,6 +267,25 @@ impl DashboardView {
             return false;
         };
         self.hit_boxes.iter().any(|hb| hit_rect(&hb.rect, mx, my))
+    }
+
+    /// Updates cursor position and returns `true` only when hover visuals actually change
+    /// (entering/leaving a hitbox or moving inside/leaving an interactive chart plot).
+    pub fn on_mouse_move(&mut self, x: f32, y: f32) -> bool {
+        self.mouse_dip = Some((x, y));
+        let hb_idx = self.hit_boxes.iter().rposition(|hb| hit_rect(&hb.rect, x, y));
+        let in_plot = self.plot_rects.iter().any(|r| hit_rect(r, x, y));
+        let sig = (hb_idx, in_plot);
+        let changed = in_plot || self.last_hover_sig.1 || sig != self.last_hover_sig;
+        self.last_hover_sig = sig;
+        changed
+    }
+
+    pub fn on_mouse_leave(&mut self) -> bool {
+        self.mouse_dip = None;
+        let had_hover = self.last_hover_sig.0.is_some() || self.last_hover_sig.1;
+        self.last_hover_sig = (None, false);
+        had_hover
     }
 
     pub fn hit_test_click(&self, x: f32, y: f32) -> Option<ClickAction> {
@@ -364,10 +387,18 @@ impl DashboardView {
                 if let Some(s) = sel {
                     let ws = s.workspace_short();
                     let cp = s.compaction_count();
+                    let (misses, miss_tok) = s.cache_miss_stats();
                     let range = match (s.first_time, s.last_time) {
                         (Some(a), Some(b)) => format!("{} -> {}", a.format("%m/%d %H:%M"), b.format("%H:%M")),
                         _ => "-".to_string(),
                     };
+                    let mut events = String::new();
+                    if cp > 0 {
+                        events.push_str(&format!(" · {}次压缩", cp));
+                    }
+                    if misses > 0 {
+                        events.push_str(&format!(" · {}次缓存未命中(重灌{})", misses, fmt_compact(miss_tok)));
+                    }
                     let text = format!(
                         "AGY 会话明细 · {}\n- ID: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
                         s.title,
@@ -376,7 +407,7 @@ impl DashboardView {
                         s.primary_model(),
                         if ws.is_empty() { String::new() } else { format!(" | 项目: {}", ws) },
                         s.counts.calls,
-                        if cp > 0 { format!(" ({}次压缩)", cp) } else { String::new() },
+                        events,
                         s.counts.cache_hit_rate(),
                         fmt_commas(s.counts.input_tokens),
                         fmt_commas(s.counts.cache_read_tokens),
@@ -490,6 +521,7 @@ impl DashboardView {
         }
 
         self.hit_boxes.clear();
+        self.plot_rects.clear();
         let theme = theme_for(light_theme);
 
         let Some(surface) = self.surface.take() else {
@@ -902,6 +934,7 @@ impl DashboardView {
         draw_text(rt, chart_title, &fonts.ui_section, rect_f(tl.left + 16.0, tl.top + 11.0, 130.0, 20.0), theme.text);
         self.draw_chart_legend_and_toggle(rt, fonts, theme, tl);
         let tl_plot = rect_f(tl.left + 10.0, tl.top + 38.0, left_w - 20.0, top_h - 46.0);
+        self.plot_rects.push(tl_plot);
         let tl_slots = draw_editorial_bars(rt, fonts, theme, tl_plot, &bars, self.fresh_only, self.mouse_dip, empty_msg);
         for (rect, maybe_day) in tl_slots.into_iter().zip(bar_days.into_iter()) {
             if let Some(day) = maybe_day {
@@ -1255,6 +1288,7 @@ impl DashboardView {
         self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
+        self.plot_rects.push(plot);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
         let days_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_day.iter().collect();
@@ -1378,6 +1412,7 @@ impl DashboardView {
         self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
+        self.plot_rects.push(plot);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
         match self.weekly_mode {
@@ -1698,7 +1733,7 @@ impl DashboardView {
             let hdr = format!("逐轮剖析 · {}", s.title);
             draw_text(rt, &hdr, &fonts.ui_section, rect_f(bot_c.left + 16.0, bot_c.top + 9.0, (bw - 320.0).max(160.0), 19.0), theme.text);
             let mut meta = format!(
-                "{} 轮  ·  缓存命中 {:.1}%  ·  非缓存 {}  ·  总计 {}  ·  峰值Ctx {}",
+                "{}轮 · 命中 {:.1}% · 非缓存 {} · 总计 {} · 峰值Ctx {}",
                 s.turns.len(),
                 s.counts.cache_hit_rate(),
                 fmt_compact(s.counts.non_cached_tokens()),
@@ -1707,11 +1742,15 @@ impl DashboardView {
             );
             let cp = s.compaction_count();
             if cp > 0 {
-                meta.push_str(&format!("  ·  {} 次压缩", cp));
+                meta.push_str(&format!(" · {}压缩", cp));
+            }
+            let (misses, _) = s.cache_miss_stats();
+            if misses > 0 {
+                meta.push_str(&format!(" · {}未命中", misses));
             }
             let ws = s.workspace_short();
             if !ws.is_empty() {
-                meta.push_str(&format!("  ·  {}", ws));
+                meta.push_str(&format!(" · {}", ws));
             }
             draw_text(rt, &meta, &fonts.mono_small, rect_f(bot_c.left + 16.0, bot_c.top + 28.0, (bw - 96.0).max(160.0), 15.0), theme.sub);
             let s_copied = self.session_copied_until.map(|t| Instant::now() < t).unwrap_or(false);
@@ -1727,16 +1766,34 @@ impl DashboardView {
             );
             self.draw_chart_legend_and_toggle(rt, fonts, theme, bot_c);
 
+            let mut prev_ts: Option<chrono::DateTime<chrono::Utc>> = None;
             let bars: Vec<BarItem> = s
                 .turns
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(idx, t)| {
                     let lbl = if t.step_index >= 0 { format!("#{}", t.step_index) } else { "-".into() };
                     let ts = t.timestamp_utc.map(|u| u.with_timezone(&Local).format("%H:%M:%S").to_string()).unwrap_or_else(|| "-".into());
+                    let gap_s = match (prev_ts, t.timestamp_utc) {
+                        (Some(p), Some(cur)) => {
+                            let g = fmt_gap((cur - p).num_seconds());
+                            if g.is_empty() { String::new() } else { format!(" · 隔 {}", g) }
+                        }
+                        _ => String::new(),
+                    };
+                    if t.timestamp_utc.is_some() {
+                        prev_ts = t.timestamp_utc;
+                    }
+                    let is_miss = idx > 0
+                        && !t.is_checkpoint
+                        && t.total_input() >= 30_000
+                        && t.cache_hit_rate() < 50.0;
                     let step_hdr = if t.is_checkpoint {
-                        format!("Step {} · 上下文压缩 ({})", lbl, ts)
+                        format!("Step {} · 上下文压缩 ({}{})", lbl, ts, gap_s)
+                    } else if is_miss {
+                        format!("Step {} · 缓存未命中 ({}{})", lbl, ts, gap_s)
                     } else {
-                        format!("Step {} ({})", lbl, ts)
+                        format!("Step {} ({}{})", lbl, ts, gap_s)
                     };
                     BarItem {
                         label: lbl.clone(),
@@ -1756,6 +1813,7 @@ impl DashboardView {
                 })
                 .collect();
             let plot = rect_f(bot_c.left + 12.0, bot_c.top + 48.0, bw - 24.0, (bot_c.bottom - bot_c.top - 56.0).max(60.0));
+            self.plot_rects.push(plot);
             let _ = draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "无逐轮记录");
         } else {
             draw_text(rt, "点击上方会话查看逐轮上下文增长趋势", &fonts.ui_reg_center, bot_c, theme.muted);
@@ -1766,7 +1824,7 @@ impl DashboardView {
 
     #[allow(clippy::too_many_arguments)]
     fn draw_system_tab(
-        &self,
+        &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
         fonts: &Fonts,
@@ -1799,6 +1857,7 @@ impl DashboardView {
         let pb_y = chart_c.bottom - 18.0;
         let pw = (pr - pl).max(40.0);
         let ph = (pb_y - pt_y).max(40.0);
+        self.plot_rects.push(rect_f(pl, pt_y, pw, ph));
 
         for pct in [0, 50, 100] {
             let y = pb_y - (pct as f32 / 100.0) * ph;
@@ -2074,5 +2133,31 @@ mod tests {
             assert_eq!(DateScope::from_u8(sc.to_u8()), sc);
         }
         assert_eq!(DateScope::from_u8(99), DateScope::Today);
+    }
+
+    #[test]
+    fn test_smart_hover_repaint_gating() {
+        let mut view = DashboardView::new(false, DateScope::Today);
+        view.hit_boxes.push(HitBox {
+            rect: rect_f(10.0, 10.0, 50.0, 20.0),
+            action: ClickAction::Refresh,
+        });
+        view.plot_rects.push(rect_f(100.0, 100.0, 200.0, 100.0));
+
+        // Moving over blank space does not repaint
+        assert!(!view.on_mouse_move(2.0, 2.0));
+        assert!(!view.on_mouse_move(5.0, 5.0));
+        // Entering hitbox repaints once; sliding inside same hitbox does NOT repaint
+        assert!(view.on_mouse_move(20.0, 15.0));
+        assert!(!view.on_mouse_move(30.0, 15.0));
+        // Leaving hitbox repaints once
+        assert!(view.on_mouse_move(2.0, 2.0));
+        assert!(!view.on_mouse_move(3.0, 3.0));
+        // Moving inside chart plot always repaints for smooth tooltips/crosshair
+        assert!(view.on_mouse_move(150.0, 150.0));
+        assert!(view.on_mouse_move(160.0, 150.0));
+        // Leaving chart plot repaints once to clear tooltip
+        assert!(view.on_mouse_move(5.0, 5.0));
+        assert!(!view.on_mouse_leave());
     }
 }

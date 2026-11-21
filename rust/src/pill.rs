@@ -35,6 +35,7 @@ pub const CMD_TOGGLE_HUMAN: u32 = 1006;
 pub const CMD_REDOCK: u32 = 1007;
 pub const CMD_QUIT: u32 = 1008;
 pub const CMD_MONITOR_BASE: u32 = 1100;
+pub const CMD_METRIC_BASE: u32 = 1200; // 1200=TodayTotal, 1201=TodayNonCached, 1202=ActiveCtx
 
 const SHADOW_PAD: f32 = 10.0;
 const PILL_H_STD: f32 = 30.0;
@@ -88,6 +89,7 @@ impl PillRenderer {
         hovered: bool,
         dash_open: bool,
         recent_activity: bool,
+        pill_metric: u8,
         snapshot: &ScanSnapshot,
         telemetry: &SystemTelemetry,
     ) -> Result<(i32, i32)> {
@@ -142,8 +144,19 @@ impl PillRenderer {
             .get(&today_key)
             .copied()
             .unwrap_or_default();
-        // Always stay consistent with Dashboard's "今日" scope (show 0 on a fresh day)
-        let tok_val = fmt_compact(today_c.total_tokens());
+        let (tok_val, ctx_warn) = match pill_metric {
+            1 => (format!("Δ{}", fmt_compact(today_c.non_cached_tokens())), false),
+            2 => {
+                let ctx = snapshot.sessions.first().map(|s| s.latest_context()).unwrap_or(0);
+                let label = if mini {
+                    fmt_compact(ctx)
+                } else {
+                    format!("C {}", fmt_compact(ctx))
+                };
+                (label, ctx >= 400_000)
+            }
+            _ => (fmt_compact(today_c.total_tokens()), false),
+        };
 
         let theme = theme_for(light_theme);
         if let Some(surface) = &self.surface {
@@ -159,6 +172,7 @@ impl PillRenderer {
                     hovered,
                     dash_open,
                     recent_activity,
+                    ctx_warn,
                     &tok_val,
                     telemetry,
                 );
@@ -180,6 +194,7 @@ fn draw_pill_capsule(
     hovered: bool,
     dash_open: bool,
     recent_activity: bool,
+    ctx_warn: bool,
     tok_val: &str,
     telemetry: &SystemTelemetry,
 ) {
@@ -227,8 +242,14 @@ fn draw_pill_capsule(
 
     let cy = y + ph * 0.5;
     let dot_x = x + 13.0;
-    let dot_col = if recent_activity { theme.accent } else { theme.sage };
-    if recent_activity || hovered || dash_open {
+    let dot_col = if recent_activity {
+        theme.accent
+    } else if ctx_warn {
+        theme.warn
+    } else {
+        theme.sage
+    };
+    if recent_activity || ctx_warn || hovered || dash_open {
         fill_circle(rt, dot_x, cy, 5.0, with_alpha(dot_col, 0.22));
     }
     fill_circle(rt, dot_x, cy, 2.6, dot_col);
@@ -317,6 +338,7 @@ fn draw_pill_capsule(
     let _ = &fonts.pill_micro;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show_context_menu(
     hwnd: HWND,
     dash_open: bool,
@@ -325,6 +347,7 @@ pub fn show_context_menu(
     topmost: bool,
     human: bool,
     current_monitor: usize,
+    pill_metric: u8,
 ) -> Option<u32> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
@@ -361,6 +384,20 @@ pub fn show_context_menu(
             w!("简写数字 (K/M)"),
         );
 
+        let mut metric_menu = None;
+        if let Ok(mm) = CreatePopupMenu() {
+            for (idx, lbl) in [
+                (0u8, w!("今日总 Token")),
+                (1u8, w!("今日非缓存增量 (Δ)")),
+                (2u8, w!("活跃会话上下文 (Ctx)")),
+            ] {
+                let flag = MF_STRING | if pill_metric == idx { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(mm, flag, (CMD_METRIC_BASE as usize) + idx as usize, lbl);
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, mm.0 as usize, w!("胶囊显示指标"));
+            metric_menu = Some(mm);
+        }
+
         let monitors = get_monitors();
         let mut sub_menu = None;
         if monitors.len() > 1 {
@@ -393,6 +430,9 @@ pub fn show_context_menu(
         );
         if let Some(sub) = sub_menu {
             let _ = DestroyMenu(sub);
+        }
+        if let Some(mm) = metric_menu {
+            let _ = DestroyMenu(mm);
         }
         let _ = DestroyMenu(menu);
         if cmd.0 != 0 {

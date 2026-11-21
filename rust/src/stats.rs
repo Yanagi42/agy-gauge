@@ -141,6 +141,41 @@ impl SessionInfo {
     pub fn compaction_count(&self) -> usize {
         self.turns.iter().filter(|t| t.is_checkpoint).count()
     }
+
+    /// Count & uncached input volume of significant multi-turn prompt cache misses (>=30K ctx, <50% hit).
+    pub fn cache_miss_stats(&self) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut uncached = 0u64;
+        for (idx, t) in self.turns.iter().enumerate() {
+            if idx == 0 || t.is_checkpoint {
+                continue;
+            }
+            let ctx = t.total_input();
+            if ctx >= 30_000 && t.cache_hit_rate() < 50.0 {
+                count += 1;
+                uncached = uncached.saturating_add(t.input_tokens);
+            }
+        }
+        (count, uncached)
+    }
+
+    /// Current live context size (most recent turn's total input tokens).
+    pub fn latest_context(&self) -> u64 {
+        self.turns.last().map(TurnRecord::total_input).unwrap_or(0)
+    }
+}
+
+pub fn fmt_gap(secs: i64) -> String {
+    if secs < 0 {
+        return String::new();
+    }
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 pub fn workspace_short_name(workspace: &str) -> String {
@@ -1067,5 +1102,58 @@ mod tests {
         assert_eq!(s.workspace_short(), "agent-home");
         assert_eq!(s.compaction_count(), 1);
         assert_eq!(workspace_short_name("(未知工作区)"), "");
+        assert_eq!(fmt_gap(42), "42s");
+        assert_eq!(fmt_gap(250), "4m10s");
+        assert_eq!(fmt_gap(3725), "1h02m");
+    }
+
+    #[test]
+    fn test_cache_miss_stats() {
+        let s = SessionInfo {
+            conversation_id: "m".into(),
+            title: "m".into(),
+            workspace: "".into(),
+            turns: vec![
+                // Turn 0 cold start is not counted as a multi-turn miss
+                TurnRecord {
+                    step_index: 1,
+                    timestamp_utc: None,
+                    model: "m".into(),
+                    is_checkpoint: false,
+                    input_tokens: 40_000,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 500,
+                },
+                // Normal high hit
+                TurnRecord {
+                    step_index: 2,
+                    timestamp_utc: None,
+                    model: "m".into(),
+                    is_checkpoint: false,
+                    input_tokens: 2_000,
+                    cache_read_tokens: 40_000,
+                    cache_write_tokens: 0,
+                    output_tokens: 500,
+                },
+                // Big cache miss (>=30K ctx, <50% hit)
+                TurnRecord {
+                    step_index: 3,
+                    timestamp_utc: None,
+                    model: "m".into(),
+                    is_checkpoint: false,
+                    input_tokens: 180_000,
+                    cache_read_tokens: 5_000,
+                    cache_write_tokens: 0,
+                    output_tokens: 800,
+                },
+            ],
+            counts: TokenCounts::default(),
+            models: BTreeSet::new(),
+            first_time: None,
+            last_time: None,
+        };
+        assert_eq!(s.cache_miss_stats(), (1, 180_000));
+        assert_eq!(s.latest_context(), 185_000);
     }
 }

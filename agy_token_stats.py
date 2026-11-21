@@ -1002,24 +1002,52 @@ def render_text(
     # Single-session detailed turn-by-turn view
     if session_filter and len(report.sessions) == 1:
         s = report.sessions[0]
+        compactions = sum(1 for t in s.turns if t.step_type == "CHECKPOINT")
+        miss_cnt = 0
+        miss_tok = 0
+        for idx, t in enumerate(s.turns):
+            if idx > 0 and t.step_type != "CHECKPOINT" and t.total_input_tokens >= 30_000 and t.cache_hit_rate < 50.0:
+                miss_cnt += 1
+                miss_tok += t.input_tokens
         out.append("")
         out.append(_style(f"Session Detail: {s.conversation_id}", "1;33", color))
         out.append(f"  Title     : {s.title}")
         out.append(f"  Workspace : {s.workspace}")
         out.append(f"  Range     : {_fmt_time_sec(s.first_time)} -> {_fmt_time_sec(s.last_time)}")
+        if compactions or miss_cnt:
+            parts = []
+            if compactions:
+                parts.append(f"Compactions={compactions}")
+            if miss_cnt:
+                parts.append(f"CacheMisses={miss_cnt} ({_fmt_num(miss_tok, human)} uncached)")
+            out.append(f"  Events    : {', '.join(parts)}")
         out.append("")
-        t_headers = ["Step", "Time", "Model", "Input(new)", "CacheRead"]
-        t_aligns = ["right", "left", "left", "right", "right"]
+        t_headers = ["Step", "Time", "Gap", "Model", "Input(new)", "CacheRead"]
+        t_aligns = ["right", "left", "right", "left", "right", "right"]
         if include_cw:
             t_headers.append("CacheWrite")
             t_aligns.append("right")
         t_headers.extend(["Output", "CtxSize", "Hit%"])
         t_aligns.extend(["right", "right", "right"])
         t_rows = []
+        prev_ts: dt.datetime | None = None
         for t in s.turns:
+            if prev_ts is not None and t.timestamp is not None:
+                sec = max(0, int((t.timestamp - prev_ts).total_seconds()))
+                if sec < 60:
+                    gap_str = f"{sec}s"
+                elif sec < 3600:
+                    gap_str = f"{sec // 60}m{sec % 60:02d}s"
+                else:
+                    gap_str = f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+            else:
+                gap_str = "-"
+            if t.timestamp is not None:
+                prev_ts = t.timestamp
             r = [
                 str(t.step_index) if t.step_index >= 0 else "-",
                 _fmt_time_sec(t.timestamp),
+                gap_str,
                 t.model,
                 _fmt_num(t.input_tokens, human),
                 _fmt_num(t.cache_read_tokens, human),

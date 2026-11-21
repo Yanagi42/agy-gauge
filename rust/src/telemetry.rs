@@ -42,6 +42,7 @@ pub struct UserPrefs {
     pub monitor_index: usize,
     pub fresh_only: bool,
     pub date_scope: u8,
+    pub pill_metric: u8,
     pub custom_pos: Option<(i32, i32)>,
 }
 
@@ -55,6 +56,7 @@ impl Default for UserPrefs {
             monitor_index: 0,
             fresh_only: false,
             date_scope: 0, // Default to Today (matches corner pill)
+            pill_metric: 0, // 0=TodayTotal, 1=TodayNonCached, 2=ActiveSessionCtx
             custom_pos: None,
         }
     }
@@ -106,6 +108,9 @@ pub fn load_user_prefs() -> UserPrefs {
     if let Some(v) = reg_read_u32(w!("date_scope")) {
         p.date_scope = v.min(3) as u8;
     }
+    if let Some(v) = reg_read_u32(w!("pill_metric")) {
+        p.pill_metric = v.min(2) as u8;
+    }
     if reg_read_u32(w!("has_custom_pos")).unwrap_or(0) != 0 {
         if let (Some(x), Some(y)) = (reg_read_u32(w!("pos_x")), reg_read_u32(w!("pos_y"))) {
             p.custom_pos = Some((x as i32, y as i32));
@@ -136,7 +141,7 @@ pub fn save_user_prefs(p: &UserPrefs) {
             Some((x, y)) => (1u32, x as u32, y as u32),
             None => (0u32, 0u32, 0u32),
         };
-        let entries: [(PCWSTR, u32); 10] = [
+        let entries: [(PCWSTR, u32); 11] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(p.mini)),
             (w!("topmost"), u32::from(p.topmost)),
@@ -144,6 +149,7 @@ pub fn save_user_prefs(p: &UserPrefs) {
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
             (w!("date_scope"), p.date_scope as u32),
+            (w!("pill_metric"), p.pill_metric as u32),
             (w!("has_custom_pos"), has_pos),
             (w!("pos_x"), px),
             (w!("pos_y"), py),

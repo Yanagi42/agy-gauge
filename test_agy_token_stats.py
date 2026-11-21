@@ -278,6 +278,25 @@ class AgyTokenStatsTests(unittest.TestCase):
             # Multi-turn s1 comes ahead of single-turn s2 on --sort hit
             self.assertEqual(ordered_hit[0].conversation_id, s1.conversation_id)
 
+            # Single-session turn detail shows Gap column and Compactions summary
+            rep_one = mod.scan_usage(root, tz=tz_utc, session_filter="11111111")
+            txt_one = mod.render_text(
+                rep_one,
+                mod.aggregate_sessions(rep_one.sessions),
+                view="summary",
+                sort_by="time",
+                limit=10,
+                human=True,
+                tz_label="UTC",
+                since=None,
+                until=None,
+                model_filter=None,
+                session_filter="11111111",
+                color=False,
+            )
+            self.assertIn("Compactions=1", txt_one)
+            self.assertIn("Gap", txt_one)
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}

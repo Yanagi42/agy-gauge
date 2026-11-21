@@ -48,8 +48,9 @@ const WM_PRINTCLIENT: u32 = 0x0318;
 use d2d::{theme_for, D2DFactories, Fonts};
 use dashboard::{BreakdownMode, ClickAction, DashboardView, Tab, WeeklyMode};
 use pill::{
-    show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_QUIT, CMD_REDOCK,
-    CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_MINI, CMD_TOGGLE_TOPMOST,
+    show_context_menu, PillRenderer, CMD_METRIC_BASE, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_QUIT,
+    CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_MINI,
+    CMD_TOGGLE_TOPMOST,
 };
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
 use telemetry::{
@@ -85,6 +86,7 @@ struct AppState {
     human: bool,
     fresh_only: bool,
     date_scope: DateScope,
+    pill_metric: u8,
     monitor_index: usize,
     last_total_tokens: u64,
     recent_activity_until: Option<Instant>,
@@ -360,6 +362,7 @@ impl AppState {
             monitor_index: self.monitor_index,
             fresh_only: self.dash_view.as_ref().map(|v| v.fresh_only).unwrap_or(self.fresh_only),
             date_scope: self.dash_view.as_ref().map(|v| v.scope).unwrap_or(self.date_scope).to_u8(),
+            pill_metric: self.pill_metric,
             custom_pos: self.custom_pos,
         }
     }
@@ -368,6 +371,7 @@ impl AppState {
         let p = self.to_prefs();
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
+        self.pill_metric = p.pill_metric;
         save_user_prefs(&p);
         broadcast_prefs_sync(sender);
     }
@@ -380,6 +384,7 @@ impl AppState {
         self.monitor_index = p.monitor_index;
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
+        self.pill_metric = p.pill_metric;
         self.custom_pos = p.custom_pos;
         if let Some(view) = &mut self.dash_view {
             view.fresh_only = p.fresh_only;
@@ -411,6 +416,7 @@ impl AppState {
             self.pill_hovered,
             self.dash_visible,
             recent,
+            self.pill_metric,
             &self.snapshot,
             &self.telemetry,
         ) {
@@ -570,14 +576,14 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_RBUTTONUP => {
             let state = with_app(|app| {
-                (app.mini, app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible)
+                (app.mini, app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible, app.pill_metric)
             });
-            if let Some((mini, light, topmost, human, mon, local_vis)) = state {
+            if let Some((mini, light, topmost, human, mon, local_vis, metric)) = state {
                 let dash_open = local_vis
                     || FindWindowW(w!("AgyTokenDashboardClass"), None)
                         .map(|h| !h.0.is_null() && IsWindowVisible(h).as_bool())
                         .unwrap_or(false);
-                if let Some(cmd) = show_context_menu(hwnd, dash_open, mini, light, topmost, human, mon) {
+                if let Some(cmd) = show_context_menu(hwnd, dash_open, mini, light, topmost, human, mon, metric) {
                     match cmd {
                         CMD_OPEN_DETAIL => toggle_dashboard_safe(),
                         CMD_REFRESH => {
@@ -622,6 +628,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         CMD_QUIT => {
                             destroy_dashboard_safe();
                             PostQuitMessage(0);
+                        }
+                        c if (CMD_METRIC_BASE..CMD_METRIC_BASE + 3).contains(&c) => {
+                            with_app(|app| {
+                                app.pill_metric = (c - CMD_METRIC_BASE) as u8;
+                                app.redraw_pill();
+                                app.persist_and_sync(hwnd);
+                            });
                         }
                         c if c >= CMD_MONITOR_BASE => {
                             with_app(|app| {
@@ -703,17 +716,19 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let x_px = (lparam.0 & 0xFFFF) as i16 as f32;
             let y_px = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
             let scale = window_dpi_scale(hwnd);
-            let need_track = with_app(|app| {
+            let (need_track, need_paint) = with_app(|app| {
                 let need = !app.dash_tracking;
                 if need {
                     app.dash_tracking = true;
                 }
-                if let Some(view) = &mut app.dash_view {
-                    view.mouse_dip = Some((x_px / scale, y_px / scale));
-                }
-                need
+                let paint = app
+                    .dash_view
+                    .as_mut()
+                    .map(|v| v.on_mouse_move(x_px / scale, y_px / scale))
+                    .unwrap_or(false);
+                (need, paint)
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false));
             if need_track {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -723,17 +738,20 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 };
                 let _ = TrackMouseEvent(&mut tme);
             }
-            let _ = InvalidateRect(hwnd, None, false);
+            if need_paint {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
-            with_app(|app| {
+            let need_paint = with_app(|app| {
                 app.dash_tracking = false;
-                if let Some(view) = &mut app.dash_view {
-                    view.mouse_dip = None;
-                }
-            });
-            let _ = InvalidateRect(hwnd, None, false);
+                app.dash_view.as_mut().map(|v| v.on_mouse_leave()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+            if need_paint {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -1126,6 +1144,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             human: prefs.human,
             fresh_only: prefs.fresh_only,
             date_scope: DateScope::from_u8(prefs.date_scope),
+            pill_metric: prefs.pill_metric,
             monitor_index: prefs.monitor_index,
             last_total_tokens: initial_total,
             recent_activity_until: None,

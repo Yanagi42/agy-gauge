@@ -937,7 +937,15 @@ pub fn draw_editorial_bars(
         let lines = &items[idx].tooltip;
         if !lines.is_empty() {
             let line_h = 16.0;
-            let box_w = 246.0;
+            let max_units: f32 = lines
+                .iter()
+                .map(|s| {
+                    s.chars()
+                        .map(|c| if c.is_ascii() { 1.0_f32 } else { 1.85_f32 })
+                        .sum::<f32>()
+                })
+                .fold(0.0, f32::max);
+            let box_w = (max_units * 6.8 + 28.0).clamp(224.0, (plot_bounds.right - plot_bounds.left - 16.0).min(360.0));
             let box_h = lines.len() as f32 * line_h + 16.0;
             let bar_r = plot_l + (idx as f32 + 1.0) * slot_w;
             let bar_l = plot_l + idx as f32 * slot_w;
