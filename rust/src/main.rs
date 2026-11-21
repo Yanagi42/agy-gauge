@@ -20,21 +20,23 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
     LoadCursorW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
-    LR_DEFAULTCOLOR, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -48,9 +50,10 @@ use pill::{
 };
 use stats::{IncrementalScanner, ScanSnapshot};
 use telemetry::{
-    apply_win11_frame, broadcast_prefs_sync, enable_dpi_awareness, get_work_area, load_user_prefs,
-    read_self_private_mb, save_user_prefs, window_dpi_scale, SingleInstanceGuard, SystemTelemetry,
-    UserPrefs, WM_APP_SYNC_PREFS,
+    apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, enable_dpi_awareness,
+    get_work_area, load_user_prefs, monitor_index_for_point, read_self_private_mb,
+    save_user_prefs, window_dpi_scale, SingleInstanceGuard, SystemTelemetry, UserPrefs,
+    WM_APP_SYNC_PREFS,
 };
 
 const TIMER_TELEMETRY: usize = 1;
@@ -65,6 +68,12 @@ struct AppState {
 
     pill_hwnd: HWND,
     pill_renderer: PillRenderer,
+    pill_pos: (i32, i32),
+    custom_pos: Option<(i32, i32)>,
+    drag_down: bool,
+    dragging: bool,
+    drag_start_cursor: (i32, i32),
+    drag_start_win: (i32, i32),
     pill_hovered: bool,
     pill_tracking: bool,
     mini: bool,
@@ -76,6 +85,7 @@ struct AppState {
     last_total_tokens: u64,
     recent_activity_until: Option<Instant>,
 
+    dash_owner_hwnd: Option<HWND>,
     dash_hwnd: Option<HWND>,
     dash_view: Option<DashboardView>,
     dashboard_only: bool,
@@ -183,6 +193,30 @@ fn create_dashboard_window_local() {
 
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default();
+        // Use a hidden WS_EX_TOOLWINDOW owner so the dashboard keeps its full native Win11
+        // rounded titlebar & controls while NEVER adding a button to the Windows taskbar!
+        let owner_hwnd = with_app(|app| app.dash_owner_hwnd).flatten().or_else(|| {
+            let h = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("AgyTokenOwnerClass"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                hinst,
+                None,
+            )
+            .ok();
+            if let Some(oh) = h {
+                with_app(|app| app.dash_owner_hwnd = Some(oh));
+            }
+            h
+        });
+
         if let Ok(hwnd) = CreateWindowExW(
             Default::default(),
             w!("AgyTokenDashboardClass"),
@@ -192,7 +226,7 @@ fn create_dashboard_window_local() {
             wy,
             ww,
             wh,
-            None,
+            owner_hwnd.unwrap_or_default(),
             None,
             hinst,
             None,
@@ -211,11 +245,11 @@ fn create_dashboard_window_local() {
 }
 
 fn close_dashboard_safe() {
-    let (hwnd, dash_only) = with_app(|app| {
+    let (hwnd, owner_hwnd, dash_only) = with_app(|app| {
         app.dash_view = None;
-        (app.dash_hwnd.take(), app.dashboard_only)
+        (app.dash_hwnd.take(), app.dash_owner_hwnd.take(), app.dashboard_only)
     })
-    .unwrap_or((None, false));
+    .unwrap_or((None, None, false));
     if let Some(h) = hwnd {
         unsafe {
             let _ = DestroyWindow(h);
@@ -227,6 +261,11 @@ fn close_dashboard_safe() {
                     let _ = PostMessageW(ext, WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
             }
+        }
+    }
+    if let Some(oh) = owner_hwnd {
+        unsafe {
+            let _ = DestroyWindow(oh);
         }
     }
     if dash_only {
@@ -268,6 +307,7 @@ impl AppState {
             human: self.human,
             monitor_index: self.monitor_index,
             fresh_only: self.dash_view.as_ref().map(|v| v.fresh_only).unwrap_or(self.fresh_only),
+            custom_pos: self.custom_pos,
         }
     }
 
@@ -285,10 +325,12 @@ impl AppState {
         self.human = p.human;
         self.monitor_index = p.monitor_index;
         self.fresh_only = p.fresh_only;
+        self.custom_pos = p.custom_pos;
         if let Some(view) = &mut self.dash_view {
             view.fresh_only = p.fresh_only;
         }
     }
+
     fn redraw_pill(&mut self) {
         if self.dashboard_only || self.pill_hwnd.0.is_null() {
             return;
@@ -298,19 +340,22 @@ impl AppState {
             .recent_activity_until
             .map(|t| Instant::now() < t)
             .unwrap_or(false);
-        let _ = self.pill_renderer.render(
+        if let Ok(pos) = self.pill_renderer.render(
             &self.factories,
             &self.fonts,
             self.pill_hwnd,
             dpi,
             self.monitor_index,
+            self.custom_pos,
             self.mini,
             self.light_theme,
             self.pill_hovered,
             recent,
             &self.snapshot,
             &self.telemetry,
-        );
+        ) {
+            self.pill_pos = pos;
+        }
     }
 
     fn invalidate_dashboard(&self) {
@@ -351,8 +396,49 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
             LRESULT(1)
         }
-        WM_MOUSEMOVE => {
+        WM_LBUTTONDOWN => {
+            let mut pt = POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let _ = ClientToScreen(hwnd, &mut pt);
             with_app(|app| {
+                app.drag_down = true;
+                app.dragging = false;
+                app.drag_start_cursor = (pt.x, pt.y);
+                app.drag_start_win = app.pill_pos;
+            });
+            let _ = SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let mut move_target: Option<(i32, i32)> = None;
+            let mut pt = POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let _ = ClientToScreen(hwnd, &mut pt);
+            with_app(|app| {
+                if app.drag_down {
+                    let dx = pt.x - app.drag_start_cursor.0;
+                    let dy = pt.y - app.drag_start_cursor.1;
+                    if !app.dragging && (dx.abs() >= 4 || dy.abs() >= 4) {
+                        app.dragging = true;
+                    }
+                    if app.dragging {
+                        let (pw, ph) = app.pill_renderer.size_px();
+                        let (nx, ny) = clamp_pos_to_monitors(
+                            app.drag_start_win.0 + dx,
+                            app.drag_start_win.1 + dy,
+                            pw,
+                            ph,
+                        );
+                        app.pill_pos = (nx, ny);
+                        app.custom_pos = Some((nx, ny));
+                        move_target = Some((nx, ny));
+                    }
+                    return;
+                }
                 if !app.pill_tracking {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -368,20 +454,56 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     app.redraw_pill();
                 }
             });
+            if let Some((nx, ny)) = move_target {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    nx,
+                    ny,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
             with_app(|app| {
                 app.pill_tracking = false;
-                if app.pill_hovered {
+                if app.pill_hovered && !app.dragging {
                     app.pill_hovered = false;
                     app.redraw_pill();
                 }
             });
             LRESULT(0)
         }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                app.drag_down = false;
+                app.dragging = false;
+            });
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
-            toggle_dashboard_safe();
+            let was_dragging = with_app(|app| {
+                let was = app.dragging;
+                app.drag_down = false;
+                app.dragging = false;
+                if was {
+                    let (pw, ph) = app.pill_renderer.size_px();
+                    if let Some(mon) = monitor_index_for_point(app.pill_pos.0 + pw / 2, app.pill_pos.1 + ph / 2) {
+                        app.monitor_index = mon;
+                    }
+                    app.custom_pos = Some(app.pill_pos);
+                    app.persist_and_sync(hwnd);
+                }
+                was
+            })
+            .unwrap_or(false);
+            let _ = ReleaseCapture();
+            if !was_dragging {
+                toggle_dashboard_safe();
+            }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
@@ -419,7 +541,11 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             });
                         }
                         CMD_REDOCK => {
-                            with_app(|app| app.redraw_pill());
+                            with_app(|app| {
+                                app.custom_pos = None;
+                                app.redraw_pill();
+                                app.persist_and_sync(hwnd);
+                            });
                         }
                         CMD_QUIT => {
                             close_dashboard_safe();
@@ -428,6 +554,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         c if c >= CMD_MONITOR_BASE => {
                             with_app(|app| {
                                 app.monitor_index = (c - CMD_MONITOR_BASE) as usize;
+                                app.custom_pos = None;
                                 app.redraw_pill();
                                 app.persist_and_sync(hwnd);
                             });
@@ -788,6 +915,23 @@ fn run_app(opts: CliOpts) -> Result<()> {
         };
         RegisterClassExW(&pill_cls);
 
+        unsafe extern "system" fn owner_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        let owner_cls = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(owner_wndproc),
+            hInstance: hinst.into(),
+            lpszClassName: w!("AgyTokenOwnerClass"),
+            ..Default::default()
+        };
+        RegisterClassExW(&owner_cls);
+
         let dash_cls = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -834,6 +978,12 @@ fn run_app(opts: CliOpts) -> Result<()> {
             telemetry,
             pill_hwnd,
             pill_renderer: PillRenderer::new(),
+            pill_pos: (0, 0),
+            custom_pos: prefs.custom_pos,
+            drag_down: false,
+            dragging: false,
+            drag_start_cursor: (0, 0),
+            drag_start_win: (0, 0),
             pill_hovered: false,
             pill_tracking: false,
             mini: prefs.mini,
@@ -844,6 +994,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             monitor_index: prefs.monitor_index,
             last_total_tokens: initial_total,
             recent_activity_until: None,
+            dash_owner_hwnd: None,
             dash_hwnd: None,
             dash_view: None,
             dashboard_only: opts.dashboard_only,

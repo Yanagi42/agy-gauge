@@ -39,6 +39,7 @@ pub struct UserPrefs {
     pub human: bool,
     pub monitor_index: usize,
     pub fresh_only: bool,
+    pub custom_pos: Option<(i32, i32)>,
 }
 
 impl Default for UserPrefs {
@@ -50,6 +51,7 @@ impl Default for UserPrefs {
             human: true,
             monitor_index: 0,
             fresh_only: false,
+            custom_pos: None,
         }
     }
 }
@@ -97,6 +99,11 @@ pub fn load_user_prefs() -> UserPrefs {
     if let Some(v) = reg_read_u32(w!("fresh_only")) {
         p.fresh_only = v != 0;
     }
+    if reg_read_u32(w!("has_custom_pos")).unwrap_or(0) != 0 {
+        if let (Some(x), Some(y)) = (reg_read_u32(w!("pos_x")), reg_read_u32(w!("pos_y"))) {
+            p.custom_pos = Some((x as i32, y as i32));
+        }
+    }
     p
 }
 
@@ -118,13 +125,20 @@ pub fn save_user_prefs(p: &UserPrefs) {
         {
             return;
         }
-        let entries: [(PCWSTR, u32); 6] = [
+        let (has_pos, px, py) = match p.custom_pos {
+            Some((x, y)) => (1u32, x as u32, y as u32),
+            None => (0u32, 0u32, 0u32),
+        };
+        let entries: [(PCWSTR, u32); 9] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(p.mini)),
             (w!("topmost"), u32::from(p.topmost)),
             (w!("human"), u32::from(p.human)),
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
+            (w!("has_custom_pos"), has_pos),
+            (w!("pos_x"), px),
+            (w!("pos_y"), py),
         ];
         for (name, val) in entries {
             let bytes = val.to_le_bytes();
@@ -132,6 +146,32 @@ pub fn save_user_prefs(p: &UserPrefs) {
         }
         let _ = RegCloseKey(hkey);
     }
+}
+
+/// Find which monitor contains point (cx, cy), or None if off-screen.
+pub fn monitor_index_for_point(cx: i32, cy: i32) -> Option<usize> {
+    let mons = get_monitors();
+    for (idx, m) in mons.iter().enumerate() {
+        if cx >= m.work.left && cx <= m.work.right && cy >= m.work.top && cy <= m.work.bottom {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Clamp a dragged window's top-left (x, y) to stay visible within the union of all monitors.
+pub fn clamp_pos_to_monitors(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    let mons = get_monitors();
+    if mons.is_empty() {
+        return (x, y);
+    }
+    let min_l = mons.iter().map(|m| m.work.left).min().unwrap_or(0);
+    let min_t = mons.iter().map(|m| m.work.top).min().unwrap_or(0);
+    let max_r = mons.iter().map(|m| m.work.right).max().unwrap_or(1920);
+    let max_b = mons.iter().map(|m| m.work.bottom).max().unwrap_or(1040);
+    let cx = x.clamp(min_l - 8, (max_r - w + 8).max(min_l));
+    let cy = y.clamp(min_t - 8, (max_b - h + 8).max(min_t));
+    (cx, cy)
 }
 
 /// Notify peer windows (pill <-> independent dashboard) to reload saved preferences immediately.

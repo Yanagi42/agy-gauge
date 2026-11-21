@@ -22,7 +22,9 @@ use crate::d2d::{
     D2DFactories, Fonts, LayeredSurface, Theme,
 };
 use crate::stats::{fmt_compact, ScanSnapshot, TokenCounts};
-use crate::telemetry::{get_monitors, get_work_area, to_wide_null, wide_pcwstr, SystemTelemetry};
+use crate::telemetry::{
+    get_monitors, get_work_area, monitor_index_for_point, to_wide_null, wide_pcwstr, SystemTelemetry,
+};
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
 pub const CMD_REFRESH: u32 = 1002;
@@ -58,6 +60,10 @@ impl PillRenderer {
         (pw + SHADOW_PAD * 2.0, ph + SHADOW_PAD * 2.0)
     }
 
+    pub fn size_px(&self) -> (i32, i32) {
+        self.surface.as_ref().map(|s| s.size_px()).unwrap_or((1, 1))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -66,13 +72,14 @@ impl PillRenderer {
         hwnd: HWND,
         dpi: f32,
         monitor_index: usize,
+        custom_pos: Option<(i32, i32)>,
         mini: bool,
         light_theme: bool,
         hovered: bool,
         recent_activity: bool,
         snapshot: &ScanSnapshot,
         telemetry: &SystemTelemetry,
-    ) -> Result<()> {
+    ) -> Result<(i32, i32)> {
         let scale = dpi / 96.0;
         let (dip_w, dip_h) = Self::desired_dip_size(mini);
         let px_w = (dip_w * scale).round() as i32;
@@ -86,11 +93,29 @@ impl PillRenderer {
             self.surface = Some(LayeredSurface::new(factories, px_w, px_h, dpi)?);
         }
 
-        let work = get_work_area(monitor_index);
-        let margin_px = (12.0 * scale).round() as i32;
-        let shadow_px = (SHADOW_PAD * scale).round() as i32;
-        let win_x = (work.right - px_w + shadow_px - margin_px).max(work.left);
-        let win_y = (work.bottom - px_h + shadow_px - margin_px).max(work.top);
+        // Use custom dragged coordinates if still visible on any connected monitor;
+        // otherwise dock cleanly at bottom-right of the selected monitor.
+        let (win_x, win_y) = if let Some((cx, cy)) = custom_pos {
+            if monitor_index_for_point(cx + px_w / 2, cy + px_h / 2).is_some() {
+                (cx, cy)
+            } else {
+                let work = get_work_area(monitor_index);
+                let margin_px = (12.0 * scale).round() as i32;
+                let shadow_px = (SHADOW_PAD * scale).round() as i32;
+                (
+                    (work.right - px_w + shadow_px - margin_px).max(work.left),
+                    (work.bottom - px_h + shadow_px - margin_px).max(work.top),
+                )
+            }
+        } else {
+            let work = get_work_area(monitor_index);
+            let margin_px = (12.0 * scale).round() as i32;
+            let shadow_px = (SHADOW_PAD * scale).round() as i32;
+            (
+                (work.right - px_w + shadow_px - margin_px).max(work.left),
+                (work.bottom - px_h + shadow_px - margin_px).max(work.top),
+            )
+        };
 
         let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
         let today_c: TokenCounts = snapshot
@@ -123,7 +148,7 @@ impl PillRenderer {
                 );
             })?;
         }
-        Ok(())
+        Ok((win_x, win_y))
     }
 }
 
