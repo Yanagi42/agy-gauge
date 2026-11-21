@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, UpdateWindow, HDC, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -30,20 +30,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
-    IsWindowVisible, LoadCursorW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
-    LR_DEFAULTCOLOR, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_POPUP,
+    GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW, LoadImageW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST,
+    IDC_ARROW, IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 const WM_SETTINGCHANGE: u32 = 0x001A;
 const SPI_SETWORKAREA: usize = 0x002F;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
+const WM_SYSCOMMAND: u32 = 0x0112;
+const SC_MINIMIZE: usize = 0xF020;
+const SIZE_MINIMIZED: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
 
@@ -132,19 +135,22 @@ fn dashboard_rect_for_monitor(monitor_index: usize, pill_hwnd: HWND) -> (i32, i3
 }
 
 fn toggle_dashboard_safe() {
-    let (has_local, local_visible) = with_app(|app| (app.dash_hwnd.is_some(), app.dash_visible))
-        .unwrap_or((false, false));
-    if local_visible {
-        hide_dashboard_safe();
+    let (local_hwnd, local_visible) = with_app(|app| (app.dash_hwnd, app.dash_visible))
+        .unwrap_or((None, false));
+    if let Some(h) = local_hwnd {
+        let actually_shown = unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() };
+        if local_visible && actually_shown {
+            hide_dashboard_safe();
+            return;
+        }
+        open_or_focus_dashboard_safe();
         return;
     }
-    if !has_local {
-        unsafe {
-            if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
-                if !existing.0.is_null() && IsWindowVisible(existing).as_bool() {
-                    let _ = PostMessageW(existing, WM_CLOSE, WPARAM(0), LPARAM(0));
-                    return;
-                }
+    unsafe {
+        if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
+            if !existing.0.is_null() && IsWindowVisible(existing).as_bool() && !IsIconic(existing).as_bool() {
+                let _ = PostMessageW(existing, WM_CLOSE, WPARAM(0), LPARAM(0));
+                return;
             }
         }
     }
@@ -155,26 +161,34 @@ fn open_or_focus_dashboard_safe() {
     let local_info = with_app(|app| {
         app.dash_hwnd.map(|hwnd| {
             let moved_mon = app.dash_monitor_index != app.monitor_index;
-            let rect = if moved_mon {
+            let fallback_rect = dashboard_rect_for_monitor(app.monitor_index, app.pill_hwnd);
+            if moved_mon {
                 app.dash_monitor_index = app.monitor_index;
-                Some(dashboard_rect_for_monitor(app.monitor_index, app.pill_hwnd))
-            } else {
-                None
-            };
+            }
             app.dash_visible = true;
-            (hwnd, app.light_theme, rect)
+            (hwnd, app.light_theme, moved_mon, fallback_rect)
         })
     })
     .flatten();
 
-    if let Some((hwnd, light, moved_rect)) = local_info {
+    if let Some((hwnd, light, moved_mon, fallback_rect)) = local_info {
         unsafe {
-            if let Some((wx, wy, ww, wh)) = moved_rect {
-                let _ = SetWindowPos(hwnd, None, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
-            }
             let th = theme_for(light);
             apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            // Always use SW_RESTORE if iconic (e.g., after Win+D / Win+M), otherwise SW_SHOW.
+            let was_iconic = IsIconic(hwnd).as_bool();
+            let _ = ShowWindow(hwnd, if was_iconic { SW_RESTORE } else { SW_SHOW });
+
+            // Guard against degenerate/off-screen rect (e.g., after monitor disconnect or minimized stub).
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            let rw = rc.right - rc.left;
+            let rh = rc.bottom - rc.top;
+            let off_screen = monitor_index_for_point((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2).is_none();
+            if moved_mon || rw < 400 || rh < 300 || off_screen {
+                let (wx, wy, ww, wh) = fallback_rect;
+                let _ = SetWindowPos(hwnd, None, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
             let _ = SetForegroundWindow(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
@@ -201,7 +215,8 @@ fn create_dashboard_window_local() {
     if let Some(hwnd) = existing {
         with_app(|app| app.dash_visible = true);
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let cmd = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
+            let _ = ShowWindow(hwnd, cmd);
             let _ = SetForegroundWindow(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
@@ -779,6 +794,24 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let scale = window_dpi_scale(hwnd);
             mmi.ptMinTrackSize.x = (840.0 * scale).round() as i32;
             mmi.ptMinTrackSize.y = (560.0 * scale).round() as i32;
+            LRESULT(0)
+        }
+        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) == SC_MINIMIZE => {
+            // Tool-owned taskbar-less windows minimize to an ugly bottom-left titlebar stub on Windows.
+            // Fold cleanly back into the floating pill instead (releasing surface RAM immediately).
+            let dash_only = with_app(|app| app.dashboard_only).unwrap_or(false);
+            if !dash_only {
+                hide_dashboard_safe();
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_SIZE if wparam.0 == SIZE_MINIMIZED => {
+            let dash_only = with_app(|app| app.dashboard_only).unwrap_or(false);
+            if !dash_only {
+                hide_dashboard_safe();
+            }
             LRESULT(0)
         }
         WM_SIZE | WM_DPICHANGED => {
