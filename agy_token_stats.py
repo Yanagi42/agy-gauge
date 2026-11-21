@@ -399,6 +399,14 @@ def _parse_transcript_file(
             stripped = line.strip()
             if not stripped:
                 continue
+            need_preview = (not first_user_preview) and ("USER_INPUT" in stripped)
+            if (
+                stripped.startswith("{")
+                and stripped.endswith("}")
+                and not need_preview
+                and "_tokens" not in stripped
+            ):
+                continue
             try:
                 obj = json.loads(stripped)
             except json.JSONDecodeError:
@@ -429,7 +437,14 @@ def _parse_transcript_file(
                 continue
 
             ts = _parse_iso_timestamp(obj.get("created_at"), dt.timezone.utc)
-            model = str(obj.get("model") or "unknown").strip() or "unknown"
+            step_type = str(obj.get("type") or "")
+            raw_model = str(obj.get("model") or "").strip()
+            if raw_model:
+                model = raw_model
+            elif step_type == "CHECKPOINT":
+                model = "compaction"
+            else:
+                model = "unknown"
 
             raw_step = obj.get("step_index")
             if isinstance(raw_step, int) and not isinstance(raw_step, bool):
@@ -859,6 +874,13 @@ def _sort_sessions(sessions: Sequence[SessionInfo], sort_by: str) -> list[Sessio
     min_dt = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     if sort_by == "total":
         return sorted(sessions, key=lambda s: s.counts.total_tokens, reverse=True)
+    if sort_by == "non-cached":
+        return sorted(sessions, key=lambda s: s.counts.non_cached_tokens, reverse=True)
+    if sort_by == "hit":
+        return sorted(
+            sessions,
+            key=lambda s: (s.counts.calls <= 1, s.counts.cache_hit_rate, -s.counts.total_tokens),
+        )
     if sort_by == "output":
         return sorted(sessions, key=lambda s: s.counts.output_tokens, reverse=True)
     if sort_by == "input":
@@ -868,6 +890,17 @@ def _sort_sessions(sessions: Sequence[SessionInfo], sort_by: str) -> list[Sessio
     if sort_by == "peak":
         return sorted(sessions, key=lambda s: s.counts.peak_context, reverse=True)
     return sorted(sessions, key=lambda s: s.last_time or min_dt, reverse=True)
+
+
+def _primary_model(s: SessionInfo) -> str:
+    by_m: dict[str, tuple[bool, int]] = {}
+    for t in s.turns:
+        is_cp = t.step_type == "CHECKPOINT"
+        prev_cp, prev_tok = by_m.get(t.model, (is_cp, 0))
+        by_m[t.model] = (prev_cp and is_cp, prev_tok + t.total_tokens)
+    if not by_m:
+        return "-"
+    return max(by_m.items(), key=lambda kv: (not kv[1][0], kv[1][1]))[0]
 
 
 def _format_counts_row(label: str, c: TokenCounts, human: bool, include_cache_write: bool) -> list[str]:
@@ -1084,17 +1117,20 @@ def render_text(
         out.append("")
         title_suffix = f" (showing {len(shown)}/{total_cnt}, sort={sort_by})" if len(shown) < total_cnt else f" ({total_cnt}, sort={sort_by})"
         out.append(_style(f"Sessions{title_suffix}", "1;33", color))
-        s_headers = ["ID", "Last Active", "Calls", "Model", "Input(new)", "CacheRead", "Output", "Total", "PeakCtx", "Title"]
-        s_aligns = ["left", "left", "right", "left", "right", "right", "right", "right", "right", "left"]
+        s_headers = ["ID", "Last Active", "Calls", "Model", "Hit%", "Input(new)", "CacheRead", "Output", "Total", "PeakCtx", "Title"]
+        s_aligns = ["left", "left", "right", "left", "right", "right", "right", "right", "right", "right", "left"]
         s_rows = []
         for s in shown:
-            models_str = ",".join(sorted(s.models)) if len(s.models) <= 1 else f"{sorted(s.models)[0]}+{len(s.models)-1}"
+            real_models = [m for m in sorted(s.models) if m != "compaction"]
+            primary = _primary_model(s)
+            models_str = primary if len(real_models) <= 1 else f"{primary}+{len(real_models)-1}"
             s_rows.append(
                 [
                     s.conversation_id[:8],
                     _fmt_time(s.last_time),
                     str(s.counts.calls),
                     models_str,
+                    _fmt_pct(s.counts.cache_hit_rate),
                     _fmt_num(s.counts.input_tokens, human),
                     _fmt_num(s.counts.cache_read_tokens, human),
                     _fmt_num(s.counts.output_tokens, human),
@@ -1108,7 +1144,7 @@ def render_text(
                 s_headers,
                 s_rows,
                 s_aligns,
-                max_widths=[8, 16, None, 22, None, None, None, None, None, 34],
+                max_widths=[8, 16, None, 22, None, None, None, None, None, None, 34],
             )
         )
 
@@ -1320,7 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sort",
-        choices=("time", "total", "output", "input", "calls", "peak"),
+        choices=("time", "total", "non-cached", "hit", "output", "input", "calls", "peak"),
         default="time",
         help="Session sort order (default: time)",
     )

@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -81,6 +81,7 @@ pub struct TurnRecord {
     pub step_index: i64,
     pub timestamp_utc: Option<DateTime<Utc>>,
     pub model: String,
+    pub is_checkpoint: bool,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
@@ -113,6 +114,46 @@ pub struct SessionInfo {
     pub models: BTreeSet<String>,
     pub first_time: Option<DateTime<Local>>,
     pub last_time: Option<DateTime<Local>>,
+}
+
+impl SessionInfo {
+    /// Dominant model by token volume, preferring real named models over compaction checkpoints.
+    pub fn primary_model(&self) -> String {
+        let mut by_m: HashMap<&str, (bool, u64)> = HashMap::new();
+        for t in &self.turns {
+            let entry = by_m.entry(t.model.as_str()).or_insert((t.is_checkpoint, 0));
+            entry.0 &= t.is_checkpoint;
+            entry.1 = entry.1.saturating_add(t.total_input() + t.output_tokens);
+        }
+        by_m.into_iter()
+            .max_by(|(_, (cp_a, tok_a)), (_, (cp_b, tok_b))| {
+                // Non-checkpoint models always rank above pure checkpoint buckets
+                cp_b.cmp(cp_a).then_with(|| tok_a.cmp(tok_b))
+            })
+            .map(|(m, _)| m.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    pub fn workspace_short(&self) -> String {
+        workspace_short_name(&self.workspace)
+    }
+
+    pub fn compaction_count(&self) -> usize {
+        self.turns.iter().filter(|t| t.is_checkpoint).count()
+    }
+}
+
+pub fn workspace_short_name(workspace: &str) -> String {
+    let trimmed = workspace.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed == "(未知工作区)" || trimmed == "(unknown)" {
+        return String::new();
+    }
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -204,6 +245,7 @@ struct CachedMetaEntry {
 pub struct IncrementalScanner {
     data_dir: PathBuf,
     canon_root: Option<PathBuf>,
+    verified_paths: HashSet<PathBuf>,
     transcript_cache: HashMap<PathBuf, CachedTranscript>,
     ann_cache: HashMap<PathBuf, (FileSig, String)>,
     meta_sig: Option<FileSig>,
@@ -216,6 +258,7 @@ impl IncrementalScanner {
         Self {
             data_dir,
             canon_root,
+            verified_paths: HashSet::new(),
             transcript_cache: HashMap::new(),
             ann_cache: HashMap::new(),
             meta_sig: None,
@@ -236,16 +279,20 @@ impl IncrementalScanner {
         &self.data_dir
     }
 
-    fn is_safe_regular_file(&self, path: &Path) -> Option<FileSig> {
+    fn is_safe_regular_file(&mut self, path: &Path) -> Option<FileSig> {
         let meta = fs::symlink_metadata(path).ok()?;
         if meta.file_type().is_symlink() || !meta.is_file() {
+            self.verified_paths.remove(path);
             return None;
         }
-        if let Some(root) = &self.canon_root {
-            let canon = fs::canonicalize(path).ok()?;
-            if !canon.starts_with(root) {
-                return None;
+        if !self.verified_paths.contains(path) {
+            if let Some(root) = &self.canon_root {
+                let canon = fs::canonicalize(path).ok()?;
+                if !canon.starts_with(root) {
+                    return None;
+                }
             }
+            self.verified_paths.insert(path.to_path_buf());
         }
         let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
         Some(FileSig {
@@ -727,12 +774,14 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
             .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
+        let step_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+        let is_checkpoint = step_type == "CHECKPOINT";
         let model = map
             .get("model")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("unknown")
+            .unwrap_or(if is_checkpoint { "(上下文压缩)" } else { "unknown" })
             .to_string();
 
         let step_index = match map.get("step_index").and_then(Value::as_i64) {
@@ -750,6 +799,7 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
                 step_index,
                 timestamp_utc,
                 model,
+                is_checkpoint,
                 input_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
@@ -968,5 +1018,54 @@ mod tests {
         assert_eq!(iso_week_key(d), "2026-W47");
         assert_eq!(iso_week_range_label("2026-W47"), "11/16 - 11/22");
         assert_eq!(weekday_cn(d), "周六");
+    }
+
+    #[test]
+    fn test_primary_model_and_workspace_short() {
+        let s = SessionInfo {
+            conversation_id: "abc".into(),
+            title: "t".into(),
+            workspace: "C:/Users/qingz/agent-home/".into(),
+            turns: vec![
+                TurnRecord {
+                    step_index: 1,
+                    timestamp_utc: None,
+                    model: "(上下文压缩)".into(),
+                    is_checkpoint: true,
+                    input_tokens: 5_000,
+                    cache_read_tokens: 500_000,
+                    cache_write_tokens: 0,
+                    output_tokens: 6_000,
+                },
+                TurnRecord {
+                    step_index: 2,
+                    timestamp_utc: None,
+                    model: "gemini-4-neon-xhigh".into(),
+                    is_checkpoint: false,
+                    input_tokens: 1_000,
+                    cache_read_tokens: 100_000,
+                    cache_write_tokens: 0,
+                    output_tokens: 500,
+                },
+                TurnRecord {
+                    step_index: 3,
+                    timestamp_utc: None,
+                    model: "gemini-4-neon-high".into(),
+                    is_checkpoint: false,
+                    input_tokens: 500,
+                    cache_read_tokens: 10_000,
+                    cache_write_tokens: 0,
+                    output_tokens: 200,
+                },
+            ],
+            counts: TokenCounts::default(),
+            models: BTreeSet::new(),
+            first_time: None,
+            last_time: None,
+        };
+        assert_eq!(s.primary_model(), "gemini-4-neon-xhigh");
+        assert_eq!(s.workspace_short(), "agent-home");
+        assert_eq!(s.compaction_count(), 1);
+        assert_eq!(workspace_short_name("(未知工作区)"), "");
     }
 }

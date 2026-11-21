@@ -38,9 +38,9 @@ pub const CMD_MONITOR_BASE: u32 = 1100;
 
 const SHADOW_PAD: f32 = 10.0;
 const PILL_H_STD: f32 = 30.0;
-const PILL_W_STD: f32 = 248.0;
+const PILL_W_STD: f32 = 252.0;
 const PILL_H_MINI: f32 = 28.0;
-const PILL_W_MINI: f32 = 90.0;
+const PILL_W_MINI: f32 = 92.0;
 
 pub struct PillRenderer {
     surface: Option<LayeredSurface>,
@@ -76,6 +76,7 @@ impl PillRenderer {
         mini: bool,
         light_theme: bool,
         hovered: bool,
+        dash_open: bool,
         recent_activity: bool,
         snapshot: &ScanSnapshot,
         telemetry: &SystemTelemetry,
@@ -124,11 +125,8 @@ impl PillRenderer {
             .get(&today_key)
             .copied()
             .unwrap_or_default();
-        let tok_val = if today_c.total_tokens() > 0 {
-            fmt_compact(today_c.total_tokens())
-        } else {
-            fmt_compact(snapshot.agg.total.total_tokens())
-        };
+        // Always stay consistent with Dashboard's "今日" scope (show 0 on a fresh day)
+        let tok_val = fmt_compact(today_c.total_tokens());
 
         let theme = theme_for(light_theme);
         if let Some(surface) = &self.surface {
@@ -142,6 +140,7 @@ impl PillRenderer {
                     dip_h,
                     mini,
                     hovered,
+                    dash_open,
                     recent_activity,
                     &tok_val,
                     telemetry,
@@ -162,6 +161,7 @@ fn draw_pill_capsule(
     dip_h: f32,
     mini: bool,
     hovered: bool,
+    dash_open: bool,
     recent_activity: bool,
     tok_val: &str,
     telemetry: &SystemTelemetry,
@@ -204,14 +204,14 @@ fn draw_pill_capsule(
         fill_round_rect(rt, pill_r, radius, bg_t);
     }
 
-    // Ultra-crisp hairline rim
-    let rim = if hovered { theme.pill_rim_hover } else { theme.pill_rim };
+    // Ultra-crisp hairline rim (subtly tinted when hovered or dashboard is open)
+    let rim = if hovered || dash_open { theme.pill_rim_hover } else { theme.pill_rim };
     stroke_round_rect(rt, rect_f(x + 0.5, y + 0.5, pw - 1.0, ph - 1.0), radius - 0.5, rim, 0.9);
 
     let cy = y + ph * 0.5;
     let dot_x = x + 13.0;
     let dot_col = if recent_activity { theme.accent } else { theme.sage };
-    if recent_activity || hovered {
+    if recent_activity || hovered || dash_open {
         fill_circle(rt, dot_x, cy, 5.0, with_alpha(dot_col, 0.22));
     }
     fill_circle(rt, dot_x, cy, 2.6, dot_col);
@@ -222,10 +222,10 @@ fn draw_pill_capsule(
     }
 
     // Left: Today's Token figure (crisp primary neutral ink)
-    draw_text(rt, tok_val, &fonts.pill_tok, rect_f(x + 22.0, y, 58.0, ph), theme.text);
+    draw_text(rt, tok_val, &fonts.pill_tok, rect_f(x + 22.0, y, 62.0, ph), theme.text);
 
     // Whisper-quiet divider
-    let div_x = x + 82.0;
+    let div_x = x + 86.0;
     draw_line(rt, div_x, y + 8.0, div_x, y + ph - 8.0, theme.border, 1.0);
 
     // Center: Live 16-sample micro CPU sparkline + % (like iStat Menus)

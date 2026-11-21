@@ -308,7 +308,7 @@ impl Fonts {
             mono_med_right: f.make_format(mono, 11.5, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
             mono_small: f.make_format(mono, 10.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
             mono_small_center: f.make_format(mono, 9.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
-            mono_small_right: f.make_format(mono, 10.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
+            mono_small_right: f.make_format(mono, 10.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
             pill_tok: f.make_format(mono, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
             pill_num: f.make_format(mono, 10.5, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
             pill_micro: f.make_format(ui, 9.0, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
@@ -779,6 +779,7 @@ pub struct BarItem {
     pub cache: u64,
     pub input: u64,
     pub output: u64,
+    pub marker: bool,
     pub tooltip: Vec<String>,
 }
 
@@ -799,7 +800,7 @@ pub fn draw_editorial_bars(
         return;
     }
 
-    let pad_l = 48.0;
+    let pad_l = 54.0;
     let pad_r = 12.0;
     let pad_t = 12.0;
     let pad_b = 22.0;
@@ -902,12 +903,19 @@ pub fn draw_editorial_bars(
                 }
                 cur_y = ny;
             }
+            if it.marker {
+                let dot_y = (y_top - 5.0).max(plot_t + 2.0);
+                fill_circle(rt, cx, dot_y, 2.3, theme.accent);
+            }
         } else {
             // Subtle baseline dot/tick for 0-usage calendar days so the rhythm stays visible
             fill_round_rect(rt, rect_f(x0, plot_b - 2.0, bar_w, 2.0), 1.0, theme.grid);
         }
 
-        if idx % label_every == 0 || idx == n - 1 {
+        let is_last = idx == n - 1;
+        let show_regular = idx % label_every == 0
+            && (label_every == 1 || (idx + ((label_every + 1) / 2) < n - 1));
+        if is_last || show_regular {
             draw_text(
                 rt,
                 &it.label,

@@ -25,7 +25,8 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, Invali
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
@@ -44,7 +45,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
 
 use d2d::{theme_for, D2DFactories, Fonts};
-use dashboard::{DashboardView, Tab, WeeklyMode};
+use dashboard::{BreakdownMode, ClickAction, DashboardView, Tab, WeeklyMode};
 use pill::{
     show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_QUIT, CMD_REDOCK,
     CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_MINI, CMD_TOGGLE_TOPMOST,
@@ -172,6 +173,7 @@ fn open_or_focus_dashboard_safe() {
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
         }
+        with_app(|app| app.redraw_pill());
         return;
     }
 
@@ -198,6 +200,7 @@ fn create_dashboard_window_local() {
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
         }
+        with_app(|app| app.redraw_pill());
         return;
     }
 
@@ -260,6 +263,7 @@ fn create_dashboard_window_local() {
             let _ = SetForegroundWindow(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
+            with_app(|app| app.redraw_pill());
         }
     }
 }
@@ -284,6 +288,7 @@ fn hide_dashboard_safe() {
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
         }
+        with_app(|app| app.redraw_pill());
         trim_self_working_set();
     }
 }
@@ -402,6 +407,7 @@ impl AppState {
             self.mini,
             self.light_theme,
             self.pill_hovered,
+            self.dash_visible,
             recent,
             &self.snapshot,
             &self.telemetry,
@@ -781,9 +787,56 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 as u16 == VK_ESCAPE.0 {
+            let vk = wparam.0 as u16;
+            let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+            if vk == VK_ESCAPE.0 {
                 hide_dashboard_safe();
                 return LRESULT(0);
+            }
+            let action = match vk {
+                0x31 => Some(ClickAction::SelectTab(Tab::Overview)),  // '1'
+                0x32 => Some(ClickAction::SelectTab(Tab::Daily)),     // '2'
+                0x33 => Some(ClickAction::SelectTab(Tab::Weekly)),    // '3'
+                0x34 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '4'
+                0x35 => Some(ClickAction::ToggleSystemView),          // '5'
+                0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),  // 'T'
+                0x52 => Some(ClickAction::Refresh),                   // 'R'
+                x if x == VK_F5.0 => Some(ClickAction::Refresh),
+                0x43 if ctrl => Some(ClickAction::CopySummary),       // Ctrl+C
+                _ => None,
+            };
+            if let Some(act) = action {
+                with_app(|app| {
+                    let mut need_refresh = false;
+                    let mut prefs_changed = false;
+                    if let Some(view) = &mut app.dash_view {
+                        let res = view.apply_action(hwnd, act, &mut app.human, &mut app.light_theme);
+                        need_refresh = res.0;
+                        prefs_changed = res.1;
+                        app.fresh_only = view.fresh_only;
+                        app.date_scope = view.scope;
+                    }
+                    if prefs_changed {
+                        app.persist_and_sync(hwnd);
+                    }
+                    if need_refresh {
+                        app.refresh_tokens(true);
+                    }
+                    app.redraw_pill();
+                    app.invalidate_dashboard();
+                });
+                return LRESULT(0);
+            }
+            if vk == VK_UP.0 || vk == VK_DOWN.0 {
+                let delta = if vk == VK_UP.0 { -1 } else { 1 };
+                let changed = with_app(|app| {
+                    app.dash_view.as_mut().map(|v| v.step_session(delta)).unwrap_or(false)
+                })
+                .unwrap_or(false);
+                if changed {
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -1111,6 +1164,21 @@ fn run_app(opts: CliOpts) -> Result<()> {
                             app.human,
                             app.light_theme,
                         );
+                        if tab == Tab::Overview {
+                            view.breakdown_mode = BreakdownMode::Workspace;
+                            let _ = view.render_to_hdc(
+                                &app.factories,
+                                &app.fonts,
+                                hwnd,
+                                None,
+                                dpi,
+                                &app.snapshot,
+                                &app.telemetry,
+                                app.human,
+                                app.light_theme,
+                            );
+                            view.breakdown_mode = BreakdownMode::Model;
+                        }
                         if tab == Tab::Weekly {
                             view.weekly_mode = WeeklyMode::Monthly;
                             let _ = view.render_to_hdc(

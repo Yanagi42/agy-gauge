@@ -26,7 +26,8 @@ use crate::d2d::{
 };
 use crate::stats::{
     filter_snapshot, fmt_commas, fmt_compact, fmt_num, iso_week_key, iso_week_range_label,
-    weekday_cn, AggregatedStats, DateScope, ScanSnapshot, SessionInfo, SessionSort, TokenCounts,
+    weekday_cn, workspace_short_name, AggregatedStats, DateScope, ScanSnapshot, SessionInfo,
+    SessionSort, TokenCounts,
 };
 use crate::telemetry::{apply_win11_frame, copy_text_to_clipboard, SystemTelemetry};
 
@@ -45,11 +46,18 @@ pub enum WeeklyMode {
     Monthly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakdownMode {
+    Model,
+    Workspace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickAction {
     SelectTab(Tab),
     ToggleSystemView,
     SelectWeeklyMode(WeeklyMode),
+    SelectBreakdown(BreakdownMode),
     SelectScope(DateScope),
     ToggleFreshOnly,
     ToggleLightTheme,
@@ -71,6 +79,7 @@ pub struct DashboardView {
     pub active_tab: Tab,
     prev_token_tab: Tab,
     pub weekly_mode: WeeklyMode,
+    pub breakdown_mode: BreakdownMode,
     pub scope: DateScope,
     pub sort: SessionSort,
     pub fresh_only: bool,
@@ -78,6 +87,7 @@ pub struct DashboardView {
     pub mouse_dip: Option<(f32, f32)>,
     scroll_rows: usize,
     max_scroll: usize,
+    sessions_vis_rows: usize,
     hit_boxes: Vec<HitBox>,
     copied_until: Option<Instant>,
     cached_sessions: Vec<SessionInfo>,
@@ -107,6 +117,7 @@ impl DashboardView {
             active_tab: Tab::Overview,
             prev_token_tab: Tab::Overview,
             weekly_mode: WeeklyMode::Weekly,
+            breakdown_mode: BreakdownMode::Model,
             scope,
             sort: SessionSort::Recent,
             fresh_only,
@@ -114,12 +125,70 @@ impl DashboardView {
             mouse_dip: None,
             scroll_rows: 0,
             max_scroll: 0,
+            sessions_vis_rows: 6,
             hit_boxes: Vec::new(),
             copied_until: None,
             cached_sessions: Vec::new(),
             cached_agg: AggregatedStats::default(),
             dirty_filter: true,
         }
+    }
+
+    pub fn step_session(&mut self, delta: isize) -> bool {
+        if self.active_tab != Tab::Sessions || self.cached_sessions.is_empty() {
+            return false;
+        }
+        let sorted = self.sorted_sessions();
+        if sorted.is_empty() {
+            return false;
+        }
+        let cur_idx = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| sorted.iter().position(|s| s.conversation_id == id))
+            .unwrap_or(0);
+        let next_idx = (cur_idx as isize + delta).clamp(0, (sorted.len() - 1) as isize) as usize;
+        if next_idx == cur_idx && self.selected_session.is_some() {
+            return false;
+        }
+        self.selected_session = Some(sorted[next_idx].conversation_id.clone());
+        let vis = self.sessions_vis_rows.max(1);
+        if next_idx < self.scroll_rows {
+            self.scroll_rows = next_idx;
+        } else if next_idx >= self.scroll_rows + vis {
+            self.scroll_rows = (next_idx + 1).saturating_sub(vis);
+        }
+        true
+    }
+
+    fn sorted_sessions(&self) -> Vec<SessionInfo> {
+        let mut sorted = self.cached_sessions.clone();
+        match self.sort {
+            SessionSort::Recent => sorted.sort_by(|a, b| b.last_time.cmp(&a.last_time)),
+            SessionSort::NonCached => {
+                sorted.sort_by(|a, b| b.counts.non_cached_tokens().cmp(&a.counts.non_cached_tokens()))
+            }
+            SessionSort::TotalTokens => {
+                sorted.sort_by(|a, b| b.counts.total_tokens().cmp(&a.counts.total_tokens()))
+            }
+            SessionSort::HitRateLow => sorted.sort_by(|a, b| {
+                let a_single = a.counts.calls <= 1;
+                let b_single = b.counts.calls <= 1;
+                a_single
+                    .cmp(&b_single)
+                    .then_with(|| {
+                        a.counts
+                            .cache_hit_rate()
+                            .partial_cmp(&b.counts.cache_hit_rate())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| b.counts.total_tokens().cmp(&a.counts.total_tokens()))
+            }),
+            SessionSort::PeakContext => {
+                sorted.sort_by(|a, b| b.counts.peak_context.cmp(&a.counts.peak_context))
+            }
+        }
+        sorted
     }
 
     pub fn mark_data_dirty(&mut self) {
@@ -184,6 +253,10 @@ impl DashboardView {
             ClickAction::SelectWeeklyMode(m) => {
                 self.weekly_mode = m;
                 self.scroll_rows = 0;
+                (false, false)
+            }
+            ClickAction::SelectBreakdown(mode) => {
+                self.breakdown_mode = mode;
                 (false, false)
             }
             ClickAction::SelectScope(s) => {
@@ -539,12 +612,16 @@ impl DashboardView {
         draw_text(rt, &sub2, &fonts.ui_micro, rect_f(x1 + 18.0, y + 53.0, c2 - 28.0, 14.0), theme.sub);
 
         // Block 3: Sessions & Calls
-        draw_text(rt, "活跃规模", &fonts.ui_micro, rect_f(x2 + 18.0, y + 9.0, c3 - 26.0, 14.0), theme.muted);
-        let act_str = format!("{} 会话 · {} 次", self.cached_sessions.len(), t.calls);
-        draw_text(rt, &act_str, &fonts.mono_kpi, rect_f(x2 + 18.0, y + 26.0, c3 - 26.0, 24.0), theme.text);
+        draw_text(rt, "活跃规模", &fonts.ui_micro, rect_f(x2 + 16.0, y + 9.0, c3 - 22.0, 14.0), theme.muted);
+        let act_str = if c3 >= 195.0 {
+            format!("{} 会话 · {} 次", self.cached_sessions.len(), t.calls)
+        } else {
+            format!("{}会话·{}次", self.cached_sessions.len(), t.calls)
+        };
+        draw_text(rt, &act_str, &fonts.mono_kpi, rect_f(x2 + 16.0, y + 26.0, c3 - 22.0, 24.0), theme.text);
         let avg = if t.calls > 0 { t.total_tokens() / t.calls } else { 0 };
         let sub3 = format!("均单次 {}  ·  {} 天", fmt_compact(avg), self.cached_agg.by_day.len());
-        draw_text(rt, &sub3, &fonts.ui_micro, rect_f(x2 + 18.0, y + 53.0, c3 - 26.0, 14.0), theme.sub);
+        draw_text(rt, &sub3, &fonts.ui_micro, rect_f(x2 + 16.0, y + 53.0, c3 - 22.0, 14.0), theme.sub);
 
         // Block 4: Clickable Radial Ring Gauges for CPU & RAM (toggles System Monitor view!)
         let b4 = rect_f(x3 + 4.0, y + 4.0, (band.right - x3 - 8.0).max(80.0), h - 8.0);
@@ -576,8 +653,8 @@ impl DashboardView {
         draw_ring_gauge(factories, rt, r_cx, g_cy, 17.0, 3.0, tel.mem_pct, theme.grid, theme.ram);
         draw_text(rt, &format!("{:.0}%", tel.mem_pct), &fonts.mono_small_center, rect_f(r_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
 
-        let tx_l = x3 + 110.0;
-        let tx_w = (band.right - tx_l - 12.0).max(60.0);
+        let tx_l = x3 + 106.0;
+        let tx_w = (band.right - tx_l - 10.0).max(60.0);
         draw_text(
             rt,
             if sys_act { "系统监控  ‹ 返回" } else { "CPU / 内存  ›" },
@@ -585,9 +662,14 @@ impl DashboardView {
             rect_f(tx_l, y + 14.0, tx_w, 14.0),
             if sys_act { theme.accent } else if sys_hov { theme.text } else { theme.muted },
         );
+        let ram_str = if tx_w >= 104.0 {
+            format!("{:.1}/{:.1} GB", tel.mem_used_gb, tel.mem_total_gb)
+        } else {
+            format!("{:.1}/{:.0}G", tel.mem_used_gb, tel.mem_total_gb)
+        };
         draw_text(
             rt,
-            &format!("{:.1}/{:.1} GB", tel.mem_used_gb, tel.mem_total_gb),
+            &ram_str,
             &fonts.mono_med,
             rect_f(tx_l, y + 31.0, tx_w, 18.0),
             theme.text,
@@ -646,6 +728,7 @@ impl DashboardView {
                             cache: c.cache_read_tokens,
                             input: c.input_tokens,
                             output: c.output_tokens,
+                            marker: false,
                             tooltip: vec![
                                 format!("今日 {:02}:00 - {:02}:59 · {} 次", h, h, c.calls),
                                 format!("总计   : {}", fmt_commas(c.total_tokens())),
@@ -687,6 +770,7 @@ impl DashboardView {
                         cache: c.cache_read_tokens,
                         input: c.input_tokens,
                         output: c.output_tokens,
+                        marker: false,
                         tooltip: vec![
                             format!("{} ({}) · {} 次", k, weekday_cn(d), c.calls),
                             format!("总计   : {}", fmt_commas(c.total_tokens())),
@@ -711,6 +795,18 @@ impl DashboardView {
         fill_round_rect(rt, tr, 10.0, theme.surface);
         stroke_round_rect(rt, tr, 10.0, theme.border, 1.0);
 
+        let split_y = tr.top + (top_h * 0.44).clamp(96.0, 114.0);
+        // Clickable upper ISO Week block -> jumps straight to Weekly tab
+        let wk_hit = rect_f(tr.left + 4.0, tr.top + 4.0, right_w - 8.0, (split_y - tr.top - 8.0).max(60.0));
+        let wk_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&wk_hit, mx, my)).unwrap_or(false);
+        if wk_hov {
+            fill_round_rect(rt, wk_hit, 7.0, with_alpha(theme.text, 0.035));
+        }
+        self.hit_boxes.push(HitBox {
+            rect: wk_hit,
+            action: ClickAction::SelectTab(Tab::Weekly),
+        });
+
         let cur_wk = iso_week_key(today);
         let prev_wk = today
             .checked_sub_days(chrono::Days::new(7))
@@ -721,7 +817,13 @@ impl DashboardView {
         let wk_days = snapshot.agg.week_active_days.get(&cur_wk).copied().unwrap_or(0);
         let wk_avg = if wk_days > 0 { wk_c.total_tokens() / wk_days as u64 } else { 0 };
 
-        draw_text(rt, &format!("本周 · {}", cur_wk), &fonts.ui_section, rect_f(tr.left + 16.0, tr.top + 10.0, 146.0, 20.0), theme.text);
+        draw_text(
+            rt,
+            &format!("本周 · {}  ›", cur_wk),
+            &fonts.ui_section,
+            rect_f(tr.left + 16.0, tr.top + 10.0, 160.0, 20.0),
+            if wk_hov { theme.accent } else { theme.text },
+        );
         draw_text(rt, &iso_week_range_label(&cur_wk), &fonts.mono_small_right, rect_f(tr.right - 120.0, tr.top + 12.0, 104.0, 16.0), theme.muted);
 
         draw_text(rt, &fmt_num(wk_c.total_tokens(), human), &fonts.mono_kpi, rect_f(tr.left + 16.0, tr.top + 32.0, (right_w - 150.0).max(90.0), 24.0), theme.text);
@@ -756,17 +858,47 @@ impl DashboardView {
             theme.muted,
         );
 
-        let split_y = tr.top + (top_h * 0.44).clamp(96.0, 114.0);
         draw_line(rt, tr.left + 16.0, split_y, tr.right - 16.0, split_y, theme.border, 1.0);
-        draw_text(rt, "模型分布", &fonts.ui_section, rect_f(tr.left + 16.0, split_y + 8.0, 100.0, 18.0), theme.text);
-        draw_text(rt, "占比 · 缓存命中", &fonts.ui_small_right, rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0), theme.muted);
-        self.draw_compact_models(
+
+        // Quiet "模型 | 项目" breakdown toggle inside lower right section
+        let mut bx = tr.left + 14.0;
+        for (mode, lbl, bw_btn) in [
+            (BreakdownMode::Model, "模型分布", 62.0),
+            (BreakdownMode::Workspace, "项目分布", 62.0),
+        ] {
+            let r = rect_f(bx, split_y + 7.0, bw_btn, 20.0);
+            let act = self.breakdown_mode == mode;
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
+            if act {
+                fill_round_rect(rt, r, 5.0, theme.hover);
+            } else if hov {
+                fill_round_rect(rt, r, 5.0, with_alpha(theme.text, 0.04));
+            }
+            draw_text(
+                rt,
+                lbl,
+                &fonts.ui_small_center,
+                r,
+                if act { theme.text } else if hov { theme.sub } else { theme.muted },
+            );
+            self.hit_boxes.push(HitBox {
+                rect: r,
+                action: ClickAction::SelectBreakdown(mode),
+            });
+            bx += bw_btn + 4.0;
+        }
+        draw_text(
             rt,
-            fonts,
-            theme,
-            rect_f(tr.left + 16.0, split_y + 30.0, right_w - 32.0, (tr.bottom - split_y - 36.0).max(24.0)),
-            human,
+            if self.breakdown_mode == BreakdownMode::Model { "占比 · 缓存命中" } else { "占比 · 会话数" },
+            &fonts.ui_small_right,
+            rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0),
+            theme.muted,
         );
+        let bd_bounds = rect_f(tr.left + 16.0, split_y + 31.0, right_w - 32.0, (tr.bottom - split_y - 37.0).max(24.0));
+        match self.breakdown_mode {
+            BreakdownMode::Model => self.draw_compact_models(rt, fonts, theme, bd_bounds, human),
+            BreakdownMode::Workspace => self.draw_compact_workspaces(rt, fonts, theme, bd_bounds, human),
+        }
 
         // 3) Bottom Full-Width: Recent Active Sessions (spacious table with per-session cache hit rate)
         let bot = rect_f(body.left, tl.bottom + gap, bw, bot_h);
@@ -792,7 +924,7 @@ impl DashboardView {
         let rr_l = bot.left + 10.0;
         let rr_w = bw - 20.0;
         let rx = rr_l + rr_w - 10.0;
-        let model_w = if rr_w >= 860.0 { 136.0 } else { 96.0 };
+        let model_w = if rr_w >= 860.0 { 136.0 } else { 118.0 };
         let model_x = rx - 338.0 - model_w;
         let title_x = rr_l + 90.0;
         let title_w = (model_x - 10.0 - title_x).max(80.0);
@@ -835,7 +967,7 @@ impl DashboardView {
                     draw_line(rt, bot.left + 16.0, ry - 1.0, bot.right - 16.0, ry - 1.0, theme.grid, 0.8);
                 }
                 let t_str = s.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
-                let m_str = s.models.iter().next().cloned().unwrap_or_else(|| "-".into());
+                let m_str = s.primary_model();
                 let hit_str = format!("{:.1}%", s.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &s.counts);
 
@@ -880,6 +1012,46 @@ impl DashboardView {
                 fmt_num(c.total_tokens(), human),
                 share * 100.0,
                 c.cache_hit_rate()
+            );
+            draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.46, y, w * 0.54, 16.0), theme.sub);
+            fill_round_rect(rt, rect_f(bounds.left, y + 18.0, w, 3.5), 1.75, theme.grid);
+            fill_round_rect(rt, rect_f(bounds.left, y + 18.0, (w * share).max(3.0), 3.5), 1.75, palette[i % palette.len()]);
+        }
+    }
+
+    fn draw_compact_workspaces(&self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
+        let mut items: Vec<(String, usize, &TokenCounts)> = self
+            .cached_agg
+            .by_workspace
+            .iter()
+            .map(|(ws, (cnt, c))| {
+                let short = workspace_short_name(ws);
+                let label = if short.is_empty() { "(未知工作区)".to_string() } else { short };
+                (label, *cnt, c)
+            })
+            .collect();
+        items.sort_by(|a, b| b.2.total_tokens().cmp(&a.2.total_tokens()));
+        if items.is_empty() {
+            draw_text(rt, "当前范围暂无项目数据", &fonts.ui_small, bounds, theme.muted);
+            return;
+        }
+        let avail_h = (bounds.bottom - bounds.top).max(24.0);
+        let max_show = if avail_h >= 82.0 { 3 } else { 2 };
+        let show_n = items.len().min(max_show);
+        let total_all = self.cached_agg.total.total_tokens().max(1);
+        let row_h = (avail_h / show_n as f32).clamp(24.0, 34.0);
+        let w = bounds.right - bounds.left;
+        let palette = [theme.accent, theme.output, theme.ram];
+
+        for (i, (name, sess_cnt, c)) in items.iter().take(show_n).enumerate() {
+            let y = bounds.top + i as f32 * row_h;
+            let share = (c.total_tokens() as f64 / total_all as f64) as f32;
+            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), theme.text);
+            let stat = format!(
+                "{} ({:.0}%) · {}会话",
+                fmt_num(c.total_tokens(), human),
+                share * 100.0,
+                sess_cnt
             );
             draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.46, y, w * 0.54, 16.0), theme.sub);
             fill_round_rect(rt, rect_f(bounds.left, y + 18.0, w, 3.5), 1.75, theme.grid);
@@ -962,6 +1134,7 @@ impl DashboardView {
                 cache: c.cache_read_tokens,
                 input: c.input_tokens,
                 output: c.output_tokens,
+                marker: false,
                 tooltip: vec![
                     format!("{} · {} 次调用", day, c.calls),
                     format!("总计   : {}", fmt_commas(c.total_tokens())),
@@ -1072,6 +1245,7 @@ impl DashboardView {
                             cache: c.cache_read_tokens,
                             input: c.input_tokens,
                             output: c.output_tokens,
+                            marker: false,
                             tooltip: vec![
                                 format!("{} ({})", wk, iso_week_range_label(wk)),
                                 format!("总计   : {} (环比 {})", fmt_commas(c.total_tokens()), wow.get(*wk).map(String::as_str).unwrap_or("-")),
@@ -1136,6 +1310,7 @@ impl DashboardView {
                         cache: c.cache_read_tokens,
                         input: c.input_tokens,
                         output: c.output_tokens,
+                        marker: false,
                         tooltip: vec![
                             format!("{} · {} 次调用", m, c.calls),
                             format!("总计   : {}", fmt_commas(c.total_tokens())),
@@ -1227,32 +1402,12 @@ impl DashboardView {
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectSort(*so) });
         }
 
-        let mut sorted = self.cached_sessions.clone();
-        match self.sort {
-            SessionSort::Recent => sorted.sort_by(|a, b| b.last_time.cmp(&a.last_time)),
-            SessionSort::NonCached => sorted.sort_by(|a, b| b.counts.non_cached_tokens().cmp(&a.counts.non_cached_tokens())),
-            SessionSort::TotalTokens => sorted.sort_by(|a, b| b.counts.total_tokens().cmp(&a.counts.total_tokens())),
-            SessionSort::HitRateLow => sorted.sort_by(|a, b| {
-                // Multi-turn sessions first (lowest cache hit at top), cold-start 1-turn sessions after
-                let a_single = a.counts.calls <= 1;
-                let b_single = b.counts.calls <= 1;
-                a_single
-                    .cmp(&b_single)
-                    .then_with(|| {
-                        a.counts
-                            .cache_hit_rate()
-                            .partial_cmp(&b.counts.cache_hit_rate())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| b.counts.total_tokens().cmp(&a.counts.total_tokens()))
-            }),
-            SessionSort::PeakContext => sorted.sort_by(|a, b| b.counts.peak_context.cmp(&a.counts.peak_context)),
-        }
+        let sorted = self.sorted_sessions();
 
         let rr_l = top_c.left + 10.0;
         let rr_w = bw - 24.0;
         let rx = rr_l + rr_w - 8.0;
-        let model_w = if rr_w >= 880.0 { 132.0 } else { 90.0 };
+        let model_w = if rr_w >= 880.0 { 132.0 } else { 112.0 };
         let model_x = rx - 338.0 - model_w;
         let title_x = rr_l + 150.0;
         let title_w = (model_x - 10.0 - title_x).max(80.0);
@@ -1274,6 +1429,7 @@ impl DashboardView {
         let list_y = top_c.top + 55.0;
         let row_h = 27.0;
         let vis = (((top_c.bottom - 8.0 - list_y) / row_h).floor() as usize).max(1);
+        self.sessions_vis_rows = vis;
         self.max_scroll = sorted.len().saturating_sub(vis);
         if self.scroll_rows > self.max_scroll {
             self.scroll_rows = self.max_scroll;
@@ -1301,7 +1457,7 @@ impl DashboardView {
                 }
                 let sid = &s.conversation_id[..s.conversation_id.len().min(8)];
                 let t_str = s.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
-                let m_str = s.models.iter().next().cloned().unwrap_or_else(|| "-".into());
+                let m_str = s.primary_model();
                 let hit_str = format!("{:.1}%", s.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &s.counts);
 
@@ -1345,7 +1501,7 @@ impl DashboardView {
         if let Some(s) = sel {
             let hdr = format!("逐轮剖析 · {}", s.title);
             draw_text(rt, &hdr, &fonts.ui_section, rect_f(bot_c.left + 16.0, bot_c.top + 9.0, (bw - 320.0).max(160.0), 19.0), theme.text);
-            let meta = format!(
+            let mut meta = format!(
                 "{} 轮  ·  缓存命中 {:.1}%  ·  非缓存 {}  ·  总计 {}  ·  峰值Ctx {}",
                 s.turns.len(),
                 s.counts.cache_hit_rate(),
@@ -1353,6 +1509,14 @@ impl DashboardView {
                 fmt_compact(s.counts.total_tokens()),
                 fmt_compact(s.counts.peak_context),
             );
+            let cp = s.compaction_count();
+            if cp > 0 {
+                meta.push_str(&format!("  ·  {} 次压缩", cp));
+            }
+            let ws = s.workspace_short();
+            if !ws.is_empty() {
+                meta.push_str(&format!("  ·  {}", ws));
+            }
             draw_text(rt, &meta, &fonts.mono_small, rect_f(bot_c.left + 16.0, bot_c.top + 28.0, (bw - 32.0).max(160.0), 15.0), theme.sub);
             self.draw_chart_legend_and_toggle(rt, fonts, theme, bot_c);
 
@@ -1362,13 +1526,19 @@ impl DashboardView {
                 .map(|t| {
                     let lbl = if t.step_index >= 0 { format!("#{}", t.step_index) } else { "-".into() };
                     let ts = t.timestamp_utc.map(|u| u.with_timezone(&Local).format("%H:%M:%S").to_string()).unwrap_or_else(|| "-".into());
+                    let step_hdr = if t.is_checkpoint {
+                        format!("Step {} · 上下文压缩 ({})", lbl, ts)
+                    } else {
+                        format!("Step {} ({})", lbl, ts)
+                    };
                     BarItem {
                         label: lbl.clone(),
                         cache: t.cache_read_tokens,
                         input: t.input_tokens,
                         output: t.output_tokens,
+                        marker: t.is_checkpoint,
                         tooltip: vec![
-                            format!("Step {} ({})", lbl, ts),
+                            step_hdr,
                             format!("模型   : {}", t.model),
                             format!("新输入 : {}", fmt_commas(t.input_tokens)),
                             format!("缓存读 : {} ({:.1}%)", fmt_commas(t.cache_read_tokens), t.cache_hit_rate()),
@@ -1583,14 +1753,20 @@ impl DashboardView {
             }
 
             let mut rx = bounds.left + pad_x;
-            for (ci, &(_, frac, right_align)) in cols.iter().enumerate() {
+            for (ci, &(col_title, frac, right_align)) in cols.iter().enumerate() {
                 let cw = inner_w * frac;
                 let cell = row.get(ci).map(String::as_str).unwrap_or("");
                 let color = if cell.starts_with('+') && cell.ends_with('%') {
                     theme.accent
                 } else if cell.starts_with('-') && cell.ends_with('%') {
                     theme.sage
-                } else if ci == 0 {
+                } else if col_title == "命中率" {
+                    match cell.trim_end_matches('%').parse::<f64>() {
+                        Ok(v) if v >= 85.0 => theme.sage,
+                        Ok(v) if v < 65.0 && v > 0.0 => theme.warn,
+                        _ => theme.sub,
+                    }
+                } else if ci == 0 || col_title == "总 Token" {
                     theme.text
                 } else {
                     theme.sub

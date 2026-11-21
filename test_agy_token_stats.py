@@ -245,6 +245,34 @@ class AgyTokenStatsTests(unittest.TestCase):
             self.assertEqual(rep3.files_reparsed, 1)
             self.assertEqual(rep3.files_cached, 1)
 
+    def test_checkpoint_compaction_and_hit_sort(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self._create_fixture(root)
+            s1_file = root / "brain" / "11111111-aaaa-bbbb-cccc-000000000001" / ".system_generated" / "logs" / "transcript.jsonl"
+            with s1_file.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps({
+                        "step_index": 9,
+                        "type": "CHECKPOINT",
+                        "status": "DONE",
+                        "created_at": "2026-11-21T04:00:00Z",
+                        "input_tokens": 500,
+                        "cache_read_tokens": 5000,
+                        "output_tokens": 300,
+                    }) + "\n"
+                )
+            rep = mod.scan_usage(root, tz=tz_utc)
+            agg = mod.aggregate_sessions(rep.sessions)
+            self.assertIn("compaction", agg["by_model"])
+            self.assertNotIn("unknown", agg["by_model"])
+            s1 = next(s for s in rep.sessions if s.conversation_id.startswith("11111111"))
+            self.assertEqual(mod._primary_model(s1), "gemini-4-neon-xhigh")
+            ordered_hit = mod._sort_sessions(rep.sessions, "hit")
+            # Multi-turn s1 comes ahead of single-turn s2 on --sort hit
+            self.assertEqual(ordered_hit[0].conversation_id, s1.conversation_id)
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}
