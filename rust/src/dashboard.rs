@@ -25,9 +25,9 @@ use crate::d2d::{
     theme_for, with_alpha, BarItem, D2DFactories, Fonts, Theme, WindowSurface,
 };
 use crate::stats::{
-    filter_snapshot, fmt_commas, fmt_compact, fmt_gap, fmt_num, iso_week_key, iso_week_range_label,
-    weekday_cn, workspace_short_name, AggregatedStats, DateScope, ScanSnapshot, SessionInfo,
-    SessionSort, TokenCounts,
+    filter_snapshot, fmt_commas, fmt_compact, fmt_gap, fmt_num, is_compaction_model, iso_week_key,
+    iso_week_range_label, weekday_cn, workspace_short_name, AggregatedStats, DateScope,
+    ModelCacheStats, ScanSnapshot, SessionInfo, SessionSort, TokenCounts,
 };
 use crate::telemetry::{apply_win11_frame, copy_text_to_clipboard, SystemTelemetry};
 
@@ -36,6 +36,7 @@ pub enum Tab {
     Overview,
     Daily,
     Weekly,
+    Models,
     Sessions,
     System,
 }
@@ -50,6 +51,19 @@ pub enum WeeklyMode {
 pub enum BreakdownMode {
     Model,
     Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCardMetric {
+    Volume,
+    CacheHit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSort {
+    TotalDesc,
+    HitRateAsc,
+    HitRateDesc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +111,8 @@ pub enum ClickAction {
     ToggleSystemView,
     SelectWeeklyMode(WeeklyMode),
     SelectBreakdown(BreakdownMode),
+    SelectModelCardMetric(ModelCardMetric),
+    SelectModelSort(ModelSort),
     SelectScope(DateScope),
     ToggleFreshOnly,
     ToggleLightTheme,
@@ -122,6 +138,8 @@ pub struct DashboardView {
     prev_token_tab: Tab,
     pub weekly_mode: WeeklyMode,
     pub breakdown_mode: BreakdownMode,
+    pub model_card_metric: ModelCardMetric,
+    pub model_sort: ModelSort,
     pub scope: DateScope,
     pub sort: SessionSort,
     pub session_filter: Option<SessionFilter>,
@@ -142,18 +160,21 @@ pub struct DashboardView {
     dirty_filter: bool,
 }
 
+fn hit_rate_color(theme: &Theme, rate: f64) -> D2D1_COLOR_F {
+    if rate >= 85.0 {
+        theme.sage
+    } else if rate >= 60.0 {
+        theme.warn
+    } else {
+        theme.danger
+    }
+}
+
 fn cache_hit_color(theme: &Theme, c: &TokenCounts) -> D2D1_COLOR_F {
     if c.calls <= 1 && c.cache_read_tokens == 0 {
         theme.muted
     } else {
-        let r = c.cache_hit_rate();
-        if r < 65.0 {
-            theme.warn
-        } else if r >= 85.0 {
-            theme.sage
-        } else {
-            theme.sub
-        }
+        hit_rate_color(theme, c.cache_hit_rate())
     }
 }
 
@@ -165,6 +186,8 @@ impl DashboardView {
             prev_token_tab: Tab::Overview,
             weekly_mode: WeeklyMode::Weekly,
             breakdown_mode: BreakdownMode::Model,
+            model_card_metric: ModelCardMetric::Volume,
+            model_sort: ModelSort::TotalDesc,
             scope,
             sort: SessionSort::Recent,
             session_filter: None,
@@ -244,6 +267,41 @@ impl DashboardView {
             }
         }
         sorted
+    }
+
+    fn ordered_models(&self, sort: ModelSort) -> (Vec<(String, TokenCounts)>, Vec<(String, TokenCounts)>) {
+        let mut primary: Vec<(String, TokenCounts)> = Vec::new();
+        let mut secondary: Vec<(String, TokenCounts)> = Vec::new();
+        for (name, c) in &self.cached_agg.by_model {
+            if is_compaction_model(name) {
+                secondary.push((name.clone(), *c));
+            } else {
+                primary.push((name.clone(), *c));
+            }
+        }
+        match sort {
+            ModelSort::TotalDesc => {
+                primary.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+            }
+            ModelSort::HitRateAsc => {
+                primary.sort_by(|a, b| {
+                    a.1.cache_hit_rate()
+                        .partial_cmp(&b.1.cache_hit_rate())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.1.total_tokens().cmp(&a.1.total_tokens()))
+                });
+            }
+            ModelSort::HitRateDesc => {
+                primary.sort_by(|a, b| {
+                    b.1.cache_hit_rate()
+                        .partial_cmp(&a.1.cache_hit_rate())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.1.total_tokens().cmp(&a.1.total_tokens()))
+                });
+            }
+        }
+        secondary.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+        (primary, secondary)
     }
 
     pub fn mark_data_dirty(&mut self) {
@@ -333,6 +391,15 @@ impl DashboardView {
                 self.breakdown_mode = mode;
                 (false, false)
             }
+            ClickAction::SelectModelCardMetric(metric) => {
+                self.model_card_metric = metric;
+                (false, false)
+            }
+            ClickAction::SelectModelSort(sort) => {
+                self.model_sort = sort;
+                self.scroll_rows = 0;
+                (false, false)
+            }
             ClickAction::SelectScope(s) => {
                 self.scope = s;
                 self.scroll_rows = 0;
@@ -361,19 +428,66 @@ impl DashboardView {
                     DateScope::Days30 => "近30天",
                     DateScope::All => "全部",
                 };
-                let text = format!(
-                    "AGY CLI Token 用量 ({})\n- 会话: {} | 调用: {}\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
-                    scope_lbl,
-                    self.cached_sessions.len(),
-                    t.calls,
-                    fmt_commas(t.input_tokens),
-                    fmt_commas(t.cache_read_tokens),
-                    t.cache_hit_rate(),
-                    fmt_commas(t.output_tokens),
-                    fmt_commas(t.total_tokens()),
-                    fmt_commas(t.non_cached_tokens()),
-                    fmt_commas(t.peak_context),
-                );
+                let text = if self.active_tab == Tab::Models {
+                    let (primary, secondary) = self.ordered_models(self.model_sort);
+                    let mut lines = vec![
+                        format!("AGY CLI 按模型缓存命中率 ({})", scope_lbl),
+                        "| 模型 | 调用 | 命中率 | 稳定命中(第2轮起) | 未命中 | 新增输入 | 缓存读取 | 输出 | 总 Token | 峰值Ctx |".to_string(),
+                        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+                    ];
+                    let fmt_row = |name: &str, c: &TokenCounts, mcs: Option<&ModelCacheStats>, tag: &str| {
+                        let mt = mcs
+                            .and_then(ModelCacheStats::multi_turn_hit_rate)
+                            .map(|r| format!("{r:.1}%"))
+                            .unwrap_or_else(|| "-".into());
+                        let miss = mcs
+                            .filter(|m| m.miss_count > 0)
+                            .map(|m| format!("{}次", m.miss_count))
+                            .unwrap_or_else(|| "-".into());
+                        format!(
+                            "| {}{} | {} | {:.1}% | {} | {} | {} | {} | {} | {} | {} |",
+                            name,
+                            tag,
+                            c.calls,
+                            c.cache_hit_rate(),
+                            mt,
+                            miss,
+                            fmt_compact(c.input_tokens),
+                            fmt_compact(c.cache_read_tokens),
+                            fmt_compact(c.output_tokens),
+                            fmt_compact(c.total_tokens()),
+                            fmt_compact(c.peak_context),
+                        )
+                    };
+                    for (name, c) in &primary {
+                        lines.push(fmt_row(name, c, self.cached_agg.by_model_cache.get(name), ""));
+                    }
+                    for (name, c) in &secondary {
+                        lines.push(fmt_row(name, c, self.cached_agg.by_model_cache.get(name), " [次要]"));
+                    }
+                    lines.push(format!(
+                        "\n总计: {} 次调用 · 总 Token {} · 综合缓存命中 {:.1}% · 峰值Ctx {}",
+                        t.calls,
+                        fmt_commas(t.total_tokens()),
+                        t.cache_hit_rate(),
+                        fmt_commas(t.peak_context),
+                    ));
+                    lines.join("\n")
+                } else {
+                    format!(
+                        "AGY CLI Token 用量 ({})\n- 会话: {} | 调用: {}\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
+                        scope_lbl,
+                        self.cached_sessions.len(),
+                        t.calls,
+                        fmt_commas(t.input_tokens),
+                        fmt_commas(t.cache_read_tokens),
+                        t.cache_hit_rate(),
+                        fmt_commas(t.output_tokens),
+                        fmt_commas(t.total_tokens()),
+                        fmt_commas(t.non_cached_tokens()),
+                        fmt_commas(t.peak_context),
+                    )
+                };
                 if copy_text_to_clipboard(hwnd, &text) {
                     self.copied_until = Some(Instant::now() + std::time::Duration::from_millis(1600));
                 }
@@ -539,6 +653,7 @@ impl DashboardView {
                 Tab::Overview => self.draw_overview_tab(rt, fonts, theme, body, snapshot, human),
                 Tab::Daily => self.draw_daily_tab(rt, fonts, theme, body, human),
                 Tab::Weekly => self.draw_weekly_tab(rt, fonts, theme, body, human),
+                Tab::Models => self.draw_models_tab(rt, fonts, theme, body, human),
                 Tab::Sessions => self.draw_sessions_tab(rt, fonts, theme, body, human),
                 Tab::System => self.draw_system_tab(factories, rt, fonts, theme, body, snapshot, telemetry),
             }
@@ -568,14 +683,15 @@ impl DashboardView {
         draw_text(rt, "AGY", &fonts.ui_brand, rect_f(35.0, 0.0, 42.0, h), theme.text);
         draw_text(rt, "/ 用量", &fonts.ui_small, rect_f(72.0, 1.0, 46.0, h), theme.muted);
 
-        // Flattened 4 direct token tabs (System monitor lives on Hero CPU/RAM rings)
+        // Flattened 5 direct token tabs (System monitor lives on Hero CPU/RAM rings)
         let tabs = [
-            (Tab::Overview, "概览", 48.0),
-            (Tab::Daily, "按天", 48.0),
-            (Tab::Weekly, "按周", 48.0),
-            (Tab::Sessions, "会话", 48.0),
+            (Tab::Overview, "概览", 44.0),
+            (Tab::Daily, "按天", 44.0),
+            (Tab::Weekly, "按周", 44.0),
+            (Tab::Models, "模型", 44.0),
+            (Tab::Sessions, "会话", 44.0),
         ];
-        let mut tx = 136.0;
+        let mut tx = 132.0;
         for (tab, lbl, tw) in tabs {
             let r = rect_f(tx, 0.0, tw, h);
             let act = self.active_tab == tab;
@@ -588,10 +704,10 @@ impl DashboardView {
                 if act { theme.text } else if hov { theme.sub } else { theme.muted },
             );
             if act {
-                fill_round_rect(rt, rect_f(tx + 8.0, h - 2.5, tw - 16.0, 2.5), 1.25, theme.accent);
+                fill_round_rect(rt, rect_f(tx + 7.0, h - 2.5, tw - 14.0, 2.5), 1.25, theme.accent);
             }
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectTab(tab) });
-            tx += tw + 10.0;
+            tx += tw + 8.0;
         }
 
         // Right minimalist utility actions
@@ -950,7 +1066,7 @@ impl DashboardView {
         fill_round_rect(rt, tr, 10.0, theme.surface);
         stroke_round_rect(rt, tr, 10.0, theme.border, 1.0);
 
-        let split_y = tr.top + (top_h * 0.44).clamp(96.0, 114.0);
+        let split_y = tr.top + (top_h * 0.41).clamp(93.0, 100.0);
         // Clickable upper ISO Week block -> jumps straight to Weekly tab
         let wk_hit = rect_f(tr.left + 4.0, tr.top + 4.0, right_w - 8.0, (split_y - tr.top - 8.0).max(60.0));
         let wk_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&wk_hit, mx, my)).unwrap_or(false);
@@ -1042,13 +1158,42 @@ impl DashboardView {
             });
             bx += bw_btn + 4.0;
         }
-        draw_text(
-            rt,
-            if self.breakdown_mode == BreakdownMode::Model { "占比 · 缓存命中" } else { "占比 · 会话数" },
-            &fonts.ui_small_right,
-            rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0),
-            theme.muted,
-        );
+        if self.breakdown_mode == BreakdownMode::Model {
+            let mut mx = tr.right - 98.0;
+            for (metric, lbl, mw) in [
+                (ModelCardMetric::Volume, "用量", 36.0),
+                (ModelCardMetric::CacheHit, "缓存率", 44.0),
+            ] {
+                let r = rect_f(mx, split_y + 7.0, mw, 20.0);
+                let act = self.model_card_metric == metric;
+                let hov = self.mouse_dip.map(|(px, py)| hit_rect(&r, px, py)).unwrap_or(false);
+                if act {
+                    fill_round_rect(rt, r, 5.0, theme.hover);
+                } else if hov {
+                    fill_round_rect(rt, r, 5.0, with_alpha(theme.text, 0.04));
+                }
+                draw_text(
+                    rt,
+                    lbl,
+                    &fonts.ui_small_center,
+                    r,
+                    if act { theme.text } else if hov { theme.sub } else { theme.muted },
+                );
+                self.hit_boxes.push(HitBox {
+                    rect: r,
+                    action: ClickAction::SelectModelCardMetric(metric),
+                });
+                mx += mw + 3.0;
+            }
+        } else {
+            draw_text(
+                rt,
+                "占比 · 会话数",
+                &fonts.ui_small_right,
+                rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0),
+                theme.muted,
+            );
+        }
         let bd_bounds = rect_f(tr.left + 16.0, split_y + 31.0, right_w - 32.0, (tr.bottom - split_y - 37.0).max(24.0));
         match self.breakdown_mode {
             BreakdownMode::Model => self.draw_compact_models(rt, fonts, theme, bd_bounds, human),
@@ -1144,43 +1289,89 @@ impl DashboardView {
     }
 
     fn draw_compact_models(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
-        let mut items: Vec<(String, TokenCounts)> = self
-            .cached_agg
-            .by_model
-            .iter()
-            .map(|(k, c)| (k.clone(), *c))
-            .collect();
-        items.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
-        if items.is_empty() {
+        let sort = match self.model_card_metric {
+            ModelCardMetric::Volume => ModelSort::TotalDesc,
+            ModelCardMetric::CacheHit => ModelSort::HitRateDesc,
+        };
+        let (primary, secondary) = self.ordered_models(sort);
+        if primary.is_empty() && secondary.is_empty() {
             draw_text(rt, "当前范围暂无模型数据", &fonts.ui_small, bounds, theme.muted);
             return;
         }
         let avail_h = (bounds.bottom - bounds.top).max(24.0);
-        let max_show = if avail_h >= 82.0 { 3 } else { 2 };
-        let show_n = items.len().min(max_show);
+        let max_show: usize = if avail_h >= 94.0 { 4 } else if avail_h >= 66.0 { 3 } else { 2 };
+        let show_secondary = !secondary.is_empty()
+            && (primary.is_empty() || primary.len() < max_show || max_show >= 3);
+        let max_primary = if show_secondary { max_show.saturating_sub(1) } else { max_show };
+
+        let mut rows: Vec<(String, TokenCounts, bool)> = primary
+            .into_iter()
+            .take(max_primary)
+            .map(|(n, c)| (n, c, false))
+            .collect();
+        if show_secondary {
+            if let Some((n, c)) = secondary.into_iter().next() {
+                rows.push((n, c, true));
+            }
+        }
+
+        let show_n = rows.len().max(1);
         let total_all = self.cached_agg.total.total_tokens().max(1);
-        let row_h = (avail_h / show_n as f32).clamp(24.0, 34.0);
+        let row_h = (avail_h / show_n as f32).clamp(21.5, 34.0);
         let w = bounds.right - bounds.left;
         let palette = [theme.accent, theme.output, theme.ram];
+        let hit_w = 46.0_f32.min(w * 0.24);
+        let name_w = (w * 0.44).max(80.0);
+        let stat_l = bounds.left + name_w + 4.0;
+        let stat_w = (w - name_w - hit_w - 8.0).max(40.0);
 
-        for (i, (name, c)) in items.into_iter().take(show_n).enumerate() {
+        for (i, (name, c, is_sec)) in rows.into_iter().enumerate() {
             let y = bounds.top + i as f32 * row_h;
-            let row_r = rect_f(bounds.left - 4.0, y - 2.0, w + 8.0, row_h.min(27.0));
+            if is_sec && i > 0 {
+                draw_line(rt, bounds.left, y - 2.0, bounds.right, y - 2.0, theme.border, 0.8);
+            }
+            let row_r = rect_f(bounds.left - 4.0, y - 1.5, w + 8.0, row_h.min(24.0));
             let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&row_r, mx, my)).unwrap_or(false);
             if hov {
                 fill_round_rect(rt, row_r, 5.0, with_alpha(theme.text, 0.04));
             }
             let share = (c.total_tokens() as f64 / total_all as f64) as f32;
-            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), if hov { theme.accent } else { theme.text });
-            let stat = format!(
-                "{} ({:.0}%) · {:.0}%",
-                fmt_num(c.total_tokens(), human),
-                share * 100.0,
-                c.cache_hit_rate()
+            let hit = c.cache_hit_rate();
+            let hit_col = if is_sec { theme.muted } else { cache_hit_color(theme, &c) };
+            let name_col = if hov {
+                theme.accent
+            } else if is_sec {
+                theme.muted
+            } else {
+                theme.text
+            };
+            let stat_col = if is_sec { theme.muted } else { theme.sub };
+            let stat = format!("{} ({:.0}%)", fmt_num(c.total_tokens(), human), share * 100.0);
+
+            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, name_w, 15.0), name_col);
+            draw_text(rt, &stat, &fonts.mono_small_right, rect_f(stat_l, y, stat_w, 15.0), stat_col);
+            draw_text(
+                rt,
+                &format!("{:.1}%", hit),
+                if is_sec { &fonts.mono_small_right } else { &fonts.mono_med_right },
+                rect_f(bounds.right - hit_w, y, hit_w, 15.0),
+                hit_col,
             );
-            draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.46, y, w * 0.54, 16.0), theme.sub);
-            fill_round_rect(rt, rect_f(bounds.left, y + 18.0, w, 3.5), 1.75, theme.grid);
-            fill_round_rect(rt, rect_f(bounds.left, y + 18.0, (w * share).max(3.0), 3.5), 1.75, palette[i % palette.len()]);
+
+            let (bar_frac, bar_col) = match self.model_card_metric {
+                ModelCardMetric::Volume => (
+                    share,
+                    if is_sec { theme.cache } else { palette[i % palette.len()] },
+                ),
+                ModelCardMetric::CacheHit => (
+                    (hit as f32 / 100.0).clamp(0.0, 1.0),
+                    if is_sec { theme.cache } else { hit_col },
+                ),
+            };
+            fill_round_rect(rt, rect_f(bounds.left, y + 16.5, w, 3.0), 1.5, theme.grid);
+            if bar_frac > 0.0 {
+                fill_round_rect(rt, rect_f(bounds.left, y + 16.5, (w * bar_frac).max(3.0), 3.0), 1.5, bar_col);
+            }
             self.hit_boxes.push(HitBox {
                 rect: row_r,
                 action: ClickAction::FilterSessions(SessionFilter::Model(name)),
@@ -1377,6 +1568,7 @@ impl DashboardView {
             ],
             &rows,
             Some(&row_actions),
+            None,
         );
     }
 
@@ -1507,6 +1699,7 @@ impl DashboardView {
                     ],
                     &rows,
                     Some(&wk_actions),
+                    None,
                 );
             }
             WeeklyMode::Monthly => {
@@ -1565,9 +1758,320 @@ impl DashboardView {
                     ],
                     &rows,
                     None,
+                    None,
                 );
             }
         }
+    }
+
+    // ---------- Tab 4: Per-Model Cache Hit Rate Comparison & Full Breakdown ----------
+
+    fn draw_models_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
+        let bw = body.right - body.left;
+        let bh = body.bottom - body.top;
+        let chart_h = (bh * 0.45).clamp(176.0, 245.0);
+        let chart_c = rect_f(body.left, body.top, bw, chart_h);
+        fill_round_rect(rt, chart_c, 10.0, theme.surface);
+        stroke_round_rect(rt, chart_c, 10.0, theme.border, 1.0);
+
+        draw_text(
+            rt,
+            "各模型缓存命中率对比",
+            &fonts.ui_section,
+            rect_f(chart_c.left + 16.0, chart_c.top + 10.0, 152.0, 20.0),
+            theme.text,
+        );
+        if self.scope == DateScope::Today {
+            let hint_r = rect_f(chart_c.left + 166.0, chart_c.top + 9.0, 108.0, 22.0);
+            self.draw_ghost_btn(
+                rt,
+                fonts,
+                theme,
+                hint_r,
+                "仅今日 · 展开全部",
+                true,
+                ClickAction::SelectScope(DateScope::All),
+            );
+        }
+
+        // Right header sort controls
+        let sorts = [
+            (ModelSort::TotalDesc, "按总量", 50.0),
+            (ModelSort::HitRateAsc, "命中低→高", 68.0),
+            (ModelSort::HitRateDesc, "命中高→低", 68.0),
+        ];
+        let mut sx = chart_c.right - 14.0 - (50.0 + 68.0 + 68.0 + 6.0);
+        for (sort_k, lbl, sw) in sorts {
+            let r = rect_f(sx, chart_c.top + 9.0, sw, 22.0);
+            let act = self.model_sort == sort_k;
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
+            if act {
+                fill_round_rect(rt, r, 6.0, theme.hover);
+            } else if hov {
+                fill_round_rect(rt, r, 6.0, with_alpha(theme.text, 0.04));
+            }
+            draw_text(
+                rt,
+                lbl,
+                &fonts.ui_small_center,
+                r,
+                if act { theme.text } else if hov { theme.sub } else { theme.muted },
+            );
+            self.hit_boxes.push(HitBox {
+                rect: r,
+                action: ClickAction::SelectModelSort(sort_k),
+            });
+            sx += sw + 3.0;
+        }
+
+        let (primary, secondary) = self.ordered_models(self.model_sort);
+        let plot = rect_f(chart_c.left + 14.0, chart_c.top + 38.0, bw - 28.0, chart_h - 46.0);
+        self.plot_rects.push(plot);
+
+        if primary.is_empty() && secondary.is_empty() {
+            draw_text(
+                rt,
+                "当前范围暂无模型用量 · 可切换右上角 7天 / 30天 / 全部",
+                &fonts.ui_reg_center,
+                plot,
+                theme.muted,
+            );
+        } else {
+            let label_w = (plot.right - plot.left) * 0.24;
+            let label_w = label_w.clamp(146.0, 226.0);
+            let right_w = 178.0_f32.min((plot.right - plot.left) * 0.28);
+            let track_l = plot.left + label_w + 10.0;
+            let track_r = (plot.right - right_w - 10.0).max(track_l + 80.0);
+            let track_w = track_r - track_l;
+            let axis_h = 18.0;
+            let rows_top = plot.top + 4.0;
+            let rows_bot = (plot.bottom - axis_h).max(rows_top + 28.0);
+
+            // Vertical percentage gridlines + 85% healthy guide
+            for pct in [0, 25, 50, 75, 100] {
+                let gx = track_l + (pct as f32 / 100.0) * track_w;
+                let col = if pct == 0 || pct == 100 { theme.border } else { theme.grid };
+                draw_line(rt, gx, rows_top, gx, rows_bot, col, 1.0);
+                if pct == 0 || pct == 50 || pct == 100 {
+                    draw_text(
+                        rt,
+                        &format!("{pct}%"),
+                        &fonts.mono_small_center,
+                        rect_f(gx - 20.0, rows_bot + 2.0, 40.0, 14.0),
+                        theme.muted,
+                    );
+                }
+            }
+            let gx85 = track_l + 0.85 * track_w;
+            draw_line(rt, gx85, rows_top, gx85, rows_bot, with_alpha(theme.sage, 0.30), 1.0);
+            draw_text(
+                rt,
+                "85%",
+                &fonts.mono_small_center,
+                rect_f(gx85 - 16.0, rows_bot + 2.0, 32.0, 14.0),
+                with_alpha(theme.sage, 0.85),
+            );
+
+            let max_chart_rows = (((rows_bot - rows_top) / 26.0).floor() as usize).clamp(2, 6);
+            let show_sec_in_chart = !secondary.is_empty() && (primary.is_empty() || max_chart_rows >= 2);
+            let max_pri = if show_sec_in_chart { max_chart_rows - 1 } else { max_chart_rows };
+            let mut chart_items: Vec<(String, TokenCounts, bool)> = primary
+                .iter()
+                .take(max_pri)
+                .map(|(n, c)| (n.clone(), *c, false))
+                .collect();
+            if show_sec_in_chart {
+                if let Some((n, c)) = secondary.first() {
+                    chart_items.push((n.clone(), *c, true));
+                }
+            }
+
+            let n_rows = chart_items.len().max(1);
+            let row_h = ((rows_bot - rows_top) / n_rows as f32).clamp(24.0, 36.0);
+            let mut hovered_tip: Option<(f32, f32, Vec<String>)> = None;
+
+            for (i, (name, c, is_sec)) in chart_items.iter().enumerate() {
+                let ry = rows_top + i as f32 * row_h;
+                if *is_sec && i > 0 {
+                    draw_line(rt, plot.left, ry - 1.5, plot.right, ry - 1.5, theme.border, 0.9);
+                }
+                let rr = rect_f(plot.left - 4.0, ry + 1.0, (plot.right - plot.left) + 8.0, row_h - 3.0);
+                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
+                if hov {
+                    fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
+                }
+
+                let hit = c.cache_hit_rate();
+                let col = if *is_sec { theme.cache } else { cache_hit_color(theme, c) };
+                let name_col = if hov {
+                    theme.accent
+                } else if *is_sec {
+                    theme.muted
+                } else {
+                    theme.text
+                };
+                draw_text(rt, name, &fonts.mono_small, rect_f(plot.left, ry, label_w, row_h), name_col);
+
+                let bar_h = (row_h * 0.34).clamp(7.0, 10.0);
+                let bar_y = ry + (row_h - bar_h) * 0.5;
+                fill_round_rect(rt, rect_f(track_l, bar_y, track_w, bar_h), bar_h * 0.5, theme.grid);
+                let fill_w = ((hit as f32 / 100.0).clamp(0.0, 1.0) * track_w).max(if c.cache_read_tokens > 0 { 4.0 } else { 0.0 });
+                if fill_w > 0.0 {
+                    fill_round_rect(rt, rect_f(track_l, bar_y, fill_w, bar_h), bar_h * 0.5, col);
+                }
+
+                let hit_txt = format!("{:.1}%", hit);
+                let meta_txt = if *is_sec {
+                    format!("{}次 · 次要", c.calls)
+                } else {
+                    format!("{}次 · {}", c.calls, fmt_num(c.total_tokens(), human))
+                };
+                draw_text(
+                    rt,
+                    &hit_txt,
+                    if *is_sec { &fonts.mono_small_right } else { &fonts.mono_med_right },
+                    rect_f(track_r + 8.0, ry, 50.0, row_h),
+                    if *is_sec { theme.muted } else { col },
+                );
+                draw_text(
+                    rt,
+                    &meta_txt,
+                    &fonts.mono_small_right,
+                    rect_f(track_r + 62.0, ry, (plot.right - (track_r + 62.0)).max(50.0), row_h),
+                    theme.muted,
+                );
+
+                self.hit_boxes.push(HitBox {
+                    rect: rr,
+                    action: ClickAction::FilterSessions(SessionFilter::Model(name.clone())),
+                });
+
+                if hov {
+                    let mcs = self.cached_agg.by_model_cache.get(name);
+                    let mt_str = mcs
+                        .and_then(ModelCacheStats::multi_turn_hit_rate)
+                        .map(|r| format!("{r:.1}% (第2轮起 {} 次)", mcs.map(|m| m.multi_turn_calls).unwrap_or(0)))
+                        .unwrap_or_else(|| "-".into());
+                    let mut tip = vec![
+                        if *is_sec {
+                            format!("{} · {} 次调用 (次要压缩)", name, c.calls)
+                        } else {
+                            format!("{} · {} 次调用 (点击筛选会话)", name, c.calls)
+                        },
+                        format!("总命中率 : {:.1}%", hit),
+                        format!("稳定命中 : {}", mt_str),
+                    ];
+                    if !*is_sec {
+                        let (mc, mu) = mcs.map(|m| (m.miss_count, m.miss_uncached_tokens)).unwrap_or((0, 0));
+                        tip.push(if mc > 0 {
+                            format!("缓存未命 : {} 次 (重传 {})", mc, fmt_commas(mu))
+                        } else {
+                            "缓存未命 : 0 次".to_string()
+                        });
+                    }
+                    tip.push(format!("新增输入 : {}  |  缓存读 : {}", fmt_commas(c.input_tokens), fmt_commas(c.cache_read_tokens)));
+                    tip.push(format!("输出     : {}  |  总计   : {}", fmt_commas(c.output_tokens), fmt_commas(c.total_tokens())));
+                    tip.push(format!("峰值Ctx  : {}", fmt_commas(c.peak_context)));
+                    let (mx, _) = self.mouse_dip.unwrap_or((track_l + track_w * 0.5, ry));
+                    hovered_tip = Some((mx, ry, tip));
+                }
+            }
+
+            if let Some((mx, ry, lines)) = hovered_tip {
+                let max_units = lines
+                    .iter()
+                    .map(|l| {
+                        l.chars()
+                            .map(|ch| if ch.is_ascii() { 1.0_f32 } else { 1.82_f32 })
+                            .sum::<f32>()
+                    })
+                    .fold(0.0_f32, f32::max);
+                let tw = (max_units * 6.4 + 24.0).clamp(240.0, (plot.right - plot.left - 16.0).max(240.0));
+                let th = lines.len() as f32 * 16.0 + 14.0;
+                let tx = (mx + 14.0).min(plot.right - tw - 4.0).max(plot.left + 4.0);
+                let ty = (ry - 4.0).clamp(plot.top, (plot.bottom - th).max(plot.top));
+                let tr = rect_f(tx, ty, tw, th);
+                fill_round_rect(rt, tr, 8.0, theme.tooltip_bg);
+                stroke_round_rect(rt, tr, 8.0, theme.border, 1.0);
+                for (li, line) in lines.iter().enumerate() {
+                    draw_text(
+                        rt,
+                        line,
+                        &fonts.mono_small,
+                        rect_f(tx + 10.0, ty + 7.0 + li as f32 * 16.0, tw - 20.0, 16.0),
+                        if li == 0 { theme.text } else { theme.sub },
+                    );
+                }
+            }
+        }
+
+        // Bottom full-width breakdown table (compaction pinned to bottom secondary rows)
+        let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
+        let secondary_from = if secondary.is_empty() { None } else { Some(primary.len()) };
+
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(primary.len() + secondary.len());
+        let mut actions: Vec<ClickAction> = Vec::with_capacity(primary.len() + secondary.len());
+
+        let mut push_model_row = |name: String, c: TokenCounts, is_sec: bool| {
+            let mcs = self.cached_agg.by_model_cache.get(&name);
+            let mt_str = if is_sec {
+                "-".to_string()
+            } else {
+                mcs.and_then(ModelCacheStats::multi_turn_hit_rate)
+                    .map(|r| format!("{r:.1}%"))
+                    .unwrap_or_else(|| "-".into())
+            };
+            let miss_str = if is_sec {
+                "-".to_string()
+            } else {
+                match mcs.map(|m| m.miss_count).unwrap_or(0) {
+                    0 => "-".to_string(),
+                    n => format!("{}次", n),
+                }
+            };
+            rows.push(vec![
+                name.clone(),
+                c.calls.to_string(),
+                format!("{:.1}%", c.cache_hit_rate()),
+                mt_str,
+                miss_str,
+                fmt_num(c.input_tokens, human),
+                fmt_num(c.cache_read_tokens, human),
+                fmt_num(c.output_tokens, human),
+                fmt_num(c.total_tokens(), human),
+                fmt_num(c.peak_context, human),
+            ]);
+            actions.push(ClickAction::FilterSessions(SessionFilter::Model(name)));
+        };
+
+        for (name, c) in primary {
+            push_model_row(name, c, false);
+        }
+        for (name, c) in secondary {
+            push_model_row(name, c, true);
+        }
+
+        self.draw_table(
+            rt,
+            fonts,
+            theme,
+            tbl_r,
+            &[
+                ("模型", 0.22, false),
+                ("调用", 0.06, true),
+                ("命中率", 0.08, true),
+                ("稳定命中", 0.085, true),
+                ("未命中", 0.065, true),
+                ("新增输入", 0.10, true),
+                ("缓存读取", 0.10, true),
+                ("输出", 0.08, true),
+                ("总 Token", 0.11, true),
+                ("峰值Ctx", 0.10, true),
+            ],
+            &rows,
+            Some(&actions),
+            secondary_from,
+        );
     }
 
     // ---------- Tab 4: Session Explorer + Per-Session Cache Hit Rate & Turn Anatomy ----------
@@ -1973,6 +2477,7 @@ impl DashboardView {
         cols: &[(&str, f32, bool)],
         rows: &[Vec<String>],
         row_actions: Option<&[ClickAction]>,
+        secondary_from: Option<usize>,
     ) {
         fill_round_rect(rt, bounds, 10.0, theme.surface);
         stroke_round_rect(rt, bounds, 10.0, theme.border, 1.0);
@@ -2010,6 +2515,9 @@ impl DashboardView {
         }
 
         for (vi, row) in rows.iter().skip(self.scroll_rows).take(vis_rows).enumerate() {
+            let abs_idx = self.scroll_rows + vi;
+            let is_secondary = secondary_from.map(|s| abs_idx >= s).unwrap_or(false);
+            let is_sec_boundary = secondary_from == Some(abs_idx) && vi > 0;
             let ry = body_top + vi as f32 * row_h;
             let rr = rect_f(bounds.left + 8.0, ry, bounds.right - bounds.left - 20.0, row_h - 1.0);
             let hovered = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
@@ -2017,14 +2525,16 @@ impl DashboardView {
                 fill_round_rect(rt, rr, 6.0, theme.hover);
             }
             if let Some(acts) = row_actions {
-                if let Some(act) = acts.get(self.scroll_rows + vi) {
+                if let Some(act) = acts.get(abs_idx) {
                     self.hit_boxes.push(HitBox {
                         rect: rr,
                         action: act.clone(),
                     });
                 }
             }
-            if vi > 0 {
+            if is_sec_boundary {
+                draw_line(rt, bounds.left + 12.0, ry, bounds.right - 12.0, ry, theme.border, 1.0);
+            } else if vi > 0 {
                 draw_line(rt, bounds.left + 14.0, ry, bounds.right - 14.0, ry, theme.grid, 0.8);
             }
 
@@ -2032,16 +2542,19 @@ impl DashboardView {
             for (ci, &(col_title, frac, right_align)) in cols.iter().enumerate() {
                 let cw = inner_w * frac;
                 let cell = row.get(ci).map(String::as_str).unwrap_or("");
-                let color = if cell.starts_with('+') && cell.ends_with('%') {
+                let color = if is_secondary {
+                    theme.muted
+                } else if cell.starts_with('+') && cell.ends_with('%') {
                     theme.accent
                 } else if cell.starts_with('-') && cell.ends_with('%') {
                     theme.sage
-                } else if col_title == "命中率" {
+                } else if col_title == "命中率" || col_title == "稳定命中" {
                     match cell.trim_end_matches('%').parse::<f64>() {
-                        Ok(v) if v >= 85.0 => theme.sage,
-                        Ok(v) if v < 65.0 && v > 0.0 => theme.warn,
-                        _ => theme.sub,
+                        Ok(v) if cell.ends_with('%') => hit_rate_color(theme, v),
+                        _ => theme.muted,
                     }
+                } else if col_title == "未命中" {
+                    if cell == "-" { theme.muted } else { theme.warn }
                 } else if ci == 0 || col_title == "总 Token" {
                     theme.text
                 } else {
@@ -2159,5 +2672,34 @@ mod tests {
         // Leaving chart plot repaints once to clear tooltip
         assert!(view.on_mouse_move(5.0, 5.0));
         assert!(!view.on_mouse_leave());
+    }
+
+    #[test]
+    fn test_ordered_models_pins_compaction_to_secondary() {
+        let mut view = DashboardView::new(false, DateScope::All);
+        let mut hi = TokenCounts::default();
+        hi.add_call(1_000, 9_000, 0, 200); // 90% hit, 10.2K total
+        let mut lo = TokenCounts::default();
+        lo.add_call(4_000, 1_000, 0, 200); // 20% hit, 5.2K total
+        let mut cp = TokenCounts::default();
+        cp.add_call(1_000, 99_000, 0, 500); // 99% hit, 100.5K total (compaction!)
+
+        view.cached_agg.by_model.insert("model-hi".into(), hi);
+        view.cached_agg.by_model.insert("model-lo".into(), lo);
+        view.cached_agg.by_model.insert("(上下文压缩)".into(), cp);
+
+        for sort in [ModelSort::TotalDesc, ModelSort::HitRateAsc, ModelSort::HitRateDesc] {
+            let (pri, sec) = view.ordered_models(sort);
+            assert_eq!(pri.len(), 2);
+            assert_eq!(sec.len(), 1);
+            assert_eq!(sec[0].0, "(上下文压缩)");
+            if sort == ModelSort::HitRateAsc {
+                assert_eq!(pri[0].0, "model-lo");
+                assert_eq!(pri[1].0, "model-hi");
+            } else {
+                assert_eq!(pri[0].0, "model-hi");
+                assert_eq!(pri[1].0, "model-lo");
+            }
+        }
     }
 }

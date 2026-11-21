@@ -191,6 +191,31 @@ pub fn workspace_short_name(workspace: &str) -> String {
         .to_string()
 }
 
+pub const COMPACTION_MODEL_LABEL: &str = "(上下文压缩)";
+
+pub fn is_compaction_model(model: &str) -> bool {
+    model == COMPACTION_MODEL_LABEL || model == "compaction"
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelCacheStats {
+    pub miss_count: usize,
+    pub miss_uncached_tokens: u64,
+    pub multi_turn_calls: u64,
+    pub multi_turn_input: u64,
+    pub multi_turn_cache_read: u64,
+}
+
+impl ModelCacheStats {
+    pub fn multi_turn_hit_rate(&self) -> Option<f64> {
+        if self.multi_turn_calls == 0 || self.multi_turn_input == 0 {
+            None
+        } else {
+            Some((self.multi_turn_cache_read as f64 / self.multi_turn_input as f64) * 100.0)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedStats {
     pub total: TokenCounts,
@@ -200,6 +225,7 @@ pub struct AggregatedStats {
     pub by_month: BTreeMap<String, TokenCounts>,
     pub by_hour: [TokenCounts; 24],
     pub by_model: BTreeMap<String, TokenCounts>,
+    pub by_model_cache: HashMap<String, ModelCacheStats>,
     pub by_workspace: BTreeMap<String, (usize, TokenCounts)>,
 }
 
@@ -624,11 +650,23 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
         ws.0 += 1;
         ws.1.merge(&s.counts);
 
-        for t in &s.turns {
+        for (idx, t) in s.turns.iter().enumerate() {
             agg.by_model
                 .entry(t.model.clone())
                 .or_default()
                 .add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
+
+            let mcs = agg.by_model_cache.entry(t.model.clone()).or_default();
+            if idx > 0 && !t.is_checkpoint {
+                let ctx = t.total_input();
+                mcs.multi_turn_calls += 1;
+                mcs.multi_turn_input = mcs.multi_turn_input.saturating_add(ctx);
+                mcs.multi_turn_cache_read = mcs.multi_turn_cache_read.saturating_add(t.cache_read_tokens);
+                if ctx >= 30_000 && t.cache_hit_rate() < 50.0 {
+                    mcs.miss_count += 1;
+                    mcs.miss_uncached_tokens = mcs.miss_uncached_tokens.saturating_add(t.input_tokens);
+                }
+            }
 
             if let Some(ts_utc) = t.timestamp_utc {
                 let ts = ts_utc.with_timezone(&Local);
@@ -816,7 +854,7 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(if is_checkpoint { "(上下文压缩)" } else { "unknown" })
+            .unwrap_or(if is_checkpoint { COMPACTION_MODEL_LABEL } else { "unknown" })
             .to_string();
 
         let step_index = match map.get("step_index").and_then(Value::as_i64) {
@@ -1155,5 +1193,17 @@ mod tests {
         };
         assert_eq!(s.cache_miss_stats(), (1, 180_000));
         assert_eq!(s.latest_context(), 185_000);
+
+        let agg = aggregate_sessions(&[s]);
+        let mcs = agg.by_model_cache.get("m").expect("model cache stats");
+        assert_eq!(mcs.miss_count, 1);
+        assert_eq!(mcs.miss_uncached_tokens, 180_000);
+        assert_eq!(mcs.multi_turn_calls, 2);
+        let mt_rate = mcs.multi_turn_hit_rate().expect("multi-turn rate");
+        // (40_000 + 5_000) / (42_000 + 185_000) = 45_000 / 227_000 ≈ 19.82%
+        assert!((mt_rate - 19.8237).abs() < 0.05);
+        assert!(is_compaction_model(COMPACTION_MODEL_LABEL));
+        assert!(is_compaction_model("compaction"));
+        assert!(!is_compaction_model("gemini-4-neon-xhigh"));
     }
 }

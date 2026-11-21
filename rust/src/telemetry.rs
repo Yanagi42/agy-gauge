@@ -33,6 +33,29 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const WM_APP_SYNC_PREFS: u32 = WM_APP + 1;
 
+pub const PILL_ITEM_TOTAL: u32 = 1 << 0;
+pub const PILL_ITEM_NON_CACHED: u32 = 1 << 1;
+pub const PILL_ITEM_CACHE_HIT: u32 = 1 << 2;
+pub const PILL_ITEM_ACTIVE_CTX: u32 = 1 << 3;
+pub const PILL_ITEM_CPU: u32 = 1 << 4;
+pub const PILL_ITEM_RAM: u32 = 1 << 5;
+pub const PILL_ITEMS_ALL_MASK: u32 =
+    PILL_ITEM_TOTAL | PILL_ITEM_NON_CACHED | PILL_ITEM_CACHE_HIT | PILL_ITEM_ACTIVE_CTX | PILL_ITEM_CPU | PILL_ITEM_RAM;
+pub const PILL_ITEMS_DEFAULT: u32 = PILL_ITEM_TOTAL | PILL_ITEM_CPU | PILL_ITEM_RAM;
+
+pub fn migrate_legacy_pill_items(mini: bool, pill_metric: u8) -> u32 {
+    let tok_bit = match pill_metric {
+        1 => PILL_ITEM_NON_CACHED,
+        2 => PILL_ITEM_ACTIVE_CTX,
+        _ => PILL_ITEM_TOTAL,
+    };
+    if mini {
+        tok_bit
+    } else {
+        tok_bit | PILL_ITEM_CPU | PILL_ITEM_RAM
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UserPrefs {
     pub light_theme: bool,
@@ -43,6 +66,7 @@ pub struct UserPrefs {
     pub fresh_only: bool,
     pub date_scope: u8,
     pub pill_metric: u8,
+    pub pill_items: u32,
     pub custom_pos: Option<(i32, i32)>,
 }
 
@@ -56,7 +80,8 @@ impl Default for UserPrefs {
             monitor_index: 0,
             fresh_only: false,
             date_scope: 0, // Default to Today (matches corner pill)
-            pill_metric: 0, // 0=TodayTotal, 1=TodayNonCached, 2=ActiveSessionCtx
+            pill_metric: 0,
+            pill_items: PILL_ITEMS_DEFAULT,
             custom_pos: None,
         }
     }
@@ -111,6 +136,13 @@ pub fn load_user_prefs() -> UserPrefs {
     if let Some(v) = reg_read_u32(w!("pill_metric")) {
         p.pill_metric = v.min(2) as u8;
     }
+    if let Some(v) = reg_read_u32(w!("pill_items")) {
+        let masked = v & PILL_ITEMS_ALL_MASK;
+        p.pill_items = if masked != 0 { masked } else { PILL_ITEMS_DEFAULT };
+    } else {
+        p.pill_items = migrate_legacy_pill_items(p.mini, p.pill_metric);
+    }
+    p.mini = (p.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
     if reg_read_u32(w!("has_custom_pos")).unwrap_or(0) != 0 {
         if let (Some(x), Some(y)) = (reg_read_u32(w!("pos_x")), reg_read_u32(w!("pos_y"))) {
             p.custom_pos = Some((x as i32, y as i32));
@@ -141,15 +173,21 @@ pub fn save_user_prefs(p: &UserPrefs) {
             Some((x, y)) => (1u32, x as u32, y as u32),
             None => (0u32, 0u32, 0u32),
         };
-        let entries: [(PCWSTR, u32); 11] = [
+        let pill_items = {
+            let m = p.pill_items & PILL_ITEMS_ALL_MASK;
+            if m != 0 { m } else { PILL_ITEMS_DEFAULT }
+        };
+        let derived_mini = (pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
+        let entries: [(PCWSTR, u32); 12] = [
             (w!("light_theme"), u32::from(p.light_theme)),
-            (w!("mini"), u32::from(p.mini)),
+            (w!("mini"), u32::from(derived_mini)),
             (w!("topmost"), u32::from(p.topmost)),
             (w!("human"), u32::from(p.human)),
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
             (w!("date_scope"), p.date_scope as u32),
             (w!("pill_metric"), p.pill_metric as u32),
+            (w!("pill_items"), pill_items),
             (w!("has_custom_pos"), has_pos),
             (w!("pos_x"), px),
             (w!("pos_y"), py),
@@ -739,5 +777,16 @@ mod tests {
         assert_eq!(sy_up, -100);
         let (_, sy_down) = clamp_pos_in_list(&stacked, 500, 1050, w, h, shadow, false);
         assert!(sy_down + h - shadow <= 1032);
+    }
+
+    #[test]
+    fn test_pill_items_legacy_migration() {
+        assert_eq!(migrate_legacy_pill_items(false, 0), PILL_ITEMS_DEFAULT);
+        assert_eq!(migrate_legacy_pill_items(true, 0), PILL_ITEM_TOTAL);
+        assert_eq!(migrate_legacy_pill_items(true, 1), PILL_ITEM_NON_CACHED);
+        assert_eq!(
+            migrate_legacy_pill_items(false, 2),
+            PILL_ITEM_ACTIVE_CTX | PILL_ITEM_CPU | PILL_ITEM_RAM
+        );
     }
 }

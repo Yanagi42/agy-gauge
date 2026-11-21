@@ -50,8 +50,8 @@ const WM_PRINTCLIENT: u32 = 0x0318;
 use d2d::{theme_for, D2DFactories, Fonts};
 use dashboard::{BreakdownMode, ClickAction, DashboardView, Tab, WeeklyMode};
 use pill::{
-    show_context_menu, PillRenderer, CMD_METRIC_BASE, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_QUIT,
-    CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_MINI,
+    show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_PILL_ITEMS_RESET,
+    CMD_PILL_ITEM_BASE, CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT,
     CMD_TOGGLE_TOPMOST,
 };
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
@@ -59,7 +59,8 @@ use telemetry::{
     apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, clamp_pos_to_work_area,
     enable_dpi_awareness, get_work_area, load_user_prefs, monitor_index_for_point,
     read_self_private_mb, read_self_working_set_mb, save_user_prefs, trim_self_working_set,
-    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, UserPrefs, WM_APP_SYNC_PREFS,
+    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, UserPrefs, PILL_ITEMS_ALL_MASK,
+    PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM, PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS,
 };
 
 const TIMER_TELEMETRY: usize = 1;
@@ -82,13 +83,12 @@ struct AppState {
     drag_start_win: (i32, i32),
     pill_hovered: bool,
     pill_tracking: bool,
-    mini: bool,
     light_theme: bool,
     topmost: bool,
     human: bool,
     fresh_only: bool,
     date_scope: DateScope,
-    pill_metric: u8,
+    pill_items: u32,
     monitor_index: usize,
     last_total_tokens: u64,
     recent_activity_until: Option<Instant>,
@@ -376,13 +376,14 @@ impl AppState {
     fn to_prefs(&self) -> UserPrefs {
         UserPrefs {
             light_theme: self.light_theme,
-            mini: self.mini,
+            mini: (self.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0,
             topmost: self.topmost,
             human: self.human,
             monitor_index: self.monitor_index,
             fresh_only: self.dash_view.as_ref().map(|v| v.fresh_only).unwrap_or(self.fresh_only),
             date_scope: self.dash_view.as_ref().map(|v| v.scope).unwrap_or(self.date_scope).to_u8(),
-            pill_metric: self.pill_metric,
+            pill_metric: 0,
+            pill_items: self.pill_items,
             custom_pos: self.custom_pos,
         }
     }
@@ -391,20 +392,19 @@ impl AppState {
         let p = self.to_prefs();
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
-        self.pill_metric = p.pill_metric;
+        self.pill_items = p.pill_items;
         save_user_prefs(&p);
         broadcast_prefs_sync(sender);
     }
 
     fn apply_synced_prefs(&mut self, p: UserPrefs) {
         self.light_theme = p.light_theme;
-        self.mini = p.mini;
         self.topmost = p.topmost;
         self.human = p.human;
         self.monitor_index = p.monitor_index;
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
-        self.pill_metric = p.pill_metric;
+        self.pill_items = p.pill_items;
         self.custom_pos = p.custom_pos;
         if let Some(view) = &mut self.dash_view {
             view.fresh_only = p.fresh_only;
@@ -431,12 +431,11 @@ impl AppState {
             dpi,
             self.monitor_index,
             self.custom_pos,
-            self.mini,
             self.light_theme,
             self.pill_hovered,
             self.dash_visible,
             recent,
-            self.pill_metric,
+            self.pill_items,
             &self.snapshot,
             &self.telemetry,
         ) {
@@ -624,14 +623,14 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_RBUTTONUP => {
             let state = with_app(|app| {
-                (app.mini, app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible, app.pill_metric)
+                (app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible, app.pill_items)
             });
-            if let Some((mini, light, topmost, human, mon, local_vis, metric)) = state {
+            if let Some((light, topmost, human, mon, local_vis, items)) = state {
                 let dash_open = local_vis
                     || FindWindowW(w!("AgyTokenDashboardClass"), None)
                         .map(|h| !h.0.is_null() && IsWindowVisible(h).as_bool())
                         .unwrap_or(false);
-                if let Some(cmd) = show_context_menu(hwnd, dash_open, mini, light, topmost, human, mon, metric) {
+                if let Some(cmd) = show_context_menu(hwnd, dash_open, light, topmost, human, mon, items) {
                     match cmd {
                         CMD_OPEN_DETAIL => toggle_dashboard_safe(),
                         CMD_REFRESH => {
@@ -649,13 +648,6 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                                 let th = theme_for(new_light);
                                 apply_win11_frame(dh, th.is_dark, th.caption_colorref);
                             }
-                        }
-                        CMD_TOGGLE_MINI => {
-                            with_app(|app| {
-                                app.mini = !app.mini;
-                                app.redraw_pill();
-                                app.persist_and_sync(hwnd);
-                            });
                         }
                         CMD_TOGGLE_TOPMOST => set_pill_topmost_safe(!topmost, true),
                         CMD_TOGGLE_HUMAN => {
@@ -681,11 +673,24 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             destroy_dashboard_safe();
                             PostQuitMessage(0);
                         }
-                        c if (CMD_METRIC_BASE..CMD_METRIC_BASE + 3).contains(&c) => {
+                        CMD_PILL_ITEMS_RESET => {
                             with_app(|app| {
-                                app.pill_metric = (c - CMD_METRIC_BASE) as u8;
+                                app.pill_items = PILL_ITEMS_DEFAULT;
+                                app.pill_renderer.invalidate_position();
                                 app.redraw_pill();
                                 app.persist_and_sync(hwnd);
+                            });
+                        }
+                        c if (CMD_PILL_ITEM_BASE..CMD_PILL_ITEM_BASE + 6).contains(&c) => {
+                            let bit = 1u32 << (c - CMD_PILL_ITEM_BASE);
+                            with_app(|app| {
+                                let next = (app.pill_items ^ bit) & PILL_ITEMS_ALL_MASK;
+                                if next != 0 {
+                                    app.pill_items = next;
+                                    app.pill_renderer.invalidate_position();
+                                    app.redraw_pill();
+                                    app.persist_and_sync(hwnd);
+                                }
                             });
                         }
                         c if c >= CMD_MONITOR_BASE => {
@@ -902,8 +907,9 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 0x31 => Some(ClickAction::SelectTab(Tab::Overview)),  // '1'
                 0x32 => Some(ClickAction::SelectTab(Tab::Daily)),     // '2'
                 0x33 => Some(ClickAction::SelectTab(Tab::Weekly)),    // '3'
-                0x34 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '4'
-                0x35 => Some(ClickAction::ToggleSystemView),          // '5'
+                0x34 => Some(ClickAction::SelectTab(Tab::Models)),    // '4'
+                0x35 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '5'
+                0x36 => Some(ClickAction::ToggleSystemView),          // '6'
                 0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),  // 'T'
                 0x52 => Some(ClickAction::Refresh),                   // 'R'
                 x if x == VK_F5.0 => Some(ClickAction::Refresh),
@@ -1098,7 +1104,12 @@ fn run_app(opts: CliOpts) -> Result<()> {
         load_user_prefs()
     };
     if let Some(v) = opts.mini {
-        prefs.mini = v;
+        if v {
+            let trimmed = prefs.pill_items & !(PILL_ITEM_CPU | PILL_ITEM_RAM);
+            prefs.pill_items = if trimmed != 0 { trimmed } else { PILL_ITEM_TOTAL };
+        } else {
+            prefs.pill_items |= PILL_ITEM_CPU | PILL_ITEM_RAM;
+        }
     }
     if let Some(v) = opts.light {
         prefs.light_theme = v;
@@ -1211,13 +1222,12 @@ fn run_app(opts: CliOpts) -> Result<()> {
             drag_start_win: (0, 0),
             pill_hovered: false,
             pill_tracking: false,
-            mini: prefs.mini,
             light_theme: prefs.light_theme,
             topmost: prefs.topmost,
             human: prefs.human,
             fresh_only: prefs.fresh_only,
             date_scope: DateScope::from_u8(prefs.date_scope),
-            pill_metric: prefs.pill_metric,
+            pill_items: prefs.pill_items,
             monitor_index: prefs.monitor_index,
             last_total_tokens: initial_total,
             recent_activity_until: None,
@@ -1256,7 +1266,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             let t_open = Instant::now();
             create_dashboard_window_local();
             let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
-            for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Sessions, Tab::System] {
+            for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::System] {
                 with_app(|app| {
                     if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
                         view.active_tab = tab;

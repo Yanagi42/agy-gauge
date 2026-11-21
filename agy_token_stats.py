@@ -1077,12 +1077,20 @@ def render_text(
         out.append("")
         out.append(_style("By Model", "1;33", color))
         headers, aligns = _counts_headers("Model", include_cw)
-        items = sorted(
-            agg["by_model"].items(),
+        primary_items = sorted(
+            ((k, v) for k, v in agg["by_model"].items() if k != "compaction"),
             key=lambda kv: kv[1].total_tokens,
             reverse=True,
         )
-        rows = [_format_counts_row(k, v, human, include_cw) for k, v in items]
+        compaction_items = [
+            (k, v) for k, v in agg["by_model"].items() if k == "compaction"
+        ]
+        rows = [_format_counts_row(k, v, human, include_cw) for k, v in primary_items]
+        if compaction_items:
+            rows.extend(
+                _format_counts_row(f"{k} (secondary)", v, human, include_cw)
+                for k, v in compaction_items
+            )
         out.append(_render_table(headers, rows, aligns))
 
     if show_monthly:

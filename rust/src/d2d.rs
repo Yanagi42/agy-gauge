@@ -29,7 +29,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
     DWRITE_PARAGRAPH_ALIGNMENT, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -245,6 +246,22 @@ impl D2DFactories {
             }
             Ok(fmt)
         }
+    }
+
+    pub fn measure_text_width(&self, text: &str, fmt: &IDWriteTextFormat) -> f32 {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        if wide.is_empty() {
+            return 0.0;
+        }
+        unsafe {
+            if let Ok(layout) = self.dwrite.CreateTextLayout(&wide, fmt, 1000.0, 100.0) {
+                let mut m: DWRITE_TEXT_METRICS = zeroed();
+                if layout.GetMetrics(&mut m).is_ok() {
+                    return m.widthIncludingTrailingWhitespace.ceil();
+                }
+            }
+        }
+        (text.chars().count() as f32 * 7.5).ceil()
     }
 }
 

@@ -2,13 +2,15 @@
 //!
 //! Features:
 //!   - True per-pixel alpha capsule with soft feathered ambient shadow & 0.75px neutral hairline rim.
-//!   - Live 16-sample micro CPU sparkline waveform + anti-aliased radial RAM ring gauge.
+//!   - User-composable display segments (Today Total / Non-Cached Δ / Cache Hit% / Active Ctx / CPU / RAM)
+//!     with exact DirectWrite text-metric dynamic sizing so every combination stays optically balanced.
 //!   - Restrained Obsidian Charcoal or Warm Paper theme (zero AI neon cyan/purple/mint!).
 //!   - No redundant hover popup: hovering smoothly illuminates the rim; left-click opens dashboard.
 
 use chrono::Local;
 use windows::core::{w, Result};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Direct2D::ID2D1RenderTarget;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu,
@@ -24,25 +26,44 @@ use crate::d2d::{
 use crate::stats::{fmt_compact, ScanSnapshot, TokenCounts};
 use crate::telemetry::{
     clamp_pos_to_work_area, get_monitors, get_work_area, monitor_index_for_point, to_wide_null,
-    wide_pcwstr, SystemTelemetry,
+    wide_pcwstr, SystemTelemetry, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX,
+    PILL_ITEM_CACHE_HIT, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
 };
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
 pub const CMD_REFRESH: u32 = 1002;
-pub const CMD_TOGGLE_MINI: u32 = 1003;
 pub const CMD_TOGGLE_LIGHT: u32 = 1004;
 pub const CMD_TOGGLE_TOPMOST: u32 = 1005;
 pub const CMD_TOGGLE_HUMAN: u32 = 1006;
 pub const CMD_REDOCK: u32 = 1007;
 pub const CMD_QUIT: u32 = 1008;
 pub const CMD_MONITOR_BASE: u32 = 1100;
-pub const CMD_METRIC_BASE: u32 = 1200; // 1200=TodayTotal, 1201=TodayNonCached, 1202=ActiveCtx
+pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1205 -> bit 0..5
+pub const CMD_PILL_ITEMS_RESET: u32 = 1210;
 
 const SHADOW_PAD: f32 = 10.0;
 const PILL_H_STD: f32 = 30.0;
-const PILL_W_STD: f32 = 252.0;
-const PILL_H_MINI: f32 = 28.0;
-const PILL_W_MINI: f32 = 92.0;
+
+struct PillTokenSeg {
+    text: String,
+    width: f32,
+    color: D2D1_COLOR_F,
+}
+
+fn pill_hit_color(theme: &Theme, c: &TokenCounts) -> D2D1_COLOR_F {
+    if c.total_input() == 0 {
+        theme.muted
+    } else {
+        let r = c.cache_hit_rate();
+        if r >= 85.0 {
+            theme.sage
+        } else if r >= 60.0 {
+            theme.warn
+        } else {
+            theme.danger
+        }
+    }
+}
 
 pub struct PillRenderer {
     surface: Option<LayeredSurface>,
@@ -63,15 +84,6 @@ impl PillRenderer {
         self.pos_cache_key = None;
     }
 
-    pub fn desired_dip_size(mini: bool) -> (f32, f32) {
-        let (pw, ph) = if mini {
-            (PILL_W_MINI, PILL_H_MINI)
-        } else {
-            (PILL_W_STD, PILL_H_STD)
-        };
-        (pw + SHADOW_PAD * 2.0, ph + SHADOW_PAD * 2.0)
-    }
-
     pub fn size_px(&self) -> (i32, i32) {
         self.surface.as_ref().map(|s| s.size_px()).unwrap_or((1, 1))
     }
@@ -90,17 +102,104 @@ impl PillRenderer {
         dpi: f32,
         monitor_index: usize,
         custom_pos: Option<(i32, i32)>,
-        mini: bool,
         light_theme: bool,
         hovered: bool,
         dash_open: bool,
         recent_activity: bool,
-        pill_metric: u8,
+        pill_items: u32,
         snapshot: &ScanSnapshot,
         telemetry: &SystemTelemetry,
     ) -> Result<(i32, i32)> {
         let scale = dpi / 96.0;
-        let (dip_w, dip_h) = Self::desired_dip_size(mini);
+        let theme = theme_for(light_theme);
+        let items = {
+            let m = pill_items & PILL_ITEMS_ALL_MASK;
+            if m != 0 { m } else { PILL_ITEMS_DEFAULT }
+        };
+
+        let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let today_c: TokenCounts = snapshot
+            .agg
+            .by_day
+            .get(&today_key)
+            .copied()
+            .unwrap_or_default();
+
+        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(4);
+        let mut ctx_warn = false;
+
+        if (items & PILL_ITEM_TOTAL) != 0 {
+            let text = fmt_compact(today_c.total_tokens());
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(16.0) + 2.0;
+            segs.push(PillTokenSeg {
+                text,
+                width,
+                color: theme.text,
+            });
+        }
+        if (items & PILL_ITEM_NON_CACHED) != 0 {
+            let text = format!("Δ{}", fmt_compact(today_c.non_cached_tokens()));
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(20.0) + 2.0;
+            let color = if segs.is_empty() { theme.text } else { theme.sub };
+            segs.push(PillTokenSeg { text, width, color });
+        }
+        if (items & PILL_ITEM_CACHE_HIT) != 0 {
+            let text = if today_c.total_input() > 0 {
+                format!("{:.1}%", today_c.cache_hit_rate())
+            } else {
+                "--%".to_string()
+            };
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(26.0) + 2.0;
+            segs.push(PillTokenSeg {
+                text,
+                width,
+                color: pill_hit_color(theme, &today_c),
+            });
+        }
+        if (items & PILL_ITEM_ACTIVE_CTX) != 0 {
+            let ctx = snapshot.sessions.first().map(|s| s.latest_context()).unwrap_or(0);
+            ctx_warn = ctx >= 400_000;
+            let text = format!("C {}", fmt_compact(ctx));
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(24.0) + 2.0;
+            let color = if ctx_warn {
+                theme.warn
+            } else if segs.is_empty() {
+                theme.text
+            } else {
+                theme.sub
+            };
+            segs.push(PillTokenSeg { text, width, color });
+        }
+
+        let show_cpu = (items & PILL_ITEM_CPU) != 0;
+        let show_ram = (items & PILL_ITEM_RAM) != 0;
+        let has_sys = show_cpu || show_ram;
+
+        let mut content_w = 23.0; // Left dot zone
+        for (i, seg) in segs.iter().enumerate() {
+            if i > 0 {
+                content_w += 12.0; // Subtle dot separator
+            }
+            content_w += seg.width;
+        }
+        if !segs.is_empty() && has_sys {
+            content_w += 14.0; // Hairline vertical divider
+        }
+        if show_cpu {
+            content_w += 63.0; // 28px sparkline + 5px gap + 30px %
+        }
+        if show_cpu && show_ram {
+            content_w += 12.0; // Subtle dot separator
+        }
+        if show_ram {
+            content_w += 47.0; // 13px ring + 4px gap + 30px %
+        }
+        content_w += 12.0; // Right padding
+
+        let pw = content_w.max(68.0);
+        let ph = PILL_H_STD;
+        let dip_w = pw + SHADOW_PAD * 2.0;
+        let dip_h = ph + SHADOW_PAD * 2.0;
         let px_w = (dip_w * scale).round() as i32;
         let px_h = (dip_h * scale).round() as i32;
 
@@ -143,28 +242,6 @@ impl PillRenderer {
             computed
         };
 
-        let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let today_c: TokenCounts = snapshot
-            .agg
-            .by_day
-            .get(&today_key)
-            .copied()
-            .unwrap_or_default();
-        let (tok_val, ctx_warn) = match pill_metric {
-            1 => (format!("Δ{}", fmt_compact(today_c.non_cached_tokens())), false),
-            2 => {
-                let ctx = snapshot.sessions.first().map(|s| s.latest_context()).unwrap_or(0);
-                let label = if mini {
-                    fmt_compact(ctx)
-                } else {
-                    format!("C {}", fmt_compact(ctx))
-                };
-                (label, ctx >= 400_000)
-            }
-            _ => (fmt_compact(today_c.total_tokens()), false),
-        };
-
-        let theme = theme_for(light_theme);
         if let Some(surface) = &self.surface {
             surface.render_and_present(hwnd, win_x, win_y, |rt| {
                 draw_pill_capsule(
@@ -174,12 +251,13 @@ impl PillRenderer {
                     theme,
                     dip_w,
                     dip_h,
-                    mini,
                     hovered,
                     dash_open,
                     recent_activity,
                     ctx_warn,
-                    &tok_val,
+                    &segs,
+                    show_cpu,
+                    show_ram,
                     telemetry,
                 );
             })?;
@@ -196,12 +274,13 @@ fn draw_pill_capsule(
     theme: &Theme,
     dip_w: f32,
     dip_h: f32,
-    mini: bool,
     hovered: bool,
     dash_open: bool,
     recent_activity: bool,
     ctx_warn: bool,
-    tok_val: &str,
+    segs: &[PillTokenSeg],
+    show_cpu: bool,
+    show_ram: bool,
     telemetry: &SystemTelemetry,
 ) {
     let pw = dip_w - SHADOW_PAD * 2.0;
@@ -260,87 +339,100 @@ fn draw_pill_capsule(
     }
     fill_circle(rt, dot_x, cy, 2.6, dot_col);
 
-    if mini {
-        draw_text(rt, tok_val, &fonts.pill_tok, rect_f(x + 22.0, y, pw - 30.0, ph), theme.text);
-        return;
+    let mut cur_x = x + 23.0;
+
+    // Composable Token segments (Total / Non-Cached Δ / Cache Hit% / Active Ctx)
+    for (i, seg) in segs.iter().enumerate() {
+        if i > 0 {
+            fill_circle(rt, cur_x + 6.0, cy, 1.2, theme.muted);
+            cur_x += 12.0;
+        }
+        draw_text(rt, &seg.text, &fonts.pill_tok, rect_f(cur_x, y, seg.width + 2.0, ph), seg.color);
+        cur_x += seg.width;
     }
 
-    // Left: Today's Token figure (crisp primary neutral ink)
-    draw_text(rt, tok_val, &fonts.pill_tok, rect_f(x + 22.0, y, 62.0, ph), theme.text);
+    let has_sys = show_cpu || show_ram;
+    if !segs.is_empty() && has_sys {
+        let div_x = cur_x + 7.0;
+        draw_line(rt, div_x, y + 8.0, div_x, y + ph - 8.0, theme.border, 1.0);
+        cur_x += 14.0;
+    }
 
-    // Whisper-quiet divider
-    let div_x = x + 86.0;
-    draw_line(rt, div_x, y + 8.0, div_x, y + ph - 8.0, theme.border, 1.0);
-
-    // Center: Live 16-sample micro CPU sparkline + % (like iStat Menus)
-    let wave_l = div_x + 9.0;
-    let wave_w = 28.0;
-    let wave_t = y + 8.0;
-    let wave_b = y + ph - 8.0;
     let tel = telemetry.latest;
 
-    // Subtle baseline for waveform
-    draw_line(rt, wave_l, wave_b, wave_l + wave_w, wave_b, theme.grid, 0.8);
-    let hist_len = telemetry.history.len();
-    if hist_len >= 2 {
-        let slice: Vec<_> = telemetry.history.iter().rev().take(16).collect();
-        let n = slice.len();
-        let pts: Vec<(f32, f32)> = slice
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(i, s)| {
-                let px = wave_l + (i as f32 / (n - 1).max(1) as f32) * wave_w;
-                let py = wave_b - (s.cpu_pct.clamp(0.0, 100.0) / 100.0) * (wave_b - wave_t);
-                (px, py)
-            })
-            .collect();
-        draw_area_series(factories, rt, &pts, wave_b, wave_t, theme.accent, 1.3, 0.22);
-    } else {
-        let py = wave_b - (tel.cpu_pct.clamp(0.0, 100.0) / 100.0) * (wave_b - wave_t);
-        draw_line(rt, wave_l, py, wave_l + wave_w, py, theme.accent, 1.3);
+    // Live 16-sample micro CPU sparkline + %
+    if show_cpu {
+        let wave_l = cur_x;
+        let wave_w = 28.0;
+        let wave_t = y + 8.0;
+        let wave_b = y + ph - 8.0;
+
+        draw_line(rt, wave_l, wave_b, wave_l + wave_w, wave_b, theme.grid, 0.8);
+        let hist_len = telemetry.history.len();
+        if hist_len >= 2 {
+            let slice: Vec<_> = telemetry.history.iter().rev().take(16).collect();
+            let n = slice.len();
+            let pts: Vec<(f32, f32)> = slice
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(i, s)| {
+                    let px = wave_l + (i as f32 / (n - 1).max(1) as f32) * wave_w;
+                    let py = wave_b - (s.cpu_pct.clamp(0.0, 100.0) / 100.0) * (wave_b - wave_t);
+                    (px, py)
+                })
+                .collect();
+            draw_area_series(factories, rt, &pts, wave_b, wave_t, theme.accent, 1.3, 0.22);
+        } else {
+            let py = wave_b - (tel.cpu_pct.clamp(0.0, 100.0) / 100.0) * (wave_b - wave_t);
+            draw_line(rt, wave_l, py, wave_l + wave_w, py, theme.accent, 1.3);
+        }
+
+        let cpu_col = load_color(theme, tel.cpu_pct, 60.0, 85.0);
+        draw_text(
+            rt,
+            &format!("{:>2.0}%", tel.cpu_pct.round()),
+            &fonts.pill_num,
+            rect_f(wave_l + wave_w + 5.0, y, 30.0, ph),
+            cpu_col,
+        );
+        cur_x += 63.0;
     }
 
-    let cpu_col = load_color(theme, tel.cpu_pct, 60.0, 85.0);
-    draw_text(
-        rt,
-        &format!("{:>2.0}%", tel.cpu_pct.round()),
-        &fonts.pill_num,
-        rect_f(wave_l + wave_w + 5.0, y, 30.0, ph),
-        cpu_col,
-    );
+    if show_cpu && show_ram {
+        fill_circle(rt, cur_x + 6.0, cy, 1.2, theme.muted);
+        cur_x += 12.0;
+    }
 
-    // Subtle dot separator
-    let mid_x = wave_l + wave_w + 38.0;
-    fill_circle(rt, mid_x, cy, 1.2, theme.muted);
-
-    // Right: Crisp radial RAM ring gauge + %
-    let ring_cx = mid_x + 13.0;
-    let ram_col = if tel.mem_pct >= 85.0 {
-        theme.danger
-    } else if tel.mem_pct >= 72.0 {
-        theme.warn
-    } else {
-        theme.ram
-    };
-    draw_ring_gauge(
-        factories,
-        rt,
-        ring_cx,
-        cy,
-        5.5,
-        2.0,
-        tel.mem_pct,
-        theme.border,
-        ram_col,
-    );
-    draw_text(
-        rt,
-        &format!("{:>2.0}%", tel.mem_pct.round()),
-        &fonts.pill_num,
-        rect_f(ring_cx + 10.0, y, 32.0, ph),
-        load_color(theme, tel.mem_pct, 75.0, 88.0),
-    );
+    // Crisp radial RAM ring gauge + %
+    if show_ram {
+        let ring_cx = cur_x + 6.5;
+        let ram_col = if tel.mem_pct >= 85.0 {
+            theme.danger
+        } else if tel.mem_pct >= 72.0 {
+            theme.warn
+        } else {
+            theme.ram
+        };
+        draw_ring_gauge(
+            factories,
+            rt,
+            ring_cx,
+            cy,
+            5.5,
+            2.0,
+            tel.mem_pct,
+            theme.border,
+            ram_col,
+        );
+        draw_text(
+            rt,
+            &format!("{:>2.0}%", tel.mem_pct.round()),
+            &fonts.pill_num,
+            rect_f(cur_x + 17.0, y, 30.0, ph),
+            load_color(theme, tel.mem_pct, 75.0, 88.0),
+        );
+    }
     let _ = &fonts.pill_micro;
 }
 
@@ -348,12 +440,11 @@ fn draw_pill_capsule(
 pub fn show_context_menu(
     hwnd: HWND,
     dash_open: bool,
-    mini: bool,
     light_theme: bool,
     topmost: bool,
     human: bool,
     current_monitor: usize,
-    pill_metric: u8,
+    pill_items: u32,
 ) -> Option<u32> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
@@ -365,17 +456,37 @@ pub fn show_context_menu(
         );
         let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH as usize, w!("立即刷新"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+
+        let mut items_menu = None;
+        if let Ok(im) = CreatePopupMenu() {
+            for (bit_idx, bit, lbl) in [
+                (0usize, PILL_ITEM_TOTAL, w!("今日总 Token")),
+                (1usize, PILL_ITEM_NON_CACHED, w!("今日非缓存增量 (Δ)")),
+                (2usize, PILL_ITEM_CACHE_HIT, w!("今日缓存命中率 (%)")),
+                (3usize, PILL_ITEM_ACTIVE_CTX, w!("活跃会话上下文 (Ctx)")),
+            ] {
+                let flag = MF_STRING | if (pill_items & bit) != 0 { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(im, flag, (CMD_PILL_ITEM_BASE as usize) + bit_idx, lbl);
+            }
+            let _ = AppendMenuW(im, MF_SEPARATOR, 0, None);
+            for (bit_idx, bit, lbl) in [
+                (4usize, PILL_ITEM_CPU, w!("CPU 波形")),
+                (5usize, PILL_ITEM_RAM, w!("内存环")),
+            ] {
+                let flag = MF_STRING | if (pill_items & bit) != 0 { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(im, flag, (CMD_PILL_ITEM_BASE as usize) + bit_idx, lbl);
+            }
+            let _ = AppendMenuW(im, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(im, MF_STRING, CMD_PILL_ITEMS_RESET as usize, w!("恢复默认显示"));
+            let _ = AppendMenuW(menu, MF_POPUP, im.0 as usize, w!("胶囊显示内容"));
+            items_menu = Some(im);
+        }
+
         let _ = AppendMenuW(
             menu,
             MF_STRING | if light_theme { MF_CHECKED } else { MF_UNCHECKED },
             CMD_TOGGLE_LIGHT as usize,
             w!("浅色纸感主题 (Warm Paper)"),
-        );
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING | if mini { MF_CHECKED } else { MF_UNCHECKED },
-            CMD_TOGGLE_MINI as usize,
-            w!("极简角标模式"),
         );
         let _ = AppendMenuW(
             menu,
@@ -389,20 +500,6 @@ pub fn show_context_menu(
             CMD_TOGGLE_HUMAN as usize,
             w!("简写数字 (K/M)"),
         );
-
-        let mut metric_menu = None;
-        if let Ok(mm) = CreatePopupMenu() {
-            for (idx, lbl) in [
-                (0u8, w!("今日总 Token")),
-                (1u8, w!("今日非缓存增量 (Δ)")),
-                (2u8, w!("活跃会话上下文 (Ctx)")),
-            ] {
-                let flag = MF_STRING | if pill_metric == idx { MF_CHECKED } else { MF_UNCHECKED };
-                let _ = AppendMenuW(mm, flag, (CMD_METRIC_BASE as usize) + idx as usize, lbl);
-            }
-            let _ = AppendMenuW(menu, MF_POPUP, mm.0 as usize, w!("胶囊显示指标"));
-            metric_menu = Some(mm);
-        }
 
         let monitors = get_monitors();
         let mut sub_menu = None;
@@ -437,8 +534,8 @@ pub fn show_context_menu(
         if let Some(sub) = sub_menu {
             let _ = DestroyMenu(sub);
         }
-        if let Some(mm) = metric_menu {
-            let _ = DestroyMenu(mm);
+        if let Some(im) = items_menu {
+            let _ = DestroyMenu(im);
         }
         let _ = DestroyMenu(menu);
         if cmd.0 != 0 {

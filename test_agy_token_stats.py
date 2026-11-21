@@ -297,6 +297,24 @@ class AgyTokenStatsTests(unittest.TestCase):
             self.assertIn("Compactions=1", txt_one)
             self.assertIn("Gap", txt_one)
 
+            # Model table puts compaction at the bottom secondary row even if its volume is highest
+            txt_model = mod.render_text(
+                rep,
+                agg,
+                view="model",
+                sort_by="time",
+                limit=10,
+                human=True,
+                tz_label="UTC",
+                since=None,
+                until=None,
+                model_filter=None,
+                session_filter=None,
+                color=False,
+            )
+            model_lines = [ln for ln in txt_model.splitlines() if ln.strip()]
+            self.assertTrue(model_lines[-1].startswith("compaction (secondary)"))
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}
