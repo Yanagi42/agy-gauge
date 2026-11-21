@@ -530,6 +530,7 @@ class IncrementalScanner:
         until: dt.date | None = None,
         model_filter: str | None = None,
         session_filter: str | None = None,
+        workspace_filter: str | None = None,
     ) -> ScanReport:
         t0 = time.perf_counter()
         warnings: list[str] = []
@@ -551,6 +552,7 @@ class IncrementalScanner:
         meta_cache = self._get_metadata_cache()
         model_needle = model_filter.lower().strip() if model_filter else None
         session_needle = session_filter.lower().strip() if session_filter else None
+        workspace_needle = workspace_filter.lower().strip() if workspace_filter else None
 
         try:
             conv_dirs = sorted(brain_dir.iterdir(), key=lambda p: p.name)
@@ -646,6 +648,8 @@ class IncrementalScanner:
             meta = meta_cache.get(cid, {})
             title = ann_title or meta.get("title") or meta.get("preview") or first_user_preview or "(untitled)"
             workspace = meta.get("workspace") or "(unknown)"
+            if workspace_needle and workspace_needle not in workspace.lower():
+                continue
 
             session = SessionInfo(
                 conversation_id=cid,
@@ -689,6 +693,7 @@ def scan_usage(
     until: dt.date | None = None,
     model_filter: str | None = None,
     session_filter: str | None = None,
+    workspace_filter: str | None = None,
 ) -> ScanReport:
     return IncrementalScanner(data_dir).scan(
         tz=tz,
@@ -696,6 +701,7 @@ def scan_usage(
         until=until,
         model_filter=model_filter,
         session_filter=session_filter,
+        workspace_filter=workspace_filter,
     )
 
 
@@ -1355,6 +1361,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter by conversation ID prefix (shows turn-by-turn detail if 1 match)",
     )
     parser.add_argument(
+        "--workspace",
+        type=str,
+        default=None,
+        help="Case-insensitive substring filter on workspace path (e.g. agent-home)",
+    )
+    parser.add_argument(
         "--sort",
         choices=("time", "total", "non-cached", "hit", "output", "input", "calls", "peak"),
         default="time",
@@ -1416,6 +1428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         until=until,
         model_filter=args.model,
         session_filter=args.session,
+        workspace_filter=args.workspace,
     )
     agg = _aggregate(report.sessions)
 

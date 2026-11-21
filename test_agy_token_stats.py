@@ -165,6 +165,11 @@ class AgyTokenStatsTests(unittest.TestCase):
             self.assertEqual(report_x.sessions[0].counts.calls, 1)
             self.assertEqual(report_x.sessions[0].counts.input_tokens, 500)
 
+            # Filter by workspace substring
+            report_ws = mod.scan_usage(root, tz=tz_cn, workspace_filter="proj one")
+            self.assertEqual(len(report_ws.sessions), 1)
+            self.assertTrue(report_ws.sessions[0].conversation_id.startswith("11111111"))
+
     def test_json_csv_and_text_render(self) -> None:
         tz_utc = dt.timezone.utc
         with tempfile.TemporaryDirectory() as tmp:

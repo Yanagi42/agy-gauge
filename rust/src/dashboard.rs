@@ -53,6 +53,45 @@ pub enum BreakdownMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionFilter {
+    Model(String),
+    Workspace(String),
+    Date(String),
+    Week(String),
+}
+
+impl SessionFilter {
+    fn label(&self) -> String {
+        match self {
+            SessionFilter::Model(m) => format!("模型: {}  ×", m),
+            SessionFilter::Workspace(ws) => {
+                let s = workspace_short_name(ws);
+                format!("项目: {}  ×", if s.is_empty() { ws.as_str() } else { s.as_str() })
+            }
+            SessionFilter::Date(d) => format!("日期: {}  ×", d),
+            SessionFilter::Week(w) => format!("周: {}  ×", w),
+        }
+    }
+
+    fn matches(&self, s: &SessionInfo) -> bool {
+        match self {
+            SessionFilter::Model(m) => s.turns.iter().any(|t| t.model == *m),
+            SessionFilter::Workspace(ws) => s.workspace == *ws,
+            SessionFilter::Date(day) => s.turns.iter().any(|t| {
+                t.timestamp_utc
+                    .map(|u| u.with_timezone(&Local).format("%Y-%m-%d").to_string() == *day)
+                    .unwrap_or(false)
+            }),
+            SessionFilter::Week(wk) => s.turns.iter().any(|t| {
+                t.timestamp_utc
+                    .map(|u| iso_week_key(u.with_timezone(&Local).date_naive()) == *wk)
+                    .unwrap_or(false)
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickAction {
     SelectTab(Tab),
     ToggleSystemView,
@@ -63,10 +102,13 @@ pub enum ClickAction {
     ToggleLightTheme,
     ToggleHuman,
     CopySummary,
+    CopySessionDetail,
     Refresh,
     SelectSort(SessionSort),
     SelectSession(String),
     InspectSession(String),
+    FilterSessions(SessionFilter),
+    ClearSessionFilter,
 }
 
 struct HitBox {
@@ -82,6 +124,7 @@ pub struct DashboardView {
     pub breakdown_mode: BreakdownMode,
     pub scope: DateScope,
     pub sort: SessionSort,
+    pub session_filter: Option<SessionFilter>,
     pub fresh_only: bool,
     pub selected_session: Option<String>,
     pub mouse_dip: Option<(f32, f32)>,
@@ -90,8 +133,10 @@ pub struct DashboardView {
     sessions_vis_rows: usize,
     hit_boxes: Vec<HitBox>,
     copied_until: Option<Instant>,
+    session_copied_until: Option<Instant>,
     cached_sessions: Vec<SessionInfo>,
     cached_agg: AggregatedStats,
+    cached_date: NaiveDate,
     dirty_filter: bool,
 }
 
@@ -120,6 +165,7 @@ impl DashboardView {
             breakdown_mode: BreakdownMode::Model,
             scope,
             sort: SessionSort::Recent,
+            session_filter: None,
             fresh_only,
             selected_session: None,
             mouse_dip: None,
@@ -128,8 +174,10 @@ impl DashboardView {
             sessions_vis_rows: 6,
             hit_boxes: Vec::new(),
             copied_until: None,
+            session_copied_until: None,
             cached_sessions: Vec::new(),
             cached_agg: AggregatedStats::default(),
+            cached_date: Local::now().date_naive(),
             dirty_filter: true,
         }
     }
@@ -162,7 +210,10 @@ impl DashboardView {
     }
 
     fn sorted_sessions(&self) -> Vec<SessionInfo> {
-        let mut sorted = self.cached_sessions.clone();
+        let mut sorted: Vec<SessionInfo> = match &self.session_filter {
+            Some(f) => self.cached_sessions.iter().filter(|s| f.matches(s)).cloned().collect(),
+            None => self.cached_sessions.clone(),
+        };
         match self.sort {
             SessionSort::Recent => sorted.sort_by(|a, b| b.last_time.cmp(&a.last_time)),
             SessionSort::NonCached => {
@@ -305,6 +356,42 @@ impl DashboardView {
                 }
                 (false, false)
             }
+            ClickAction::CopySessionDetail => {
+                let sel = self
+                    .selected_session
+                    .as_deref()
+                    .and_then(|id| self.cached_sessions.iter().find(|s| s.conversation_id == id));
+                if let Some(s) = sel {
+                    let ws = s.workspace_short();
+                    let cp = s.compaction_count();
+                    let range = match (s.first_time, s.last_time) {
+                        (Some(a), Some(b)) => format!("{} -> {}", a.format("%m/%d %H:%M"), b.format("%H:%M")),
+                        _ => "-".to_string(),
+                    };
+                    let text = format!(
+                        "AGY 会话明细 · {}\n- ID: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
+                        s.title,
+                        &s.conversation_id[..s.conversation_id.len().min(8)],
+                        range,
+                        s.primary_model(),
+                        if ws.is_empty() { String::new() } else { format!(" | 项目: {}", ws) },
+                        s.counts.calls,
+                        if cp > 0 { format!(" ({}次压缩)", cp) } else { String::new() },
+                        s.counts.cache_hit_rate(),
+                        fmt_commas(s.counts.input_tokens),
+                        fmt_commas(s.counts.cache_read_tokens),
+                        fmt_commas(s.counts.output_tokens),
+                        fmt_commas(s.counts.total_tokens()),
+                        fmt_commas(s.counts.non_cached_tokens()),
+                        fmt_commas(s.counts.peak_context),
+                    );
+                    if copy_text_to_clipboard(hwnd, &text) {
+                        self.session_copied_until =
+                            Some(Instant::now() + std::time::Duration::from_millis(1600));
+                    }
+                }
+                (false, false)
+            }
             ClickAction::Refresh => (true, false),
             ClickAction::SelectSort(sort) => {
                 self.sort = sort;
@@ -317,8 +404,30 @@ impl DashboardView {
             }
             ClickAction::InspectSession(cid) => {
                 self.selected_session = Some(cid);
+                self.session_filter = None;
                 self.active_tab = Tab::Sessions;
                 self.prev_token_tab = Tab::Sessions;
+                self.scroll_rows = 0;
+                (false, false)
+            }
+            ClickAction::FilterSessions(filter) => {
+                self.session_filter = Some(filter);
+                self.active_tab = Tab::Sessions;
+                self.prev_token_tab = Tab::Sessions;
+                self.scroll_rows = 0;
+                let matches = self.sorted_sessions();
+                let keep = self
+                    .selected_session
+                    .as_deref()
+                    .map(|id| matches.iter().any(|s| s.conversation_id == id))
+                    .unwrap_or(false);
+                if !keep {
+                    self.selected_session = matches.first().map(|s| s.conversation_id.clone());
+                }
+                (false, false)
+            }
+            ClickAction::ClearSessionFilter => {
+                self.session_filter = None;
                 self.scroll_rows = 0;
                 (false, false)
             }
@@ -326,21 +435,24 @@ impl DashboardView {
     }
 
     fn ensure_filtered(&mut self, snapshot: &ScanSnapshot) {
-        if !self.dirty_filter {
+        let today = Local::now().date_naive();
+        if !self.dirty_filter && self.cached_date == today {
             return;
         }
+        self.cached_date = today;
         let (sessions, agg) = filter_snapshot(snapshot, self.scope);
         self.cached_sessions = sessions;
         self.cached_agg = agg;
         self.dirty_filter = false;
 
+        let visible = self.sorted_sessions();
         let keep = self
             .selected_session
             .as_ref()
-            .map(|id| self.cached_sessions.iter().any(|s| &s.conversation_id == id))
+            .map(|id| visible.iter().any(|s| &s.conversation_id == id))
             .unwrap_or(false);
         if !keep {
-            self.selected_session = self.cached_sessions.first().map(|s| s.conversation_id.clone());
+            self.selected_session = visible.first().map(|s| s.conversation_id.clone());
         }
     }
 
@@ -703,7 +815,7 @@ impl DashboardView {
         fill_round_rect(rt, tl, 10.0, theme.surface);
         stroke_round_rect(rt, tl, 10.0, theme.border, 1.0);
 
-        let (chart_title, bars, empty_msg) = if self.scope == DateScope::Today {
+        let (chart_title, bars, bar_days, empty_msg) = if self.scope == DateScope::Today {
             let active_hours: Vec<usize> = self
                 .cached_agg
                 .by_hour
@@ -742,7 +854,7 @@ impl DashboardView {
             } else {
                 Vec::new()
             };
-            ("今日分时趋势", items, "今日暂无用量 · 右上角可切换 7天 / 全部")
+            ("今日分时趋势", items, Vec::new(), "今日暂无用量 · 右上角可切换 7天 / 全部")
         } else {
             let n_days: u64 = match self.scope {
                 DateScope::Days7 => 7,
@@ -759,12 +871,14 @@ impl DashboardView {
                     }
                 }
             };
+            let mut days_keys: Vec<Option<String>> = Vec::new();
             let items: Vec<BarItem> = (0..n_days)
                 .rev()
                 .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
                 .map(|d| {
                     let k = d.format("%Y-%m-%d").to_string();
                     let c = self.cached_agg.by_day.get(&k).copied().unwrap_or_default();
+                    days_keys.push(if c.calls > 0 { Some(k.clone()) } else { None });
                     BarItem {
                         label: d.format("%m/%d").to_string(),
                         cache: c.cache_read_tokens,
@@ -782,13 +896,21 @@ impl DashboardView {
                 })
                 .collect();
             let title = if self.scope == DateScope::Days7 { "近 7 天用量趋势" } else { "每日用量趋势" };
-            (title, items, "暂无用量数据")
+            (title, items, days_keys, "暂无用量数据")
         };
 
         draw_text(rt, chart_title, &fonts.ui_section, rect_f(tl.left + 16.0, tl.top + 11.0, 130.0, 20.0), theme.text);
         self.draw_chart_legend_and_toggle(rt, fonts, theme, tl);
         let tl_plot = rect_f(tl.left + 10.0, tl.top + 38.0, left_w - 20.0, top_h - 46.0);
-        draw_editorial_bars(rt, fonts, theme, tl_plot, &bars, self.fresh_only, self.mouse_dip, empty_msg);
+        let tl_slots = draw_editorial_bars(rt, fonts, theme, tl_plot, &bars, self.fresh_only, self.mouse_dip, empty_msg);
+        for (rect, maybe_day) in tl_slots.into_iter().zip(bar_days.into_iter()) {
+            if let Some(day) = maybe_day {
+                self.hit_boxes.push(HitBox {
+                    rect,
+                    action: ClickAction::FilterSessions(SessionFilter::Date(day)),
+                });
+            }
+        }
 
         // 2) Top-Right: This Week vs Last Week (full snapshot context) + Model Comparison
         let tr = rect_f(tl.right + gap, body.top, right_w, top_h);
@@ -988,8 +1110,13 @@ impl DashboardView {
         }
     }
 
-    fn draw_compact_models(&self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
-        let mut items: Vec<(&String, &TokenCounts)> = self.cached_agg.by_model.iter().collect();
+    fn draw_compact_models(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
+        let mut items: Vec<(String, TokenCounts)> = self
+            .cached_agg
+            .by_model
+            .iter()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
         items.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
         if items.is_empty() {
             draw_text(rt, "当前范围暂无模型数据", &fonts.ui_small, bounds, theme.muted);
@@ -1003,10 +1130,15 @@ impl DashboardView {
         let w = bounds.right - bounds.left;
         let palette = [theme.accent, theme.output, theme.ram];
 
-        for (i, (name, c)) in items.iter().take(show_n).enumerate() {
+        for (i, (name, c)) in items.into_iter().take(show_n).enumerate() {
             let y = bounds.top + i as f32 * row_h;
+            let row_r = rect_f(bounds.left - 4.0, y - 2.0, w + 8.0, row_h.min(27.0));
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&row_r, mx, my)).unwrap_or(false);
+            if hov {
+                fill_round_rect(rt, row_r, 5.0, with_alpha(theme.text, 0.04));
+            }
             let share = (c.total_tokens() as f64 / total_all as f64) as f32;
-            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), theme.text);
+            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), if hov { theme.accent } else { theme.text });
             let stat = format!(
                 "{} ({:.0}%) · {:.0}%",
                 fmt_num(c.total_tokens(), human),
@@ -1016,21 +1148,25 @@ impl DashboardView {
             draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.46, y, w * 0.54, 16.0), theme.sub);
             fill_round_rect(rt, rect_f(bounds.left, y + 18.0, w, 3.5), 1.75, theme.grid);
             fill_round_rect(rt, rect_f(bounds.left, y + 18.0, (w * share).max(3.0), 3.5), 1.75, palette[i % palette.len()]);
+            self.hit_boxes.push(HitBox {
+                rect: row_r,
+                action: ClickAction::FilterSessions(SessionFilter::Model(name)),
+            });
         }
     }
 
-    fn draw_compact_workspaces(&self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
-        let mut items: Vec<(String, usize, &TokenCounts)> = self
+    fn draw_compact_workspaces(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
+        let mut items: Vec<(String, String, usize, TokenCounts)> = self
             .cached_agg
             .by_workspace
             .iter()
             .map(|(ws, (cnt, c))| {
                 let short = workspace_short_name(ws);
                 let label = if short.is_empty() { "(未知工作区)".to_string() } else { short };
-                (label, *cnt, c)
+                (ws.clone(), label, *cnt, *c)
             })
             .collect();
-        items.sort_by(|a, b| b.2.total_tokens().cmp(&a.2.total_tokens()));
+        items.sort_by(|a, b| b.3.total_tokens().cmp(&a.3.total_tokens()));
         if items.is_empty() {
             draw_text(rt, "当前范围暂无项目数据", &fonts.ui_small, bounds, theme.muted);
             return;
@@ -1043,10 +1179,15 @@ impl DashboardView {
         let w = bounds.right - bounds.left;
         let palette = [theme.accent, theme.output, theme.ram];
 
-        for (i, (name, sess_cnt, c)) in items.iter().take(show_n).enumerate() {
+        for (i, (full_ws, name, sess_cnt, c)) in items.into_iter().take(show_n).enumerate() {
             let y = bounds.top + i as f32 * row_h;
+            let row_r = rect_f(bounds.left - 4.0, y - 2.0, w + 8.0, row_h.min(27.0));
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&row_r, mx, my)).unwrap_or(false);
+            if hov {
+                fill_round_rect(rt, row_r, 5.0, with_alpha(theme.text, 0.04));
+            }
             let share = (c.total_tokens() as f64 / total_all as f64) as f32;
-            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), theme.text);
+            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), if hov { theme.accent } else { theme.text });
             let stat = format!(
                 "{} ({:.0}%) · {}会话",
                 fmt_num(c.total_tokens(), human),
@@ -1056,6 +1197,10 @@ impl DashboardView {
             draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.46, y, w * 0.54, 16.0), theme.sub);
             fill_round_rect(rt, rect_f(bounds.left, y + 18.0, w, 3.5), 1.75, theme.grid);
             fill_round_rect(rt, rect_f(bounds.left, y + 18.0, (w * share).max(3.0), 3.5), 1.75, palette[i % palette.len()]);
+            self.hit_boxes.push(HitBox {
+                rect: row_r,
+                action: ClickAction::FilterSessions(SessionFilter::Workspace(full_ws)),
+            });
         }
     }
 
@@ -1145,7 +1290,15 @@ impl DashboardView {
                 ],
             })
             .collect();
-        draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按天数据");
+        let day_slots = draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按天数据");
+        for (rect, (day, c)) in day_slots.into_iter().zip(chart_days.iter()) {
+            if c.calls > 0 {
+                self.hit_boxes.push(HitBox {
+                    rect,
+                    action: ClickAction::FilterSessions(SessionFilter::Date(day.clone())),
+                });
+            }
+        }
 
         let rows: Vec<Vec<String>> = days_asc
             .iter()
@@ -1166,6 +1319,11 @@ impl DashboardView {
                 ]
             })
             .collect();
+        let row_actions: Vec<ClickAction> = days_asc
+            .iter()
+            .rev()
+            .map(|(day, _)| ClickAction::FilterSessions(SessionFilter::Date((*day).clone())))
+            .collect();
         self.draw_table(
             rt,
             fonts,
@@ -1184,6 +1342,7 @@ impl DashboardView {
                 ("峰值Ctx", 0.11, true),
             ],
             &rows,
+            Some(&row_actions),
         );
     }
 
@@ -1257,7 +1416,15 @@ impl DashboardView {
                         }
                     })
                     .collect();
-                draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按周数据");
+                let wk_slots = draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按周数据");
+                for (rect, (wk, c)) in wk_slots.into_iter().zip(weeks_asc[start..].iter()) {
+                    if c.calls > 0 {
+                        self.hit_boxes.push(HitBox {
+                            rect,
+                            action: ClickAction::FilterSessions(SessionFilter::Week((*wk).clone())),
+                        });
+                    }
+                }
 
                 let rows: Vec<Vec<String>> = weeks_asc
                     .iter()
@@ -1280,6 +1447,11 @@ impl DashboardView {
                         ]
                     })
                     .collect();
+                let wk_actions: Vec<ClickAction> = weeks_asc
+                    .iter()
+                    .rev()
+                    .map(|(wk, _)| ClickAction::FilterSessions(SessionFilter::Week((*wk).clone())))
+                    .collect();
                 self.draw_table(
                     rt,
                     fonts,
@@ -1299,6 +1471,7 @@ impl DashboardView {
                         ("命中率", 0.09, true),
                     ],
                     &rows,
+                    Some(&wk_actions),
                 );
             }
             WeeklyMode::Monthly => {
@@ -1320,7 +1493,7 @@ impl DashboardView {
                         ],
                     })
                     .collect();
-                draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按月数据");
+                let _ = draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按月数据");
 
                 let rows: Vec<Vec<String>> = m_asc
                     .iter()
@@ -1356,6 +1529,7 @@ impl DashboardView {
                         ("峰值Ctx", 0.11, true),
                     ],
                     &rows,
+                    None,
                 );
             }
         }
@@ -1371,12 +1545,19 @@ impl DashboardView {
         fill_round_rect(rt, top_c, 10.0, theme.surface);
         stroke_round_rect(rt, top_c, 10.0, theme.border, 1.0);
 
-        draw_text(rt, "会话记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 9.0, 72.0, 20.0), theme.text);
+        let sorted = self.sorted_sessions();
+
+        draw_text(rt, "会话记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 9.0, 68.0, 20.0), theme.text);
+        let cnt_str = if self.session_filter.is_some() {
+            format!("{} / {} 个", sorted.len(), self.cached_sessions.len())
+        } else {
+            format!("{} 个", sorted.len())
+        };
         draw_text(
             rt,
-            &format!("{} 个", self.cached_sessions.len()),
+            &cnt_str,
             &fonts.ui_micro,
-            rect_f(top_c.left + 86.0, top_c.top + 11.0, 60.0, 16.0),
+            rect_f(top_c.left + 84.0, top_c.top + 11.0, 64.0, 16.0),
             theme.muted,
         );
 
@@ -1402,21 +1583,31 @@ impl DashboardView {
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectSort(*so) });
         }
 
-        let sorted = self.sorted_sessions();
+        // Dismissible drill-down filter chip (only visible when filtered!)
+        if let Some(f) = self.session_filter.clone() {
+            let chip_lbl = f.label();
+            let chip_x = top_c.left + 150.0;
+            let max_w = (sx - 10.0 - chip_x).max(0.0);
+            if max_w >= 72.0 {
+                let est_w = (chip_lbl.chars().count() as f32 * 8.2 + 22.0).clamp(84.0, max_w);
+                let chip_r = rect_f(chip_x, top_c.top + 8.0, est_w, 22.0);
+                self.draw_ghost_btn(rt, fonts, theme, chip_r, &chip_lbl, true, ClickAction::ClearSessionFilter);
+            }
+        }
 
         let rr_l = top_c.left + 10.0;
         let rr_w = bw - 24.0;
         let rx = rr_l + rr_w - 8.0;
-        let model_w = if rr_w >= 880.0 { 132.0 } else { 112.0 };
+        let model_w = if rr_w >= 880.0 { 134.0 } else { 122.0 };
         let model_x = rx - 338.0 - model_w;
-        let title_x = rr_l + 150.0;
+        let title_x = rr_l + 146.0;
         let title_w = (model_x - 10.0 - title_x).max(80.0);
 
         // Column headers
         let hdr_y = top_c.top + 32.0;
         let hdr_h = 19.0;
-        draw_text(rt, "ID", &fonts.ui_micro, rect_f(rr_l + 8.0, hdr_y, 56.0, hdr_h), theme.muted);
-        draw_text(rt, "时间", &fonts.ui_micro, rect_f(rr_l + 68.0, hdr_y, 76.0, hdr_h), theme.muted);
+        draw_text(rt, "ID", &fonts.ui_micro, rect_f(rr_l + 8.0, hdr_y, 52.0, hdr_h), theme.muted);
+        draw_text(rt, "时间", &fonts.ui_micro, rect_f(rr_l + 64.0, hdr_y, 76.0, hdr_h), theme.muted);
         draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
         draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
         draw_text(rt, "轮数", &fonts.ui_small_right, rect_f(rx - 332.0, hdr_y, 42.0, hdr_h), theme.muted);
@@ -1436,9 +1627,14 @@ impl DashboardView {
         }
 
         if sorted.is_empty() {
+            let empty_txt = if self.session_filter.is_some() {
+                "当前筛选条件下无匹配会话 · 点击上方筛选标签或按 Backspace 清除"
+            } else {
+                "当前范围暂无会话 · 可在右上角切换 7天 / 30天 / 全部"
+            };
             draw_text(
                 rt,
-                "当前范围暂无会话 · 可在右上角切换 7天 / 30天 / 全部",
+                empty_txt,
                 &fonts.ui_reg_center,
                 rect_f(top_c.left, list_y, bw, (top_c.bottom - list_y).max(30.0)),
                 theme.muted,
@@ -1461,8 +1657,8 @@ impl DashboardView {
                 let hit_str = format!("{:.1}%", s.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &s.counts);
 
-                draw_text(rt, sid, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 56.0, row_h - 2.0), theme.muted);
-                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 68.0, ry, 76.0, row_h - 2.0), theme.sub);
+                draw_text(rt, sid, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 52.0, row_h - 2.0), theme.muted);
+                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 64.0, ry, 76.0, row_h - 2.0), theme.sub);
                 draw_text(rt, &s.title, &fonts.ui_reg, rect_f(title_x, ry, title_w, row_h - 2.0), theme.text);
 
                 draw_text(rt, &m_str, &fonts.mono_small_right, rect_f(model_x, ry, model_w, row_h - 2.0), theme.muted);
@@ -1517,7 +1713,18 @@ impl DashboardView {
             if !ws.is_empty() {
                 meta.push_str(&format!("  ·  {}", ws));
             }
-            draw_text(rt, &meta, &fonts.mono_small, rect_f(bot_c.left + 16.0, bot_c.top + 28.0, (bw - 32.0).max(160.0), 15.0), theme.sub);
+            draw_text(rt, &meta, &fonts.mono_small, rect_f(bot_c.left + 16.0, bot_c.top + 28.0, (bw - 96.0).max(160.0), 15.0), theme.sub);
+            let s_copied = self.session_copied_until.map(|t| Instant::now() < t).unwrap_or(false);
+            let copy_r = rect_f(bot_c.right - 72.0, bot_c.top + 27.0, 58.0, 17.0);
+            self.draw_ghost_btn(
+                rt,
+                fonts,
+                theme,
+                copy_r,
+                if s_copied { "已复制" } else { "复制明细" },
+                s_copied,
+                ClickAction::CopySessionDetail,
+            );
             self.draw_chart_legend_and_toggle(rt, fonts, theme, bot_c);
 
             let bars: Vec<BarItem> = s
@@ -1549,7 +1756,7 @@ impl DashboardView {
                 })
                 .collect();
             let plot = rect_f(bot_c.left + 12.0, bot_c.top + 48.0, bw - 24.0, (bot_c.bottom - bot_c.top - 56.0).max(60.0));
-            draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "无逐轮记录");
+            let _ = draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "无逐轮记录");
         } else {
             draw_text(rt, "点击上方会话查看逐轮上下文增长趋势", &fonts.ui_reg_center, bot_c, theme.muted);
         }
@@ -1697,6 +1904,7 @@ impl DashboardView {
 
     // ---------- Minimalist Editorial Table ----------
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_table(
         &mut self,
         rt: &ID2D1RenderTarget,
@@ -1705,6 +1913,7 @@ impl DashboardView {
         bounds: D2D_RECT_F,
         cols: &[(&str, f32, bool)],
         rows: &[Vec<String>],
+        row_actions: Option<&[ClickAction]>,
     ) {
         fill_round_rect(rt, bounds, 10.0, theme.surface);
         stroke_round_rect(rt, bounds, 10.0, theme.border, 1.0);
@@ -1748,6 +1957,14 @@ impl DashboardView {
             if hovered {
                 fill_round_rect(rt, rr, 6.0, theme.hover);
             }
+            if let Some(acts) = row_actions {
+                if let Some(act) = acts.get(self.scroll_rows + vi) {
+                    self.hit_boxes.push(HitBox {
+                        rect: rr,
+                        action: act.clone(),
+                    });
+                }
+            }
             if vi > 0 {
                 draw_line(rt, bounds.left + 14.0, ry, bounds.right - 14.0, ry, theme.grid, 0.8);
             }
@@ -1789,5 +2006,73 @@ impl DashboardView {
             let thumb_y = body_top + ratio * (track_h - thumb_h);
             fill_round_rect(rt, rect_f(bounds.right - 7.0, thumb_y, 3.0, thumb_h), 1.5, theme.muted);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::TurnRecord;
+    use chrono::{TimeZone, Utc};
+    use std::collections::BTreeSet;
+
+    fn make_session(id: &str, ws: &str, model: &str, ts_ymd: (i32, u32, u32), calls: u64) -> SessionInfo {
+        let ts = Utc.with_ymd_and_hms(ts_ymd.0, ts_ymd.1, ts_ymd.2, 10, 0, 0).single();
+        let mut counts = TokenCounts::default();
+        let mut turns = Vec::new();
+        for i in 0..calls {
+            counts.add_call(1000, 9000, 0, 500);
+            turns.push(TurnRecord {
+                step_index: i as i64,
+                timestamp_utc: ts,
+                model: model.to_string(),
+                is_checkpoint: false,
+                input_tokens: 1000,
+                cache_read_tokens: 9000,
+                cache_write_tokens: 0,
+                output_tokens: 500,
+            });
+        }
+        let mut models = BTreeSet::new();
+        models.insert(model.to_string());
+        SessionInfo {
+            conversation_id: id.to_string(),
+            title: id.to_string(),
+            workspace: ws.to_string(),
+            turns,
+            counts,
+            models,
+            first_time: ts.map(|u| u.with_timezone(&Local)),
+            last_time: ts.map(|u| u.with_timezone(&Local)),
+        }
+    }
+
+    #[test]
+    fn test_session_filter_and_keyboard_step() {
+        let s1 = make_session("s1", "C:/Users/a/agent-home", "gemini-4-neon-xhigh", (2026, 11, 21), 5);
+        let s2 = make_session("s2", "C:/Users/a/subvault", "gemini-4-neon-high", (2026, 11, 20), 2);
+
+        assert!(SessionFilter::Workspace("C:/Users/a/agent-home".into()).matches(&s1));
+        assert!(!SessionFilter::Workspace("C:/Users/a/agent-home".into()).matches(&s2));
+        assert!(SessionFilter::Model("gemini-4-neon-high".into()).matches(&s2));
+        assert!(SessionFilter::Week("2026-W47".into()).matches(&s1));
+
+        let mut view = DashboardView::new(false, DateScope::All);
+        view.active_tab = Tab::Sessions;
+        view.cached_sessions = vec![s1, s2];
+        view.selected_session = Some("s1".into());
+        assert!(view.step_session(1));
+        assert_eq!(view.selected_session.as_deref(), Some("s2"));
+        assert!(!view.step_session(1)); // clamped at end
+        assert!(view.step_session(-1));
+        assert_eq!(view.selected_session.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn test_date_scope_roundtrip() {
+        for sc in [DateScope::Today, DateScope::Days7, DateScope::Days30, DateScope::All] {
+            assert_eq!(DateScope::from_u8(sc.to_u8()), sc);
+        }
+        assert_eq!(DateScope::from_u8(99), DateScope::Today);
     }
 }

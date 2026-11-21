@@ -794,10 +794,10 @@ pub fn draw_editorial_bars(
     fresh_only: bool,
     mouse_pos: Option<(f32, f32)>,
     empty_msg: &str,
-) {
+) -> Vec<D2D_RECT_F> {
     if items.is_empty() {
         draw_text(rt, empty_msg, &fonts.ui_reg_center, plot_bounds, theme.muted);
-        return;
+        return Vec::new();
     }
 
     let pad_l = 54.0;
@@ -845,8 +845,13 @@ pub fn draw_editorial_bars(
 
     let n = items.len();
     let slot_w = plot_w / n as f32;
-    let bar_w = (slot_w * 0.52).clamp(4.0, 28.0);
+    let bar_w = if slot_w >= 6.0 {
+        (slot_w * 0.56).clamp(3.0, 28.0)
+    } else {
+        (slot_w * 0.72).clamp(1.0, (slot_w - 0.5).max(1.0))
+    };
     let label_every = (((40.0 * n as f32) / plot_w).ceil() as usize).max(1);
+    let mut slot_rects = Vec::with_capacity(n);
 
     let mut hover_idx: Option<usize> = None;
     if let Some((mx, my)) = mouse_pos {
@@ -860,6 +865,7 @@ pub fn draw_editorial_bars(
 
     for (idx, it) in items.iter().enumerate() {
         let slot_l = plot_l + idx as f32 * slot_w;
+        slot_rects.push(rect_f(slot_l, plot_t, slot_w, plot_h));
         let cx = slot_l + slot_w * 0.5;
         let x0 = cx - bar_w * 0.5;
         let is_hov = hover_idx == Some(idx);
@@ -931,7 +937,7 @@ pub fn draw_editorial_bars(
         let lines = &items[idx].tooltip;
         if !lines.is_empty() {
             let line_h = 16.0;
-            let box_w = 216.0;
+            let box_w = 246.0;
             let box_h = lines.len() as f32 * line_h + 16.0;
             let bar_r = plot_l + (idx as f32 + 1.0) * slot_w;
             let bar_l = plot_l + idx as f32 * slot_w;
@@ -958,4 +964,5 @@ pub fn draw_editorial_bars(
             }
         }
     }
+    slot_rects
 }

@@ -26,7 +26,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTME
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_UP,
+    VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
@@ -41,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
+const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
 
@@ -92,6 +93,7 @@ struct AppState {
     dash_hwnd: Option<HWND>,
     dash_view: Option<DashboardView>,
     dash_visible: bool,
+    dash_tracking: bool,
     dash_monitor_index: usize,
     dashboard_only: bool,
 }
@@ -663,8 +665,11 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
             LRESULT(0)
         }
-        WM_DPICHANGED => {
-            with_app(|app| app.redraw_pill());
+        WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            with_app(|app| {
+                app.pill_renderer.invalidate_position();
+                app.redraw_pill();
+            });
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -698,23 +703,32 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let x_px = (lparam.0 & 0xFFFF) as i16 as f32;
             let y_px = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
             let scale = window_dpi_scale(hwnd);
-            let mut tme = TRACKMOUSEEVENT {
-                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: hwnd,
-                dwHoverTime: 0,
-            };
-            let _ = TrackMouseEvent(&mut tme);
-            with_app(|app| {
+            let need_track = with_app(|app| {
+                let need = !app.dash_tracking;
+                if need {
+                    app.dash_tracking = true;
+                }
                 if let Some(view) = &mut app.dash_view {
                     view.mouse_dip = Some((x_px / scale, y_px / scale));
                 }
-            });
+                need
+            })
+            .unwrap_or(false);
+            if need_track {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
             with_app(|app| {
+                app.dash_tracking = false;
                 if let Some(view) = &mut app.dash_view {
                     view.mouse_dip = None;
                 }
@@ -802,6 +816,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),  // 'T'
                 0x52 => Some(ClickAction::Refresh),                   // 'R'
                 x if x == VK_F5.0 => Some(ClickAction::Refresh),
+                x if x == VK_BACK.0 => Some(ClickAction::ClearSessionFilter),
                 0x43 if ctrl => Some(ClickAction::CopySummary),       // Ctrl+C
                 _ => None,
             };
@@ -1118,6 +1133,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             dash_hwnd: None,
             dash_view: None,
             dash_visible: false,
+            dash_tracking: false,
             dash_monitor_index: prefs.monitor_index,
             dashboard_only: opts.dashboard_only,
         };
