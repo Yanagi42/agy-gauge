@@ -41,6 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
+const WM_SETTINGCHANGE: u32 = 0x001A;
+const SPI_SETWORKAREA: usize = 0x002F;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
@@ -54,10 +56,10 @@ use pill::{
 };
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
 use telemetry::{
-    apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, enable_dpi_awareness,
-    get_work_area, load_user_prefs, monitor_index_for_point, read_self_private_mb,
-    read_self_working_set_mb, save_user_prefs, trim_self_working_set, window_dpi_scale,
-    SingleInstanceGuard, SystemTelemetry, UserPrefs, WM_APP_SYNC_PREFS,
+    apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, clamp_pos_to_work_area,
+    enable_dpi_awareness, get_work_area, load_user_prefs, monitor_index_for_point,
+    read_self_private_mb, read_self_working_set_mb, save_user_prefs, trim_self_working_set,
+    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, UserPrefs, WM_APP_SYNC_PREFS,
 };
 
 const TIMER_TELEMETRY: usize = 1;
@@ -292,7 +294,25 @@ fn hide_dashboard_safe() {
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
         }
-        with_app(|app| app.redraw_pill());
+        let pill_top = with_app(|app| {
+            app.redraw_pill();
+            (app.pill_hwnd, app.topmost)
+        });
+        if let Some((ph, true)) = pill_top {
+            if !ph.0.is_null() {
+                unsafe {
+                    let _ = SetWindowPos(
+                        ph,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
         trim_self_working_set();
     }
 }
@@ -495,11 +515,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     }
                     if app.dragging {
                         let (pw, ph) = app.pill_renderer.size_px();
+                        let sh = app.pill_renderer.shadow_px();
                         let (nx, ny) = clamp_pos_to_monitors(
                             app.drag_start_win.0 + dx,
                             app.drag_start_win.1 + dy,
                             pw,
                             ph,
+                            sh,
                         );
                         app.pill_pos = (nx, ny);
                         app.custom_pos = Some((nx, ny));
@@ -547,28 +569,54 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_CAPTURECHANGED => {
             with_app(|app| {
+                if app.dragging {
+                    let (pw, ph) = app.pill_renderer.size_px();
+                    let sh = app.pill_renderer.shadow_px();
+                    let settled = clamp_pos_to_work_area(app.pill_pos.0, app.pill_pos.1, pw, ph, sh);
+                    app.pill_pos = settled;
+                    app.custom_pos = Some(settled);
+                    app.redraw_pill();
+                }
                 app.drag_down = false;
                 app.dragging = false;
             });
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_dragging = with_app(|app| {
+            let (was_dragging, settled_pos, keep_topmost) = with_app(|app| {
                 let was = app.dragging;
                 app.drag_down = false;
                 app.dragging = false;
+                let mut moved = None;
                 if was {
                     let (pw, ph) = app.pill_renderer.size_px();
-                    if let Some(mon) = monitor_index_for_point(app.pill_pos.0 + pw / 2, app.pill_pos.1 + ph / 2) {
+                    let sh = app.pill_renderer.shadow_px();
+                    let settled = clamp_pos_to_work_area(app.pill_pos.0, app.pill_pos.1, pw, ph, sh);
+                    app.pill_pos = settled;
+                    if let Some(mon) = monitor_index_for_point(settled.0 + pw / 2, settled.1 + ph / 2) {
                         app.monitor_index = mon;
                     }
-                    app.custom_pos = Some(app.pill_pos);
+                    app.custom_pos = Some(settled);
+                    app.pill_renderer.invalidate_position();
                     app.persist_and_sync(hwnd);
+                    moved = Some(settled);
                 }
-                was
+                (was, moved, app.topmost)
             })
-            .unwrap_or(false);
+            .unwrap_or((false, None, true));
             let _ = ReleaseCapture();
+            if let Some((sx, sy)) = settled_pos {
+                let _ = SetWindowPos(
+                    hwnd,
+                    if keep_topmost { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                    sx,
+                    sy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                with_app(|app| app.redraw_pill());
+            }
             if !was_dragging {
                 toggle_dashboard_safe();
             }
@@ -621,9 +669,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         CMD_REDOCK => {
                             with_app(|app| {
                                 app.custom_pos = None;
+                                app.pill_renderer.invalidate_position();
                                 app.redraw_pill();
                                 app.persist_and_sync(hwnd);
                             });
+                            if topmost {
+                                set_pill_topmost_safe(true, false);
+                            }
                         }
                         CMD_QUIT => {
                             destroy_dashboard_safe();
@@ -640,9 +692,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             with_app(|app| {
                                 app.monitor_index = (c - CMD_MONITOR_BASE) as usize;
                                 app.custom_pos = None;
+                                app.pill_renderer.invalidate_position();
                                 app.redraw_pill();
                                 app.persist_and_sync(hwnd);
                             });
+                            if topmost {
+                                set_pill_topmost_safe(true, false);
+                            }
                         }
                         _ => {}
                     }
@@ -679,10 +735,27 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_DPICHANGED | WM_DISPLAYCHANGE => {
-            with_app(|app| {
+            let keep_top = with_app(|app| {
                 app.pill_renderer.invalidate_position();
                 app.redraw_pill();
-            });
+                app.topmost
+            })
+            .unwrap_or(false);
+            if keep_top {
+                set_pill_topmost_safe(true, false);
+            }
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE if wparam.0 == SPI_SETWORKAREA => {
+            let keep_top = with_app(|app| {
+                app.pill_renderer.invalidate_position();
+                app.redraw_pill();
+                app.topmost
+            })
+            .unwrap_or(false);
+            if keep_top {
+                set_pill_topmost_safe(true, false);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {

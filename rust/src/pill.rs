@@ -23,7 +23,8 @@ use crate::d2d::{
 };
 use crate::stats::{fmt_compact, ScanSnapshot, TokenCounts};
 use crate::telemetry::{
-    get_monitors, get_work_area, monitor_index_for_point, to_wide_null, wide_pcwstr, SystemTelemetry,
+    clamp_pos_to_work_area, get_monitors, get_work_area, monitor_index_for_point, to_wide_null,
+    wide_pcwstr, SystemTelemetry,
 };
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
@@ -75,6 +76,11 @@ impl PillRenderer {
         self.surface.as_ref().map(|s| s.size_px()).unwrap_or((1, 1))
     }
 
+    pub fn shadow_px(&self) -> i32 {
+        let scale = self.surface.as_ref().map(|s| s.dpi() / 96.0).unwrap_or(1.0);
+        (SHADOW_PAD * scale).round() as i32
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -107,17 +113,18 @@ impl PillRenderer {
         }
 
         // Cache monitor placement so 1-second telemetry ticks never re-enumerate display monitors.
+        let shadow_px = (SHADOW_PAD * scale).round() as i32;
         let key = (monitor_index, custom_pos, px_w, px_h, dpi.round() as i32);
         let (win_x, win_y) = if self.pos_cache_key == Some(key) {
             self.cached_pos
         } else {
             let computed = if let Some((cx, cy)) = custom_pos {
                 if monitor_index_for_point(cx + px_w / 2, cy + px_h / 2).is_some() {
-                    (cx, cy)
+                    // Always clamp visible capsule inside that monitor's work area (never behind taskbar!)
+                    clamp_pos_to_work_area(cx, cy, px_w, px_h, shadow_px)
                 } else {
                     let work = get_work_area(monitor_index);
                     let margin_px = (12.0 * scale).round() as i32;
-                    let shadow_px = (SHADOW_PAD * scale).round() as i32;
                     (
                         (work.right - px_w + shadow_px - margin_px).max(work.left),
                         (work.bottom - px_h + shadow_px - margin_px).max(work.top),
@@ -126,7 +133,6 @@ impl PillRenderer {
             } else {
                 let work = get_work_area(monitor_index);
                 let margin_px = (12.0 * scale).round() as i32;
-                let shadow_px = (SHADOW_PAD * scale).round() as i32;
                 (
                     (work.right - px_w + shadow_px - margin_px).max(work.left),
                     (work.bottom - px_h + shadow_px - margin_px).max(work.top),

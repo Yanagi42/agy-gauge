@@ -162,30 +162,122 @@ pub fn save_user_prefs(p: &UserPrefs) {
     }
 }
 
-/// Find which monitor contains point (cx, cy), or None if off-screen.
+/// Find which monitor contains point (cx, cy) (checking full monitor bounds, fallback nearest).
 pub fn monitor_index_for_point(cx: i32, cy: i32) -> Option<usize> {
     let mons = get_monitors();
     for (idx, m) in mons.iter().enumerate() {
-        if cx >= m.work.left && cx <= m.work.right && cy >= m.work.top && cy <= m.work.bottom {
+        if cx >= m.monitor.left && cx <= m.monitor.right && cy >= m.monitor.top && cy <= m.monitor.bottom {
             return Some(idx);
         }
     }
     None
 }
 
-/// Clamp a dragged window's top-left (x, y) to stay visible within the union of all monitors.
-pub fn clamp_pos_to_monitors(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
-    let mons = get_monitors();
+fn nearest_monitor_idx(mons: &[MonitorDesc], cx: i32, cy: i32) -> usize {
+    for (idx, m) in mons.iter().enumerate() {
+        if cx >= m.monitor.left && cx <= m.monitor.right && cy >= m.monitor.top && cy <= m.monitor.bottom {
+            return idx;
+        }
+    }
+    let mut best_idx = 0;
+    let mut best_dist = i64::MAX;
+    for (idx, m) in mons.iter().enumerate() {
+        let dx = if cx < m.monitor.left {
+            (m.monitor.left - cx) as i64
+        } else if cx > m.monitor.right {
+            (cx - m.monitor.right) as i64
+        } else {
+            0
+        };
+        let dy = if cy < m.monitor.top {
+            (m.monitor.top - cy) as i64
+        } else if cy > m.monitor.bottom {
+            (cy - m.monitor.bottom) as i64
+        } else {
+            0
+        };
+        let d2 = dx * dx + dy * dy;
+        if d2 < best_dist {
+            best_dist = d2;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+pub fn clamp_pos_in_list(
+    mons: &[MonitorDesc],
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    shadow_px: i32,
+    clamp_x_to_target: bool,
+) -> (i32, i32) {
     if mons.is_empty() {
         return (x, y);
     }
-    let min_l = mons.iter().map(|m| m.work.left).min().unwrap_or(0);
-    let min_t = mons.iter().map(|m| m.work.top).min().unwrap_or(0);
-    let max_r = mons.iter().map(|m| m.work.right).max().unwrap_or(1920);
-    let max_b = mons.iter().map(|m| m.work.bottom).max().unwrap_or(1040);
-    let cx = x.clamp(min_l - 8, (max_r - w + 8).max(min_l));
-    let cy = y.clamp(min_t - 8, (max_b - h + 8).max(min_t));
+    let center_x = x + w / 2;
+    let center_y = y + h / 2;
+    let idx = nearest_monitor_idx(mons, center_x, center_y);
+    let cur = &mons[idx];
+    let work = cur.work;
+    let margin = 2;
+
+    let (min_y, max_y) = if clamp_x_to_target {
+        let lo = work.top - shadow_px + margin;
+        let hi = (work.bottom - h + shadow_px - margin).max(lo);
+        (lo, hi)
+    } else {
+        let above_top = mons
+            .iter()
+            .filter(|m| {
+                center_x >= m.monitor.left
+                    && center_x <= m.monitor.right
+                    && m.monitor.bottom <= cur.monitor.top + 10
+            })
+            .map(|m| m.work.top)
+            .min();
+        let below_bot = mons
+            .iter()
+            .filter(|m| {
+                center_x >= m.monitor.left
+                    && center_x <= m.monitor.right
+                    && m.monitor.top >= cur.monitor.bottom - 10
+            })
+            .map(|m| m.work.bottom)
+            .max();
+        let lo = above_top.unwrap_or(work.top) - shadow_px + margin;
+        let hi = (below_bot.unwrap_or(work.bottom) - h + shadow_px - margin).max(lo);
+        (lo, hi)
+    };
+    let cy = y.clamp(min_y, max_y);
+
+    let (min_x, max_x) = if clamp_x_to_target {
+        let lo = work.left - shadow_px + margin;
+        let hi = (work.right - w + shadow_px - margin).max(lo);
+        (lo, hi)
+    } else {
+        let lo = mons.iter().map(|m| m.work.left).min().unwrap_or(work.left) - shadow_px + margin;
+        let hi = (mons.iter().map(|m| m.work.right).max().unwrap_or(work.right) - w + shadow_px - margin).max(lo);
+        (lo, hi)
+    };
+    let cx = x.clamp(min_x, max_x);
     (cx, cy)
+}
+
+/// Clamp a pill window during live drag: keeps the visible capsule strictly inside the
+/// target monitor's work area (never sliding behind the taskbar!), while allowing horizontal
+/// drag smoothly across connected monitors.
+pub fn clamp_pos_to_monitors(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) -> (i32, i32) {
+    let mons = get_monitors();
+    clamp_pos_in_list(&mons, x, y, w, h, shadow_px, false)
+}
+
+/// Clamp a settled/saved pill position strictly inside its target monitor's work area.
+pub fn clamp_pos_to_work_area(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) -> (i32, i32) {
+    let mons = get_monitors();
+    clamp_pos_in_list(&mons, x, y, w, h, shadow_px, true)
 }
 
 /// Notify peer windows (pill <-> independent dashboard) to reload saved preferences immediately.
@@ -224,6 +316,7 @@ pub struct TelemetrySample {
 pub struct MonitorDesc {
     pub label: String,
     pub is_primary: bool,
+    pub monitor: RECT,
     pub work: RECT,
 }
 
@@ -438,6 +531,7 @@ pub fn window_dpi_scale(hwnd: HWND) -> f32 {
 pub fn get_monitors() -> Vec<MonitorDesc> {
     struct RawMon {
         is_primary: bool,
+        monitor: RECT,
         work: RECT,
         w: i32,
         h: i32,
@@ -454,6 +548,7 @@ pub fn get_monitors() -> Vec<MonitorDesc> {
         if GetMonitorInfoW(hmon, &mut mi).as_bool() {
             list.push(RawMon {
                 is_primary: (mi.dwFlags & 1) != 0,
+                monitor: mi.rcMonitor,
                 work: mi.rcWork,
                 w: mi.rcMonitor.right - mi.rcMonitor.left,
                 h: mi.rcMonitor.bottom - mi.rcMonitor.top,
@@ -485,6 +580,7 @@ pub fn get_monitors() -> Vec<MonitorDesc> {
         return vec![MonitorDesc {
             label: "主屏".to_string(),
             is_primary: true,
+            monitor: rc,
             work: rc,
         }];
     }
@@ -501,6 +597,7 @@ pub fn get_monitors() -> Vec<MonitorDesc> {
             MonitorDesc {
                 label: tag,
                 is_primary: m.is_primary,
+                monitor: m.monitor,
                 work: m.work,
             }
         })
@@ -588,4 +685,59 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
 
 pub fn wide_pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dual_monitor_clamp_never_enters_primary_taskbar() {
+        let mons = vec![
+            MonitorDesc {
+                label: "Primary".into(),
+                is_primary: true,
+                monitor: RECT { left: 0, top: 0, right: 2560, bottom: 1440 },
+                work: RECT { left: 0, top: 0, right: 2560, bottom: 1380 },
+            },
+            MonitorDesc {
+                label: "Secondary".into(),
+                is_primary: false,
+                monitor: RECT { left: 2560, top: -97, right: 5440, bottom: 1703 },
+                work: RECT { left: 2560, top: -97, right: 5440, bottom: 1607 },
+            },
+        ];
+        let (w, h, shadow) = (340, 63, 13);
+        // Both live drag (clamp_x=false) and settled clamp (clamp_x=true) must stop strictly above primary work.bottom (1380)
+        for clamp_x in [false, true] {
+            let (cx, cy) = clamp_pos_in_list(&mons, 2225, 1385, w, h, shadow, clamp_x);
+            assert!(cy + h - shadow <= 1380, "visible bottom {} entered primary taskbar (clamp_x={})!", cy + h - shadow, clamp_x);
+            assert!(cx + w - shadow <= 2560);
+        }
+
+        // Dragging horizontally across to secondary monitor uses secondary work.bottom (1607)
+        let (cx2, cy2) = clamp_pos_in_list(&mons, 3000, 1650, w, h, shadow, false);
+        assert_eq!(cx2, 3000);
+        assert!(cy2 + h - shadow <= 1607, "visible bottom {} entered secondary taskbar!", cy2 + h - shadow);
+
+        // Vertically stacked monitors allow dragging upward across the seam, while still blocking bottom taskbar
+        let stacked = vec![
+            MonitorDesc {
+                label: "Top".into(),
+                is_primary: false,
+                monitor: RECT { left: 0, top: -1080, right: 1920, bottom: 0 },
+                work: RECT { left: 0, top: -1080, right: 1920, bottom: -48 },
+            },
+            MonitorDesc {
+                label: "Bottom".into(),
+                is_primary: true,
+                monitor: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+                work: RECT { left: 0, top: 0, right: 1920, bottom: 1032 },
+            },
+        ];
+        let (_, sy_up) = clamp_pos_in_list(&stacked, 500, -100, w, h, shadow, false);
+        assert_eq!(sy_up, -100);
+        let (_, sy_down) = clamp_pos_in_list(&stacked, 500, 1050, w, h, shadow, false);
+        assert!(sy_down + h - shadow <= 1032);
+    }
 }
