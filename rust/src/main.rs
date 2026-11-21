@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, UpdateWindow, HDC, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -29,10 +29,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
-    LoadCursorW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    IsWindowVisible, LoadCursorW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON,
     LR_DEFAULTCOLOR, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
     WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -43,12 +44,12 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
 
 use d2d::{theme_for, D2DFactories, Fonts};
-use dashboard::{DashboardView, Tab};
+use dashboard::{DashboardView, Tab, WeeklyMode};
 use pill::{
     show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_QUIT, CMD_REDOCK,
     CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_MINI, CMD_TOGGLE_TOPMOST,
 };
-use stats::{IncrementalScanner, ScanSnapshot};
+use stats::{DateScope, IncrementalScanner, ScanSnapshot};
 use telemetry::{
     apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, enable_dpi_awareness,
     get_work_area, load_user_prefs, monitor_index_for_point, read_self_private_mb,
@@ -81,6 +82,7 @@ struct AppState {
     topmost: bool,
     human: bool,
     fresh_only: bool,
+    date_scope: DateScope,
     monitor_index: usize,
     last_total_tokens: u64,
     recent_activity_until: Option<Instant>,
@@ -88,8 +90,9 @@ struct AppState {
     dash_owner_hwnd: Option<HWND>,
     dash_hwnd: Option<HWND>,
     dash_view: Option<DashboardView>,
+    dash_visible: bool,
+    dash_monitor_index: usize,
     dashboard_only: bool,
-    data_dir: PathBuf,
 }
 
 thread_local! {
@@ -105,13 +108,36 @@ fn with_app<R>(f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
     })
 }
 
+fn dashboard_rect_for_monitor(monitor_index: usize, pill_hwnd: HWND) -> (i32, i32, i32, i32) {
+    let work = get_work_area(monitor_index);
+    let scale = if !pill_hwnd.0.is_null() {
+        window_dpi_scale(pill_hwnd)
+    } else {
+        1.25
+    };
+    let avail_w = work.right - work.left;
+    let avail_h = work.bottom - work.top;
+    let ww = ((1060.0 * scale).round() as i32).min((avail_w as f32 * 0.90) as i32);
+    let wh = ((710.0 * scale).round() as i32).min((avail_h as f32 * 0.88) as i32);
+    let wx = work.left + (avail_w - ww) / 2;
+    let wy = work.top + (avail_h - wh) / 2;
+    (wx, wy, ww, wh)
+}
+
 fn toggle_dashboard_safe() {
-    // If dashboard is already open (detached or local), clicking the pill again closes it cleanly!
-    unsafe {
-        if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
-            if !existing.0.is_null() {
-                let _ = PostMessageW(existing, WM_CLOSE, WPARAM(0), LPARAM(0));
-                return;
+    let (has_local, local_visible) = with_app(|app| (app.dash_hwnd.is_some(), app.dash_visible))
+        .unwrap_or((false, false));
+    if local_visible {
+        hide_dashboard_safe();
+        return;
+    }
+    if !has_local {
+        unsafe {
+            if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
+                if !existing.0.is_null() && IsWindowVisible(existing).as_bool() {
+                    let _ = PostMessageW(existing, WM_CLOSE, WPARAM(0), LPARAM(0));
+                    return;
+                }
             }
         }
     }
@@ -119,6 +145,36 @@ fn toggle_dashboard_safe() {
 }
 
 fn open_or_focus_dashboard_safe() {
+    let local_info = with_app(|app| {
+        app.dash_hwnd.map(|hwnd| {
+            let moved_mon = app.dash_monitor_index != app.monitor_index;
+            let rect = if moved_mon {
+                app.dash_monitor_index = app.monitor_index;
+                Some(dashboard_rect_for_monitor(app.monitor_index, app.pill_hwnd))
+            } else {
+                None
+            };
+            app.dash_visible = true;
+            (hwnd, app.light_theme, rect)
+        })
+    })
+    .flatten();
+
+    if let Some((hwnd, light, moved_rect)) = local_info {
+        unsafe {
+            if let Some((wx, wy, ww, wh)) = moved_rect {
+                let _ = SetWindowPos(hwnd, None, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            let th = theme_for(light);
+            apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = InvalidateRect(hwnd, None, false);
+            let _ = UpdateWindow(hwnd);
+        }
+        return;
+    }
+
     unsafe {
         if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
             if !existing.0.is_null() {
@@ -129,64 +185,25 @@ fn open_or_focus_dashboard_safe() {
             }
         }
     }
-
-    let spawn_info = with_app(|app| {
-        if app.dashboard_only {
-            None
-        } else {
-            Some((app.data_dir.clone(), app.monitor_index, app.human, app.light_theme))
-        }
-    })
-    .flatten();
-
-    if let Some((data_dir, mon, human, light)) = spawn_info {
-        if let Ok(exe) = std::env::current_exe() {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("--dashboard-only")
-                .arg("--monitor")
-                .arg(mon.to_string())
-                .arg("--data-dir")
-                .arg(data_dir);
-            if !human {
-                cmd.arg("--exact");
-            }
-            if light {
-                cmd.arg("--light");
-            }
-            if cmd.spawn().is_ok() {
-                return;
-            }
-        }
-    }
-
     create_dashboard_window_local();
 }
 
 fn create_dashboard_window_local() {
     let existing = with_app(|app| app.dash_hwnd).flatten();
     if let Some(hwnd) = existing {
+        with_app(|app| app.dash_visible = true);
         unsafe {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
+            let _ = UpdateWindow(hwnd);
         }
         return;
     }
 
-    let Some((wx, wy, ww, wh, light)) = with_app(|app| {
-        let work = get_work_area(app.monitor_index);
-        let scale = if !app.pill_hwnd.0.is_null() {
-            window_dpi_scale(app.pill_hwnd)
-        } else {
-            1.25
-        };
-        let avail_w = work.right - work.left;
-        let avail_h = work.bottom - work.top;
-        let ww = ((1060.0 * scale).round() as i32).min((avail_w as f32 * 0.90) as i32);
-        let wh = ((710.0 * scale).round() as i32).min((avail_h as f32 * 0.88) as i32);
-        let wx = work.left + (avail_w - ww) / 2;
-        let wy = work.top + (avail_h - wh) / 2;
-        (wx, wy, ww, wh, app.light_theme)
+    let Some((wx, wy, ww, wh, light, mon_idx)) = with_app(|app| {
+        let (wx, wy, ww, wh) = dashboard_rect_for_monitor(app.monitor_index, app.pill_hwnd);
+        (wx, wy, ww, wh, app.light_theme, app.monitor_index)
     }) else {
         return;
     };
@@ -235,17 +252,42 @@ fn create_dashboard_window_local() {
             apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
             with_app(|app| {
                 app.dash_hwnd = Some(hwnd);
-                app.dash_view = Some(DashboardView::new(app.fresh_only));
+                app.dash_view = Some(DashboardView::new(app.fresh_only, app.date_scope));
+                app.dash_visible = true;
+                app.dash_monitor_index = mon_idx;
             });
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
+            let _ = UpdateWindow(hwnd);
         }
     }
 }
 
-fn close_dashboard_safe() {
+fn hide_dashboard_safe() {
+    let (hwnd, dash_only) = with_app(|app| {
+        app.dash_visible = false;
+        if let Some(view) = &mut app.dash_view {
+            view.mouse_dip = None;
+        }
+        (app.dash_hwnd, app.dashboard_only)
+    })
+    .unwrap_or((None, false));
+
+    if dash_only {
+        destroy_dashboard_safe();
+        return;
+    }
+    if let Some(h) = hwnd {
+        unsafe {
+            let _ = ShowWindow(h, SW_HIDE);
+        }
+    }
+}
+
+fn destroy_dashboard_safe() {
     let (hwnd, owner_hwnd, dash_only) = with_app(|app| {
+        app.dash_visible = false;
         app.dash_view = None;
         (app.dash_hwnd.take(), app.dash_owner_hwnd.take(), app.dashboard_only)
     })
@@ -307,6 +349,7 @@ impl AppState {
             human: self.human,
             monitor_index: self.monitor_index,
             fresh_only: self.dash_view.as_ref().map(|v| v.fresh_only).unwrap_or(self.fresh_only),
+            date_scope: self.dash_view.as_ref().map(|v| v.scope).unwrap_or(self.date_scope).to_u8(),
             custom_pos: self.custom_pos,
         }
     }
@@ -314,6 +357,7 @@ impl AppState {
     fn persist_and_sync(&mut self, sender: HWND) {
         let p = self.to_prefs();
         self.fresh_only = p.fresh_only;
+        self.date_scope = DateScope::from_u8(p.date_scope);
         save_user_prefs(&p);
         broadcast_prefs_sync(sender);
     }
@@ -325,9 +369,14 @@ impl AppState {
         self.human = p.human;
         self.monitor_index = p.monitor_index;
         self.fresh_only = p.fresh_only;
+        self.date_scope = DateScope::from_u8(p.date_scope);
         self.custom_pos = p.custom_pos;
         if let Some(view) = &mut self.dash_view {
             view.fresh_only = p.fresh_only;
+            if view.scope != self.date_scope {
+                view.scope = self.date_scope;
+                view.mark_data_dirty();
+            }
         }
     }
 
@@ -359,9 +408,11 @@ impl AppState {
     }
 
     fn invalidate_dashboard(&self) {
-        if let Some(hwnd) = self.dash_hwnd {
-            unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
+        if self.dash_visible {
+            if let Some(hwnd) = self.dash_hwnd {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
         }
     }
@@ -507,11 +558,14 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            let state = with_app(|app| (app.mini, app.light_theme, app.topmost, app.human, app.monitor_index));
-            let dash_open = FindWindowW(w!("AgyTokenDashboardClass"), None)
-                .map(|h| !h.0.is_null())
-                .unwrap_or(false);
-            if let Some((mini, light, topmost, human, mon)) = state {
+            let state = with_app(|app| {
+                (app.mini, app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible)
+            });
+            if let Some((mini, light, topmost, human, mon, local_vis)) = state {
+                let dash_open = local_vis
+                    || FindWindowW(w!("AgyTokenDashboardClass"), None)
+                        .map(|h| !h.0.is_null() && IsWindowVisible(h).as_bool())
+                        .unwrap_or(false);
                 if let Some(cmd) = show_context_menu(hwnd, dash_open, mini, light, topmost, human, mon) {
                     match cmd {
                         CMD_OPEN_DETAIL => toggle_dashboard_safe(),
@@ -519,11 +573,17 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             with_app(|app| app.refresh_tokens(true));
                         }
                         CMD_TOGGLE_LIGHT => {
-                            with_app(|app| {
+                            let dh = with_app(|app| {
                                 app.light_theme = !app.light_theme;
                                 app.redraw_pill();
                                 app.persist_and_sync(hwnd);
+                                app.invalidate_dashboard();
+                                (app.dash_hwnd, app.light_theme)
                             });
+                            if let Some((Some(dh), new_light)) = dh {
+                                let th = theme_for(new_light);
+                                apply_win11_frame(dh, th.is_dark, th.caption_colorref);
+                            }
                         }
                         CMD_TOGGLE_MINI => {
                             with_app(|app| {
@@ -538,6 +598,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                                 app.human = !app.human;
                                 app.redraw_pill();
                                 app.persist_and_sync(hwnd);
+                                app.invalidate_dashboard();
                             });
                         }
                         CMD_REDOCK => {
@@ -548,7 +609,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             });
                         }
                         CMD_QUIT => {
-                            close_dashboard_safe();
+                            destroy_dashboard_safe();
                             PostQuitMessage(0);
                         }
                         c if c >= CMD_MONITOR_BASE => {
@@ -682,6 +743,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         need_refresh = res.0;
                         prefs_changed = res.1;
                         app.fresh_only = view.fresh_only;
+                        app.date_scope = view.scope;
                     }
                     if prefs_changed {
                         app.persist_and_sync(hwnd);
@@ -717,7 +779,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_KEYDOWN => {
             if wparam.0 as u16 == VK_ESCAPE.0 {
-                close_dashboard_safe();
+                hide_dashboard_safe();
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -782,11 +844,12 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_CLOSE => {
-            close_dashboard_safe();
+            hide_dashboard_safe();
             LRESULT(0)
         }
         WM_DESTROY => {
             let dash_only = with_app(|app| {
+                app.dash_visible = false;
                 app.dash_hwnd = None;
                 app.dash_view = None;
                 app.dashboard_only
@@ -991,14 +1054,16 @@ fn run_app(opts: CliOpts) -> Result<()> {
             topmost: prefs.topmost,
             human: prefs.human,
             fresh_only: prefs.fresh_only,
+            date_scope: DateScope::from_u8(prefs.date_scope),
             monitor_index: prefs.monitor_index,
             last_total_tokens: initial_total,
             recent_activity_until: None,
             dash_owner_hwnd: None,
             dash_hwnd: None,
             dash_view: None,
+            dash_visible: false,
+            dash_monitor_index: prefs.monitor_index,
             dashboard_only: opts.dashboard_only,
-            data_dir: opts.data_dir,
         };
 
         APP.with(|cell| {
@@ -1020,10 +1085,13 @@ fn run_app(opts: CliOpts) -> Result<()> {
         }
 
         if opts.self_test {
+            let cold_ms = with_app(|app| app.snapshot.scan_ms).unwrap_or(0.0);
             let idle_mb = read_self_private_mb();
             let cached_ms = with_app(|app| app.scanner.scan().scan_ms).unwrap_or(0.0);
+            let t_open = Instant::now();
             create_dashboard_window_local();
-            for tab in [Tab::Overview, Tab::Trends, Tab::Sessions, Tab::System] {
+            let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+            for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Sessions, Tab::System] {
                 with_app(|app| {
                     if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
                         view.active_tab = tab;
@@ -1039,20 +1107,43 @@ fn run_app(opts: CliOpts) -> Result<()> {
                             app.human,
                             app.light_theme,
                         );
+                        if tab == Tab::Weekly {
+                            view.weekly_mode = WeeklyMode::Monthly;
+                            let _ = view.render_to_hdc(
+                                &app.factories,
+                                &app.fonts,
+                                hwnd,
+                                None,
+                                dpi,
+                                &app.snapshot,
+                                &app.telemetry,
+                                app.human,
+                                app.light_theme,
+                            );
+                        }
                     }
                 });
             }
             let open_mb = read_self_private_mb();
-            close_dashboard_safe();
+            hide_dashboard_safe();
+            let t_reopen = Instant::now();
+            open_or_focus_dashboard_safe();
+            let reopen_ms = t_reopen.elapsed().as_secs_f64() * 1000.0;
+            destroy_dashboard_safe();
+            let after_close_mb = read_self_private_mb();
             let summary = with_app(|app| {
                 format!(
-                    "RUST_SELF_TEST_OK theme={} sessions={} total_tokens={} pill_idle_mb={:.1} dash_open_mb={:.1} cached_ms={:.2}",
+                    "RUST_SELF_TEST_OK theme={} sessions={} total_tokens={} cold_scan_ms={:.1} cached_ms={:.2} open1_ms={:.1} reopen_ms={:.1} pill_idle_mb={:.1} dash_open_mb={:.1} after_close_mb={:.1}",
                     if app.light_theme { "paper" } else { "obsidian" },
                     app.snapshot.sessions.len(),
                     app.snapshot.agg.total.total_tokens(),
+                    cold_ms,
+                    cached_ms,
+                    open_ms,
+                    reopen_ms,
                     idle_mb,
                     open_mb,
-                    cached_ms,
+                    after_close_mb,
                 )
             })
             .unwrap_or_default();

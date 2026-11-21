@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -39,6 +39,7 @@ pub struct UserPrefs {
     pub human: bool,
     pub monitor_index: usize,
     pub fresh_only: bool,
+    pub date_scope: u8,
     pub custom_pos: Option<(i32, i32)>,
 }
 
@@ -51,6 +52,7 @@ impl Default for UserPrefs {
             human: true,
             monitor_index: 0,
             fresh_only: false,
+            date_scope: 0, // Default to Today (matches corner pill)
             custom_pos: None,
         }
     }
@@ -99,6 +101,9 @@ pub fn load_user_prefs() -> UserPrefs {
     if let Some(v) = reg_read_u32(w!("fresh_only")) {
         p.fresh_only = v != 0;
     }
+    if let Some(v) = reg_read_u32(w!("date_scope")) {
+        p.date_scope = v.min(3) as u8;
+    }
     if reg_read_u32(w!("has_custom_pos")).unwrap_or(0) != 0 {
         if let (Some(x), Some(y)) = (reg_read_u32(w!("pos_x")), reg_read_u32(w!("pos_y"))) {
             p.custom_pos = Some((x as i32, y as i32));
@@ -129,13 +134,14 @@ pub fn save_user_prefs(p: &UserPrefs) {
             Some((x, y)) => (1u32, x as u32, y as u32),
             None => (0u32, 0u32, 0u32),
         };
-        let entries: [(PCWSTR, u32); 9] = [
+        let entries: [(PCWSTR, u32); 10] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(p.mini)),
             (w!("topmost"), u32::from(p.topmost)),
             (w!("human"), u32::from(p.human)),
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
+            (w!("date_scope"), p.date_scope as u32),
             (w!("has_custom_pos"), has_pos),
             (w!("pos_x"), px),
             (w!("pos_y"), py),
@@ -255,24 +261,24 @@ impl SystemTelemetry {
             si.dwNumberOfProcessors.max(1)
         };
         let prev_times = read_sys_times();
+        let (mem_pct, mem_used_gb, mem_total_gb, mem_avail_gb) = read_memory();
+        let self_mb = read_self_private_mb();
         let initial = TelemetrySample {
             timestamp: now_secs(),
             cpu_pct: 0.0,
-            mem_pct: 0.0,
-            mem_used_gb: 0.0,
-            mem_total_gb: 0.0,
-            mem_avail_gb: 0.0,
-            self_mb: 0.0,
+            mem_pct,
+            mem_used_gb,
+            mem_total_gb,
+            mem_avail_gb,
+            self_mb,
             cpu_cores,
         };
-        let mut s = Self {
+        Self {
             prev_times,
             cpu_cores,
             history: VecDeque::with_capacity(cap),
             latest: initial,
-        };
-        s.sample();
-        s
+        }
     }
 
     pub fn sample(&mut self) -> TelemetrySample {
@@ -506,6 +512,13 @@ pub fn apply_win11_frame(hwnd: HWND, dark: bool, caption_colorref: u32) {
             DWMWA_CAPTION_COLOR,
             (&caption_colorref as *const u32).cast(),
             size_of::<u32>() as u32,
+        );
+        let no_anim: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&no_anim as *const i32).cast(),
+            size_of::<i32>() as u32,
         );
     }
 }

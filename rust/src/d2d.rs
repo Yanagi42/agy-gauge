@@ -182,17 +182,29 @@ impl D2DFactories {
         }
     }
 
-    fn pick_installed_font(&self, candidates: &[PCWSTR], fallback: PCWSTR) -> PCWSTR {
+    fn get_font_collection(&self) -> Option<IDWriteFontCollection> {
         unsafe {
             let mut coll: Option<IDWriteFontCollection> = None;
             if self.dwrite.GetSystemFontCollection(&mut coll, false).is_ok() {
-                if let Some(c) = coll {
-                    for &name in candidates {
-                        let mut idx = 0u32;
-                        let mut exists = BOOL(0);
-                        if c.FindFamilyName(name, &mut idx, &mut exists).is_ok() && exists.as_bool() {
-                            return name;
-                        }
+                coll
+            } else {
+                None
+            }
+        }
+    }
+
+    fn pick_from_collection(
+        coll: Option<&IDWriteFontCollection>,
+        candidates: &[PCWSTR],
+        fallback: PCWSTR,
+    ) -> PCWSTR {
+        if let Some(c) = coll {
+            unsafe {
+                for &name in candidates {
+                    let mut idx = 0u32;
+                    let mut exists = BOOL(0);
+                    if c.FindFamilyName(name, &mut idx, &mut exists).is_ok() && exists.as_bool() {
+                        return name;
                     }
                 }
             }
@@ -262,11 +274,14 @@ pub struct Fonts {
 
 impl Fonts {
     pub fn new(f: &D2DFactories) -> Result<Self> {
-        let ui = f.pick_installed_font(
+        let coll = f.get_font_collection();
+        let ui = D2DFactories::pick_from_collection(
+            coll.as_ref(),
             &[w!("Segoe UI Variable Text"), w!("Segoe UI Variable"), w!("Microsoft YaHei UI")],
             w!("Microsoft YaHei UI"),
         );
-        let mono = f.pick_installed_font(
+        let mono = D2DFactories::pick_from_collection(
+            coll.as_ref(),
             &[
                 w!("Maple Mono Normal NF CN"),
                 w!("JetBrainsMonoNL Nerd Font"),

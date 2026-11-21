@@ -2,17 +2,19 @@
 //!
 //! Design principles:
 //!   - Warm neutral Obsidian Charcoal / Warm Paper themes (zero neon AI blue/purple/mint).
-//!   - Underline editorial navigation, hairline dividers, radial ring gauges, 2x2 Bento Overview.
-//!   - Interactive "总计 / 仅增量" toggle so non-cached fresh work is never drowned out by 95% cache read.
-//!   - Mouse hover crosshair on the 90-second live CPU/RAM telemetry studio.
+//!   - Flattened 4-tab underline navigation (`概览` | `按天` | `按周` | `会话`);
+//!     Hero strip right-side CPU/RAM rings click-toggle the 90s System Monitor view.
+//!   - Asymmetric 3-panel Overview: smart Trend + ISO Week/Model breakdown + Full-Width Recent Sessions
+//!     with per-session cache hit rate.
+//!   - Interactive "总计 / 仅增量" toggle and Registry-persisted DateScope (defaults to Today).
 
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, Timelike};
 use std::collections::HashMap;
 use std::time::Instant;
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::ID2D1RenderTarget;
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -31,14 +33,14 @@ use crate::telemetry::{apply_win11_frame, copy_text_to_clipboard, SystemTelemetr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Overview,
-    Trends,
+    Daily,
+    Weekly,
     Sessions,
     System,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrendGranularity {
-    Daily,
+pub enum WeeklyMode {
     Weekly,
     Monthly,
 }
@@ -46,7 +48,8 @@ pub enum TrendGranularity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickAction {
     SelectTab(Tab),
-    SelectGranularity(TrendGranularity),
+    ToggleSystemView,
+    SelectWeeklyMode(WeeklyMode),
     SelectScope(DateScope),
     ToggleFreshOnly,
     ToggleLightTheme,
@@ -66,7 +69,8 @@ struct HitBox {
 pub struct DashboardView {
     surface: Option<WindowSurface>,
     pub active_tab: Tab,
-    pub granularity: TrendGranularity,
+    prev_token_tab: Tab,
+    pub weekly_mode: WeeklyMode,
     pub scope: DateScope,
     pub sort: SessionSort,
     pub fresh_only: bool,
@@ -81,13 +85,29 @@ pub struct DashboardView {
     dirty_filter: bool,
 }
 
+fn cache_hit_color(theme: &Theme, c: &TokenCounts) -> D2D1_COLOR_F {
+    if c.calls <= 1 && c.cache_read_tokens == 0 {
+        theme.muted
+    } else {
+        let r = c.cache_hit_rate();
+        if r < 65.0 {
+            theme.warn
+        } else if r >= 85.0 {
+            theme.sage
+        } else {
+            theme.sub
+        }
+    }
+}
+
 impl DashboardView {
-    pub fn new(fresh_only: bool) -> Self {
+    pub fn new(fresh_only: bool, scope: DateScope) -> Self {
         Self {
             surface: None,
             active_tab: Tab::Overview,
-            granularity: TrendGranularity::Daily,
-            scope: DateScope::All,
+            prev_token_tab: Tab::Overview,
+            weekly_mode: WeeklyMode::Weekly,
+            scope,
             sort: SessionSort::Recent,
             fresh_only,
             selected_session: None,
@@ -144,12 +164,25 @@ impl DashboardView {
     ) -> (bool, bool) {
         match action {
             ClickAction::SelectTab(t) => {
+                if t != Tab::System {
+                    self.prev_token_tab = t;
+                }
                 self.active_tab = t;
                 self.scroll_rows = 0;
                 (false, false)
             }
-            ClickAction::SelectGranularity(g) => {
-                self.granularity = g;
+            ClickAction::ToggleSystemView => {
+                if self.active_tab == Tab::System {
+                    self.active_tab = self.prev_token_tab;
+                } else {
+                    self.prev_token_tab = self.active_tab;
+                    self.active_tab = Tab::System;
+                }
+                self.scroll_rows = 0;
+                (false, false)
+            }
+            ClickAction::SelectWeeklyMode(m) => {
+                self.weekly_mode = m;
                 self.scroll_rows = 0;
                 (false, false)
             }
@@ -157,7 +190,7 @@ impl DashboardView {
                 self.scope = s;
                 self.scroll_rows = 0;
                 self.dirty_filter = true;
-                (false, false)
+                (false, true)
             }
             ClickAction::ToggleFreshOnly => {
                 self.fresh_only = !self.fresh_only;
@@ -182,7 +215,7 @@ impl DashboardView {
                     DateScope::All => "全部",
                 };
                 let text = format!(
-                    "AGY CLI Token 用量 ({})\n- 会话: {} | 调用: {}\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值上下文: {}",
+                    "AGY CLI Token 用量 ({})\n- 会话: {} | 调用: {}\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
                     scope_lbl,
                     self.cached_sessions.len(),
                     t.calls,
@@ -212,6 +245,7 @@ impl DashboardView {
             ClickAction::InspectSession(cid) => {
                 self.selected_session = Some(cid);
                 self.active_tab = Tab::Sessions;
+                self.prev_token_tab = Tab::Sessions;
                 self.scroll_rows = 0;
                 (false, false)
             }
@@ -285,8 +319,9 @@ impl DashboardView {
 
             let body = rect_f(20.0, 148.0, (w - 40.0).max(200.0), (h - 166.0).max(200.0));
             match self.active_tab {
-                Tab::Overview => self.draw_overview_tab(factories, rt, fonts, theme, body, telemetry, human),
-                Tab::Trends => self.draw_trends_tab(rt, fonts, theme, body, human),
+                Tab::Overview => self.draw_overview_tab(rt, fonts, theme, body, snapshot, human),
+                Tab::Daily => self.draw_daily_tab(rt, fonts, theme, body, human),
+                Tab::Weekly => self.draw_weekly_tab(rt, fonts, theme, body, human),
                 Tab::Sessions => self.draw_sessions_tab(rt, fonts, theme, body, human),
                 Tab::System => self.draw_system_tab(factories, rt, fonts, theme, body, snapshot, telemetry),
             }
@@ -297,7 +332,7 @@ impl DashboardView {
         res
     }
 
-    // ---------- Minimalist Editorial Header (Underline Navigation) ----------
+    // ---------- Minimalist Editorial Header (4-Tab Flat Underline Nav) ----------
 
     fn draw_header(
         &mut self,
@@ -316,12 +351,12 @@ impl DashboardView {
         draw_text(rt, "AGY", &fonts.ui_brand, rect_f(35.0, 0.0, 42.0, h), theme.text);
         draw_text(rt, "/ 用量", &fonts.ui_small, rect_f(72.0, 1.0, 46.0, h), theme.muted);
 
-        // Clean underline tabs (no clunky boxed pill-in-pill)
+        // Flattened 4 direct token tabs (System monitor lives on Hero CPU/RAM rings)
         let tabs = [
             (Tab::Overview, "概览", 48.0),
-            (Tab::Trends, "按天 & 按周", 82.0),
-            (Tab::Sessions, "会话追踪", 68.0),
-            (Tab::System, "系统监控", 68.0),
+            (Tab::Daily, "按天", 48.0),
+            (Tab::Weekly, "按周", 48.0),
+            (Tab::Sessions, "会话", 48.0),
         ];
         let mut tx = 136.0;
         for (tab, lbl, tw) in tabs {
@@ -347,12 +382,10 @@ impl DashboardView {
         let btn_y = 10.0;
         let btn_h = 26.0;
 
-        // Refresh
         let r_ref = rect_f(rx - 44.0, btn_y, 44.0, btn_h);
         self.draw_ghost_btn(rt, fonts, theme, r_ref, "刷新", false, ClickAction::Refresh);
         rx -= 50.0;
 
-        // Copy summary
         let copied = self.copied_until.map(|t| Instant::now() < t).unwrap_or(false);
         let r_copy = rect_f(rx - 52.0, btn_y, 52.0, btn_h);
         self.draw_ghost_btn(
@@ -366,12 +399,10 @@ impl DashboardView {
         );
         rx -= 58.0;
 
-        // K/M toggle
         let r_km = rect_f(rx - 44.0, btn_y, 44.0, btn_h);
         self.draw_ghost_btn(rt, fonts, theme, r_km, if human { "K/M" } else { "精确" }, false, ClickAction::ToggleHuman);
         rx -= 50.0;
 
-        // Theme toggle (Obsidian / Paper)
         let r_th = rect_f(rx - 46.0, btn_y, 46.0, btn_h);
         self.draw_ghost_btn(
             rt,
@@ -384,11 +415,10 @@ impl DashboardView {
         );
         rx -= 56.0;
 
-        // Quiet vertical divider
         draw_line(rt, rx, 14.0, rx, h - 14.0, theme.border, 1.0);
         rx -= 10.0;
 
-        // Scope filter (borderless editorial text toggles)
+        // Scope filter (borderless editorial text toggles; persisted in Registry)
         let scopes = [
             (DateScope::All, "全部", 38.0),
             (DateScope::Days30, "30天", 40.0),
@@ -444,11 +474,11 @@ impl DashboardView {
         self.hit_boxes.push(HitBox { rect: r, action });
     }
 
-    // ---------- Typographic Hero Strip (Clean Horizontal Band, No RGB Boxes) ----------
+    // ---------- Typographic Hero Strip (Clickable CPU/RAM Ring Block) ----------
 
     #[allow(clippy::too_many_arguments)]
     fn draw_hero_strip(
-        &self,
+        &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
         fonts: &Fonts,
@@ -466,7 +496,7 @@ impl DashboardView {
         let bw = band.right - band.left;
         let c1 = bw * 0.30;
         let c2 = bw * 0.24;
-        let c3 = bw * 0.21;
+        let c3 = bw * 0.20;
         let x0 = band.left;
         let x1 = x0 + c1;
         let x2 = x1 + c2;
@@ -501,7 +531,7 @@ impl DashboardView {
             }
         }
 
-        // Block 2: Fresh Input & Output (warm accents only on tiny legend dots, numbers stay clean neutral!)
+        // Block 2: Fresh Input & Output
         draw_text(rt, "新增输入 / 输出", &fonts.ui_micro, rect_f(x1 + 18.0, y + 9.0, c2 - 28.0, 14.0), theme.muted);
         let io_str = format!("{}  /  {}", fmt_compact(t.input_tokens), fmt_compact(t.output_tokens));
         draw_text(rt, &io_str, &fonts.mono_kpi, rect_f(x1 + 18.0, y + 26.0, c2 - 28.0, 24.0), theme.text);
@@ -509,27 +539,52 @@ impl DashboardView {
         draw_text(rt, &sub2, &fonts.ui_micro, rect_f(x1 + 18.0, y + 53.0, c2 - 28.0, 14.0), theme.sub);
 
         // Block 3: Sessions & Calls
-        draw_text(rt, "活跃规模", &fonts.ui_micro, rect_f(x2 + 18.0, y + 9.0, c3 - 28.0, 14.0), theme.muted);
+        draw_text(rt, "活跃规模", &fonts.ui_micro, rect_f(x2 + 18.0, y + 9.0, c3 - 26.0, 14.0), theme.muted);
         let act_str = format!("{} 会话 · {} 次", self.cached_sessions.len(), t.calls);
-        draw_text(rt, &act_str, &fonts.mono_kpi, rect_f(x2 + 18.0, y + 26.0, c3 - 28.0, 24.0), theme.text);
+        draw_text(rt, &act_str, &fonts.mono_kpi, rect_f(x2 + 18.0, y + 26.0, c3 - 26.0, 24.0), theme.text);
         let avg = if t.calls > 0 { t.total_tokens() / t.calls } else { 0 };
-        let sub3 = format!("均单次 {}  ·  覆盖 {} 天", fmt_compact(avg), self.cached_agg.by_day.len());
-        draw_text(rt, &sub3, &fonts.ui_micro, rect_f(x2 + 18.0, y + 53.0, c3 - 28.0, 14.0), theme.sub);
+        let sub3 = format!("均单次 {}  ·  {} 天", fmt_compact(avg), self.cached_agg.by_day.len());
+        draw_text(rt, &sub3, &fonts.ui_micro, rect_f(x2 + 18.0, y + 53.0, c3 - 26.0, 14.0), theme.sub);
 
-        // Block 4: Radial Ring Gauges for CPU & RAM
+        // Block 4: Clickable Radial Ring Gauges for CPU & RAM (toggles System Monitor view!)
+        let b4 = rect_f(x3 + 4.0, y + 4.0, (band.right - x3 - 8.0).max(80.0), h - 8.0);
+        let sys_act = self.active_tab == Tab::System;
+        let sys_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&b4, mx, my)).unwrap_or(false);
+        if sys_act {
+            fill_round_rect(rt, b4, 7.0, with_alpha(theme.accent, 0.08));
+            fill_round_rect(
+                rt,
+                rect_f(b4.left + 14.0, band.bottom - 2.5, (b4.right - b4.left - 28.0).max(20.0), 2.5),
+                1.25,
+                theme.accent,
+            );
+        } else if sys_hov {
+            fill_round_rect(rt, b4, 7.0, theme.hover);
+        }
+        self.hit_boxes.push(HitBox {
+            rect: b4,
+            action: ClickAction::ToggleSystemView,
+        });
+
         let tel = telemetry.latest;
         let g_cy = y + h * 0.5;
-        let c_cx = x3 + 34.0;
+        let c_cx = x3 + 32.0;
         draw_ring_gauge(factories, rt, c_cx, g_cy, 17.0, 3.0, tel.cpu_pct, theme.grid, theme.accent);
         draw_text(rt, &format!("{:.0}%", tel.cpu_pct), &fonts.mono_small_center, rect_f(c_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
 
-        let r_cx = x3 + 84.0;
+        let r_cx = x3 + 80.0;
         draw_ring_gauge(factories, rt, r_cx, g_cy, 17.0, 3.0, tel.mem_pct, theme.grid, theme.ram);
         draw_text(rt, &format!("{:.0}%", tel.mem_pct), &fonts.mono_small_center, rect_f(r_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
 
-        let tx_l = x3 + 114.0;
+        let tx_l = x3 + 110.0;
         let tx_w = (band.right - tx_l - 12.0).max(60.0);
-        draw_text(rt, "CPU / 内存", &fonts.ui_micro, rect_f(tx_l, y + 15.0, tx_w, 14.0), theme.muted);
+        draw_text(
+            rt,
+            if sys_act { "系统监控  ‹ 返回" } else { "CPU / 内存  ›" },
+            &fonts.ui_micro,
+            rect_f(tx_l, y + 14.0, tx_w, 14.0),
+            if sys_act { theme.accent } else if sys_hov { theme.text } else { theme.muted },
+        );
         draw_text(
             rt,
             &format!("{:.1}/{:.1} GB", tel.mem_used_gb, tel.mem_total_gb),
@@ -540,103 +595,258 @@ impl DashboardView {
         draw_text(rt, &format!("{} 核实时", tel.cpu_cores), &fonts.ui_micro, rect_f(tx_l, y + 50.0, tx_w, 14.0), theme.sub);
     }
 
-    // ---------- Tab 1: Editorial 2x2 Bento Overview ----------
+    // ---------- Tab 1: Redesigned 3-Panel Editorial Overview ----------
 
     #[allow(clippy::too_many_arguments)]
     fn draw_overview_tab(
         &mut self,
-        factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
         fonts: &Fonts,
         theme: &Theme,
         body: D2D_RECT_F,
-        telemetry: &SystemTelemetry,
+        snapshot: &ScanSnapshot,
         human: bool,
     ) {
         let gap = 14.0;
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
-        let left_w = ((bw - gap) * 0.61).round();
+        let left_w = ((bw - gap) * 0.59).round();
         let right_w = bw - gap - left_w;
-        let top_h = ((bh - gap) * 0.55).round();
+        let top_h = ((bh - gap) * 0.50).round();
         let bot_h = bh - gap - top_h;
+        let today = Local::now().date_naive();
 
-        // 1) Top-Left: 14-day Daily Trend with "总计 | 仅增量" toggle
+        // 1) Top-Left: Smart Trend Chart (Hourly on Today scope, smart 7..14 day window otherwise)
         let tl = rect_f(body.left, body.top, left_w, top_h);
         fill_round_rect(rt, tl, 10.0, theme.surface);
         stroke_round_rect(rt, tl, 10.0, theme.border, 1.0);
-        draw_text(rt, "每日用量趋势", &fonts.ui_section, rect_f(tl.left + 16.0, tl.top + 11.0, 120.0, 20.0), theme.text);
-        self.draw_chart_legend_and_toggle(rt, fonts, theme, tl);
 
-        let today = Local::now().date_naive();
-        let days14: Vec<BarItem> = (0..14u64)
-            .rev()
-            .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
-            .map(|d| {
-                let k = d.format("%Y-%m-%d").to_string();
-                let c = self.cached_agg.by_day.get(&k).copied().unwrap_or_default();
-                BarItem {
-                    label: d.format("%m/%d").to_string(),
-                    cache: c.cache_read_tokens,
-                    input: c.input_tokens,
-                    output: c.output_tokens,
-                    tooltip: vec![
-                        format!("{} ({}) · {} 次", k, weekday_cn(d), c.calls),
-                        format!("总计   : {}", fmt_commas(c.total_tokens())),
-                        format!("新输入 : {}", fmt_commas(c.input_tokens)),
-                        format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
-                        format!("输出   : {}", fmt_commas(c.output_tokens)),
-                    ],
+        let (chart_title, bars, empty_msg) = if self.scope == DateScope::Today {
+            let active_hours: Vec<usize> = self
+                .cached_agg
+                .by_hour
+                .iter()
+                .enumerate()
+                .filter_map(|(h, c)| if c.calls > 0 { Some(h) } else { None })
+                .collect();
+            let items: Vec<BarItem> = if let (Some(&first_h), Some(&last_h)) =
+                (active_hours.first(), active_hours.last())
+            {
+                let now_h = (Local::now().hour() as usize).min(23);
+                let end_h = last_h.max(now_h).min(23);
+                let mut start_h = first_h.min(end_h.saturating_sub(7));
+                if end_h.saturating_sub(start_h) < 7 {
+                    start_h = end_h.saturating_sub(7);
                 }
-            })
-            .collect();
+                (start_h..=end_h)
+                    .map(|h| {
+                        let c = self.cached_agg.by_hour[h];
+                        BarItem {
+                            label: format!("{:02}h", h),
+                            cache: c.cache_read_tokens,
+                            input: c.input_tokens,
+                            output: c.output_tokens,
+                            tooltip: vec![
+                                format!("今日 {:02}:00 - {:02}:59 · {} 次", h, h, c.calls),
+                                format!("总计   : {}", fmt_commas(c.total_tokens())),
+                                format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                                format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                                format!("输出   : {}", fmt_commas(c.output_tokens)),
+                            ],
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            ("今日分时趋势", items, "今日暂无用量 · 右上角可切换 7天 / 全部")
+        } else {
+            let n_days: u64 = match self.scope {
+                DateScope::Days7 => 7,
+                _ => {
+                    let earliest = self
+                        .cached_agg
+                        .by_day
+                        .keys()
+                        .next()
+                        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+                    match earliest {
+                        Some(d) => ((today - d).num_days() + 1).clamp(7, 14) as u64,
+                        None => 7,
+                    }
+                }
+            };
+            let items: Vec<BarItem> = (0..n_days)
+                .rev()
+                .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
+                .map(|d| {
+                    let k = d.format("%Y-%m-%d").to_string();
+                    let c = self.cached_agg.by_day.get(&k).copied().unwrap_or_default();
+                    BarItem {
+                        label: d.format("%m/%d").to_string(),
+                        cache: c.cache_read_tokens,
+                        input: c.input_tokens,
+                        output: c.output_tokens,
+                        tooltip: vec![
+                            format!("{} ({}) · {} 次", k, weekday_cn(d), c.calls),
+                            format!("总计   : {}", fmt_commas(c.total_tokens())),
+                            format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                            format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                            format!("输出   : {}", fmt_commas(c.output_tokens)),
+                        ],
+                    }
+                })
+                .collect();
+            let title = if self.scope == DateScope::Days7 { "近 7 天用量趋势" } else { "每日用量趋势" };
+            (title, items, "暂无用量数据")
+        };
 
+        draw_text(rt, chart_title, &fonts.ui_section, rect_f(tl.left + 16.0, tl.top + 11.0, 130.0, 20.0), theme.text);
+        self.draw_chart_legend_and_toggle(rt, fonts, theme, tl);
         let tl_plot = rect_f(tl.left + 10.0, tl.top + 38.0, left_w - 20.0, top_h - 46.0);
-        draw_editorial_bars(rt, fonts, theme, tl_plot, &days14, self.fresh_only, self.mouse_dip, "暂无数据");
+        draw_editorial_bars(rt, fonts, theme, tl_plot, &bars, self.fresh_only, self.mouse_dip, empty_msg);
 
-        // 2) Top-Right: 24h Rhythm Heatmap + Model Breakdown
+        // 2) Top-Right: This Week vs Last Week (full snapshot context) + Model Comparison
         let tr = rect_f(tl.right + gap, body.top, right_w, top_h);
         fill_round_rect(rt, tr, 10.0, theme.surface);
         stroke_round_rect(rt, tr, 10.0, theme.border, 1.0);
-        draw_text(rt, "24 小时活跃节律", &fonts.ui_section, rect_f(tr.left + 16.0, tr.top + 11.0, 140.0, 20.0), theme.text);
 
-        let split_y = tr.top + top_h * 0.54;
-        self.draw_hourly_rhythm(rt, fonts, theme, rect_f(tr.left + 14.0, tr.top + 36.0, right_w - 28.0, split_y - tr.top - 42.0));
+        let cur_wk = iso_week_key(today);
+        let prev_wk = today
+            .checked_sub_days(chrono::Days::new(7))
+            .map(iso_week_key)
+            .unwrap_or_default();
+        let wk_c = snapshot.agg.by_week.get(&cur_wk).copied().unwrap_or_default();
+        let prev_c = snapshot.agg.by_week.get(&prev_wk).copied().unwrap_or_default();
+        let wk_days = snapshot.agg.week_active_days.get(&cur_wk).copied().unwrap_or(0);
+        let wk_avg = if wk_days > 0 { wk_c.total_tokens() / wk_days as u64 } else { 0 };
 
-        draw_line(rt, tr.left + 16.0, split_y, tr.right - 16.0, split_y, theme.border, 1.0);
-        draw_text(rt, "模型分布", &fonts.ui_section, rect_f(tr.left + 16.0, split_y + 10.0, 100.0, 18.0), theme.text);
-        self.draw_compact_models(rt, fonts, theme, rect_f(tr.left + 16.0, split_y + 34.0, right_w - 32.0, tr.bottom - split_y - 42.0), human);
+        draw_text(rt, &format!("本周 · {}", cur_wk), &fonts.ui_section, rect_f(tr.left + 16.0, tr.top + 10.0, 146.0, 20.0), theme.text);
+        draw_text(rt, &iso_week_range_label(&cur_wk), &fonts.mono_small_right, rect_f(tr.right - 120.0, tr.top + 12.0, 104.0, 16.0), theme.muted);
 
-        // 3) Bottom-Left: Top 5 Recent Sessions (Click jumps to Sessions tab!)
-        let bl = rect_f(body.left, tl.bottom + gap, left_w, bot_h);
-        fill_round_rect(rt, bl, 10.0, theme.surface);
-        stroke_round_rect(rt, bl, 10.0, theme.border, 1.0);
-        draw_text(rt, "最近活跃会话", &fonts.ui_section, rect_f(bl.left + 16.0, bl.top + 11.0, 140.0, 20.0), theme.text);
-        draw_text(rt, "点击查看逐轮上下文 →", &fonts.ui_micro, rect_f(bl.right - 150.0, bl.top + 13.0, 134.0, 16.0), theme.muted);
+        draw_text(rt, &fmt_num(wk_c.total_tokens(), human), &fonts.mono_kpi, rect_f(tr.left + 16.0, tr.top + 32.0, (right_w - 150.0).max(90.0), 24.0), theme.text);
 
-        let list_y = bl.top + 38.0;
-        let row_h = ((bot_h - 48.0) / 5.0).clamp(24.0, 34.0);
-        if self.cached_sessions.is_empty() {
-            draw_text(rt, "当前范围暂无会话", &fonts.ui_reg_center, rect_f(bl.left, list_y, left_w, bot_h - 48.0), theme.muted);
+        let (wow_str, wow_col) = if prev_c.total_tokens() > 0 {
+            let pct = ((wk_c.total_tokens() as f64 - prev_c.total_tokens() as f64)
+                / prev_c.total_tokens() as f64)
+                * 100.0;
+            (format!("较上周 {:+.1}%", pct), if pct >= 0.0 { theme.accent } else { theme.sage })
         } else {
-            for (i, s) in self.cached_sessions.iter().take(5).enumerate() {
+            ("上周无记录".to_string(), theme.muted)
+        };
+        draw_text(rt, &wow_str, &fonts.mono_small_right, rect_f(tr.right - 134.0, tr.top + 36.0, 118.0, 18.0), wow_col);
+
+        draw_text(
+            rt,
+            &format!("日均 {}  ·  活跃 {} 天  ·  非缓存 {}", fmt_compact(wk_avg), wk_days, fmt_compact(wk_c.non_cached_tokens())),
+            &fonts.ui_micro,
+            rect_f(tr.left + 16.0, tr.top + 59.0, right_w - 32.0, 15.0),
+            theme.sub,
+        );
+        let prev_lbl = if prev_c.total_tokens() > 0 {
+            fmt_compact(prev_c.total_tokens())
+        } else {
+            "-".to_string()
+        };
+        draw_text(
+            rt,
+            &format!("本周缓存命中 {:.1}%  ·  上周总量 {}", wk_c.cache_hit_rate(), prev_lbl),
+            &fonts.ui_micro,
+            rect_f(tr.left + 16.0, tr.top + 76.0, right_w - 32.0, 15.0),
+            theme.muted,
+        );
+
+        let split_y = tr.top + (top_h * 0.44).clamp(96.0, 114.0);
+        draw_line(rt, tr.left + 16.0, split_y, tr.right - 16.0, split_y, theme.border, 1.0);
+        draw_text(rt, "模型分布", &fonts.ui_section, rect_f(tr.left + 16.0, split_y + 8.0, 100.0, 18.0), theme.text);
+        draw_text(rt, "占比 · 缓存命中", &fonts.ui_small_right, rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0), theme.muted);
+        self.draw_compact_models(
+            rt,
+            fonts,
+            theme,
+            rect_f(tr.left + 16.0, split_y + 30.0, right_w - 32.0, (tr.bottom - split_y - 36.0).max(24.0)),
+            human,
+        );
+
+        // 3) Bottom Full-Width: Recent Active Sessions (spacious table with per-session cache hit rate)
+        let bot = rect_f(body.left, tl.bottom + gap, bw, bot_h);
+        fill_round_rect(rt, bot, 10.0, theme.surface);
+        stroke_round_rect(rt, bot, 10.0, theme.border, 1.0);
+
+        draw_text(rt, "最近活跃会话", &fonts.ui_section, rect_f(bot.left + 16.0, bot.top + 9.0, 96.0, 20.0), theme.text);
+        draw_text(
+            rt,
+            &format!("共 {} 个", self.cached_sessions.len()),
+            &fonts.ui_micro,
+            rect_f(bot.left + 108.0, bot.top + 11.0, 80.0, 16.0),
+            theme.muted,
+        );
+        draw_text(
+            rt,
+            "点击查看逐轮剖析 →",
+            &fonts.ui_small_right,
+            rect_f(bot.right - 170.0, bot.top + 10.0, 154.0, 18.0),
+            theme.muted,
+        );
+
+        let rr_l = bot.left + 10.0;
+        let rr_w = bw - 20.0;
+        let rx = rr_l + rr_w - 10.0;
+        let model_w = if rr_w >= 860.0 { 136.0 } else { 96.0 };
+        let model_x = rx - 338.0 - model_w;
+        let title_x = rr_l + 90.0;
+        let title_w = (model_x - 10.0 - title_x).max(80.0);
+
+        // Subtle column header row
+        let hdr_y = bot.top + 31.0;
+        let hdr_h = 20.0;
+        draw_text(rt, "时间", &fonts.ui_micro, rect_f(rr_l + 8.0, hdr_y, 76.0, hdr_h), theme.muted);
+        draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
+        draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
+        draw_text(rt, "轮数", &fonts.ui_small_right, rect_f(rx - 332.0, hdr_y, 42.0, hdr_h), theme.muted);
+        draw_text(rt, "命中率", &fonts.ui_small_right, rect_f(rx - 284.0, hdr_y, 60.0, hdr_h), theme.muted);
+        draw_text(rt, "非缓存", &fonts.ui_small_right, rect_f(rx - 218.0, hdr_y, 66.0, hdr_h), theme.muted);
+        draw_text(rt, "总计", &fonts.ui_small_right, rect_f(rx - 146.0, hdr_y, 72.0, hdr_h), theme.muted);
+        draw_text(rt, "峰值Ctx", &fonts.ui_small_right, rect_f(rx - 68.0, hdr_y, 68.0, hdr_h), theme.muted);
+        draw_line(rt, bot.left + 14.0, bot.top + 51.0, bot.right - 14.0, bot.top + 51.0, theme.border, 1.0);
+
+        let list_y = bot.top + 54.0;
+        let avail_h = (bot.bottom - 8.0 - list_y).max(28.0);
+        if self.cached_sessions.is_empty() {
+            draw_text(
+                rt,
+                "当前范围暂无会话 · 点击右上角可切换 7天 / 30天 / 全部",
+                &fonts.ui_reg_center,
+                rect_f(bot.left, list_y, bw, avail_h),
+                theme.muted,
+            );
+        } else {
+            let max_vis = ((avail_h / 28.0).floor() as usize).clamp(1, 6);
+            let show_n = self.cached_sessions.len().min(max_vis);
+            let row_h = (avail_h / max_vis as f32).clamp(26.0, 32.0);
+            for (i, s) in self.cached_sessions.iter().take(show_n).enumerate() {
                 let ry = list_y + i as f32 * row_h;
-                let rr = rect_f(bl.left + 10.0, ry, left_w - 20.0, row_h - 2.0);
+                let rr = rect_f(rr_l, ry, rr_w, row_h - 2.0);
                 let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
                 if hov {
                     fill_round_rect(rt, rr, 6.0, theme.hover);
                 }
                 if i > 0 {
-                    draw_line(rt, bl.left + 16.0, ry - 1.0, bl.right - 16.0, ry - 1.0, theme.grid, 0.8);
+                    draw_line(rt, bot.left + 16.0, ry - 1.0, bot.right - 16.0, ry - 1.0, theme.grid, 0.8);
                 }
                 let t_str = s.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
-                let rx = rr.right - 8.0;
-                let title_w = (rx - 220.0 - (rr.left + 84.0)).max(80.0);
-                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr.left + 8.0, ry, 72.0, row_h - 2.0), theme.muted);
-                draw_text(rt, &s.title, &fonts.ui_reg, rect_f(rr.left + 84.0, ry, title_w, row_h - 2.0), theme.text);
-                draw_text(rt, &format!("{}轮", s.counts.calls), &fonts.mono_small_right, rect_f(rx - 204.0, ry, 46.0, row_h - 2.0), theme.muted);
-                draw_text(rt, &fmt_num(s.counts.total_tokens(), human), &fonts.mono_med_right, rect_f(rx - 150.0, ry, 74.0, row_h - 2.0), theme.text);
-                draw_text(rt, &format!("Ctx {}", fmt_compact(s.counts.peak_context)), &fonts.mono_small_right, rect_f(rx - 70.0, ry, 70.0, row_h - 2.0), theme.sub);
+                let m_str = s.models.iter().next().cloned().unwrap_or_else(|| "-".into());
+                let hit_str = format!("{:.1}%", s.counts.cache_hit_rate());
+                let hit_col = cache_hit_color(theme, &s.counts);
+
+                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 76.0, row_h - 2.0), theme.muted);
+                draw_text(rt, &s.title, &fonts.ui_reg, rect_f(title_x, ry, title_w, row_h - 2.0), theme.text);
+                draw_text(rt, &m_str, &fonts.mono_small_right, rect_f(model_x, ry, model_w, row_h - 2.0), theme.muted);
+                draw_text(rt, &format!("{}轮", s.counts.calls), &fonts.mono_small_right, rect_f(rx - 332.0, ry, 42.0, row_h - 2.0), theme.muted);
+                draw_text(rt, &hit_str, &fonts.mono_small_right, rect_f(rx - 284.0, ry, 60.0, row_h - 2.0), hit_col);
+                draw_text(rt, &fmt_num(s.counts.non_cached_tokens(), human), &fonts.mono_small_right, rect_f(rx - 218.0, ry, 66.0, row_h - 2.0), theme.sub);
+                draw_text(rt, &fmt_num(s.counts.total_tokens(), human), &fonts.mono_med_right, rect_f(rx - 146.0, ry, 72.0, row_h - 2.0), theme.text);
+                draw_text(rt, &fmt_compact(s.counts.peak_context), &fonts.mono_small_right, rect_f(rx - 68.0, ry, 68.0, row_h - 2.0), theme.sub);
 
                 self.hit_boxes.push(HitBox {
                     rect: rr,
@@ -644,137 +854,40 @@ impl DashboardView {
                 });
             }
         }
-
-        // 4) Bottom-Right: Current ISO Week Scorecard + Live Mini Dual Sparkline
-        let br = rect_f(tl.right + gap, tr.bottom + gap, right_w, bot_h);
-        fill_round_rect(rt, br, 10.0, theme.surface);
-        stroke_round_rect(rt, br, 10.0, theme.border, 1.0);
-
-        let cur_wk = iso_week_key(today);
-        let wk_c = self.cached_agg.by_week.get(&cur_wk).copied().unwrap_or_default();
-        let wk_days = self.cached_agg.week_active_days.get(&cur_wk).copied().unwrap_or(0);
-        let wk_avg = if wk_days > 0 { wk_c.total_tokens() / wk_days as u64 } else { 0 };
-
-        draw_text(rt, &format!("本周 · {}", cur_wk), &fonts.ui_section, rect_f(br.left + 16.0, br.top + 11.0, 140.0, 20.0), theme.text);
-        draw_text(rt, &iso_week_range_label(&cur_wk), &fonts.mono_small_right, rect_f(br.right - 116.0, br.top + 13.0, 100.0, 16.0), theme.muted);
-
-        draw_text(rt, &fmt_num(wk_c.total_tokens(), human), &fonts.mono_kpi, rect_f(br.left + 16.0, br.top + 36.0, right_w - 32.0, 24.0), theme.text);
-        draw_text(
-            rt,
-            &format!("日均 {}  ·  活跃 {} 天  ·  非缓存 {}", fmt_compact(wk_avg), wk_days, fmt_compact(wk_c.non_cached_tokens())),
-            &fonts.ui_micro,
-            rect_f(br.left + 16.0, br.top + 63.0, right_w - 32.0, 15.0),
-            theme.sub,
-        );
-
-        let sep_y = br.top + 88.0;
-        draw_line(rt, br.left + 16.0, sep_y, br.right - 16.0, sep_y, theme.border, 1.0);
-        let tel = telemetry.latest;
-        draw_text(rt, "实时 CPU / 内存波形", &fonts.ui_micro, rect_f(br.left + 16.0, sep_y + 8.0, 130.0, 14.0), theme.muted);
-        draw_text(
-            rt,
-            &format!("CPU {:.0}% · RAM {:.0}%", tel.cpu_pct, tel.mem_pct),
-            &fonts.mono_small_right,
-            rect_f(br.right - 146.0, sep_y + 8.0, 130.0, 14.0),
-            theme.sub,
-        );
-
-        let sp_l = br.left + 16.0;
-        let sp_r = br.right - 16.0;
-        let sp_t = sep_y + 28.0;
-        let sp_b = br.bottom - 14.0;
-        if sp_b > sp_t + 16.0 && telemetry.history.len() >= 2 {
-            let max_pts = 45usize;
-            let slice: Vec<_> = telemetry.history.iter().rev().take(max_pts).collect();
-            let n = slice.len();
-            let dx = (sp_r - sp_l) / (max_pts - 1) as f32;
-            let x0 = sp_l + (max_pts - n) as f32 * dx;
-            let mut c_pts = Vec::with_capacity(n);
-            let mut m_pts = Vec::with_capacity(n);
-            for (i, s) in slice.iter().rev().enumerate() {
-                let px = x0 + i as f32 * dx;
-                c_pts.push((px, sp_b - (s.cpu_pct.clamp(0.0, 100.0) / 100.0) * (sp_b - sp_t)));
-                m_pts.push((px, sp_b - (s.mem_pct.clamp(0.0, 100.0) / 100.0) * (sp_b - sp_t)));
-            }
-            draw_line(rt, sp_l, sp_b, sp_r, sp_b, theme.grid, 1.0);
-            draw_area_series(factories, rt, &m_pts, sp_b, sp_t, theme.ram, 1.4, 0.10);
-            draw_area_series(factories, rt, &c_pts, sp_b, sp_t, theme.accent, 1.6, 0.18);
-        }
-    }
-
-    fn draw_hourly_rhythm(&self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F) {
-        let w = bounds.right - bounds.left;
-        let h = bounds.bottom - bounds.top;
-        let plot_b = bounds.bottom - 16.0;
-        let plot_h = (h - 20.0).max(20.0);
-        let max_v = self
-            .cached_agg
-            .by_hour
-            .iter()
-            .map(|c| if self.fresh_only { c.non_cached_tokens() } else { c.total_tokens() })
-            .max()
-            .unwrap_or(0)
-            .max(1);
-
-        let slot = w / 24.0;
-        let bw = (slot * 0.62).clamp(3.0, 10.0);
-        let mut hov_h: Option<usize> = None;
-        if let Some((mx, my)) = self.mouse_dip {
-            if mx >= bounds.left && mx <= bounds.right && my >= bounds.top && my <= plot_b {
-                let idx = ((mx - bounds.left) / slot).floor() as isize;
-                if (0..24).contains(&idx) {
-                    hov_h = Some(idx as usize);
-                }
-            }
-        }
-
-        for (hr, c) in self.cached_agg.by_hour.iter().enumerate() {
-            let val = if self.fresh_only { c.non_cached_tokens() } else { c.total_tokens() };
-            let cx = bounds.left + (hr as f32 + 0.5) * slot;
-            let x0 = cx - bw * 0.5;
-            if val > 0 {
-                let ratio = (val as f64 / max_v as f64) as f32;
-                let bh = (ratio * plot_h).max(3.0);
-                let col = with_alpha(theme.accent, 0.28 + 0.72 * ratio);
-                fill_round_rect(rt, rect_f(x0, plot_b - bh, bw, bh), (bw * 0.35).min(2.5), col);
-            } else {
-                fill_round_rect(rt, rect_f(x0, plot_b - 2.0, bw, 2.0), 1.0, theme.grid);
-            }
-            if hr % 6 == 0 || hr == 23 {
-                draw_text(rt, &format!("{:02}", hr), &fonts.mono_small_center, rect_f(cx - 12.0, plot_b + 2.0, 24.0, 14.0), theme.muted);
-            }
-        }
-
-        if let Some(hr) = hov_h {
-            let c = &self.cached_agg.by_hour[hr];
-            let tip = format!("{:02}:00  ·  {} ({}次)", hr, fmt_compact(c.total_tokens()), c.calls);
-            draw_text(rt, &tip, &fonts.mono_small_right, rect_f(bounds.right - 170.0, bounds.top - 22.0, 170.0, 16.0), theme.accent);
-        }
     }
 
     fn draw_compact_models(&self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
         let mut items: Vec<(&String, &TokenCounts)> = self.cached_agg.by_model.iter().collect();
         items.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
         if items.is_empty() {
-            draw_text(rt, "暂无模型数据", &fonts.ui_small, bounds, theme.muted);
+            draw_text(rt, "当前范围暂无模型数据", &fonts.ui_small, bounds, theme.muted);
             return;
         }
+        let avail_h = (bounds.bottom - bounds.top).max(24.0);
+        let max_show = if avail_h >= 82.0 { 3 } else { 2 };
+        let show_n = items.len().min(max_show);
         let total_all = self.cached_agg.total.total_tokens().max(1);
-        let row_h = ((bounds.bottom - bounds.top) / items.len().clamp(1, 3) as f32).clamp(24.0, 34.0);
+        let row_h = (avail_h / show_n as f32).clamp(24.0, 34.0);
         let w = bounds.right - bounds.left;
-        for (i, (name, c)) in items.iter().take(3).enumerate() {
+        let palette = [theme.accent, theme.output, theme.ram];
+
+        for (i, (name, c)) in items.iter().take(show_n).enumerate() {
             let y = bounds.top + i as f32 * row_h;
             let share = (c.total_tokens() as f64 / total_all as f64) as f32;
-            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.58, 16.0), theme.text);
-            let stat = format!("{}  ({:.0}%)", fmt_num(c.total_tokens(), human), share * 100.0);
-            draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.56, y, w * 0.44, 16.0), theme.sub);
+            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.48, 16.0), theme.text);
+            let stat = format!(
+                "{} ({:.0}%) · {:.0}%",
+                fmt_num(c.total_tokens(), human),
+                share * 100.0,
+                c.cache_hit_rate()
+            );
+            draw_text(rt, &stat, &fonts.mono_small_right, rect_f(bounds.left + w * 0.46, y, w * 0.54, 16.0), theme.sub);
             fill_round_rect(rt, rect_f(bounds.left, y + 18.0, w, 3.5), 1.75, theme.grid);
-            fill_round_rect(rt, rect_f(bounds.left, y + 18.0, (w * share).max(3.0), 3.5), 1.75, if i == 0 { theme.accent } else { theme.output });
+            fill_round_rect(rt, rect_f(bounds.left, y + 18.0, (w * share).max(3.0), 3.5), 1.75, palette[i % palette.len()]);
         }
     }
 
     fn draw_chart_legend_and_toggle(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, card: D2D_RECT_F) {
-        // Right-aligned "总计 | 仅增量" toggle pill
         let tw = 112.0;
         let tr = rect_f(card.right - tw - 14.0, card.top + 9.0, tw, 22.0);
         fill_round_rect(rt, tr, 6.0, theme.surface_subtle);
@@ -789,7 +902,6 @@ impl DashboardView {
         draw_text(rt, "仅增量", &fonts.ui_small_center, r_inc, if self.fresh_only { theme.accent } else { theme.muted });
         self.hit_boxes.push(HitBox { rect: tr, action: ClickAction::ToggleFreshOnly });
 
-        // Quiet inline dot legend just left of toggle
         let mut lx = tr.left - 168.0;
         let ly = card.top + 20.0;
         if lx > card.left + 135.0 {
@@ -808,9 +920,9 @@ impl DashboardView {
         }
     }
 
-    // ---------- Tab 2: Deep Daily / Weekly (ISO) / Monthly Trends ----------
+    // ---------- Tab 2: Direct Daily Analytics ----------
 
-    fn draw_trends_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
+    fn draw_daily_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
         let chart_h = (bh * 0.50).clamp(190.0, 275.0);
@@ -818,103 +930,126 @@ impl DashboardView {
         fill_round_rect(rt, chart_c, 10.0, theme.surface);
         stroke_round_rect(rt, chart_c, 10.0, theme.border, 1.0);
 
-        // Granularity sub-tabs inside chart card header
-        let mut gx = chart_c.left + 14.0;
-        for (g, lbl, gw) in [
-            (TrendGranularity::Daily, "按天", 46.0),
-            (TrendGranularity::Weekly, "按周 (ISO)", 76.0),
-            (TrendGranularity::Monthly, "按月", 46.0),
-        ] {
-            let r = rect_f(gx, chart_c.top + 9.0, gw, 22.0);
-            let act = self.granularity == g;
-            if act {
-                fill_round_rect(rt, r, 6.0, theme.hover);
-            }
-            draw_text(rt, lbl, &fonts.ui_small_center, r, if act { theme.text } else { theme.muted });
-            self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectGranularity(g) });
-            gx += gw + 4.0;
+        draw_text(rt, "按天用量明细", &fonts.ui_section, rect_f(chart_c.left + 16.0, chart_c.top + 10.0, 96.0, 20.0), theme.text);
+        if self.scope == DateScope::Today {
+            let hint_r = rect_f(chart_c.left + 114.0, chart_c.top + 9.0, 108.0, 22.0);
+            self.draw_ghost_btn(rt, fonts, theme, hint_r, "仅今日 · 展开全部", true, ClickAction::SelectScope(DateScope::All));
         }
         self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
-        match self.granularity {
-            TrendGranularity::Daily => {
-                let days_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_day.iter().collect();
-                let chart_days: Vec<(String, TokenCounts)> = if self.scope != DateScope::Today && days_asc.len() < 14 && !days_asc.is_empty() {
-                    let today = Local::now().date_naive();
-                    (0..14u64)
-                        .rev()
-                        .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
-                        .map(|d| {
-                            let k = d.format("%Y-%m-%d").to_string();
-                            (k.clone(), self.cached_agg.by_day.get(&k).copied().unwrap_or_default())
-                        })
-                        .collect()
-                } else {
-                    let s = days_asc.len().saturating_sub(30);
-                    days_asc[s..].iter().map(|(k, c)| ((*k).clone(), **c)).collect()
-                };
-                let bars: Vec<BarItem> = chart_days
-                    .iter()
-                    .map(|(day, c)| BarItem {
-                        label: if day.len() >= 10 { day[5..].to_string() } else { day.clone() },
-                        cache: c.cache_read_tokens,
-                        input: c.input_tokens,
-                        output: c.output_tokens,
-                        tooltip: vec![
-                            format!("{} · {} 次调用", day, c.calls),
-                            format!("总计   : {}", fmt_commas(c.total_tokens())),
-                            format!("新输入 : {}", fmt_commas(c.input_tokens)),
-                            format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
-                            format!("输出   : {}", fmt_commas(c.output_tokens)),
-                            format!("峰值Ctx: {}", fmt_commas(c.peak_context)),
-                        ],
-                    })
-                    .collect();
-                draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按天数据");
+        let days_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_day.iter().collect();
+        let chart_days: Vec<(String, TokenCounts)> = if self.scope != DateScope::Today && days_asc.len() < 7 && !days_asc.is_empty() {
+            let today = Local::now().date_naive();
+            (0..7u64)
+                .rev()
+                .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
+                .map(|d| {
+                    let k = d.format("%Y-%m-%d").to_string();
+                    (k.clone(), self.cached_agg.by_day.get(&k).copied().unwrap_or_default())
+                })
+                .collect()
+        } else {
+            let s = days_asc.len().saturating_sub(30);
+            days_asc[s..].iter().map(|(k, c)| ((*k).clone(), **c)).collect()
+        };
+        let bars: Vec<BarItem> = chart_days
+            .iter()
+            .map(|(day, c)| BarItem {
+                label: if day.len() >= 10 { day[5..].to_string() } else { day.clone() },
+                cache: c.cache_read_tokens,
+                input: c.input_tokens,
+                output: c.output_tokens,
+                tooltip: vec![
+                    format!("{} · {} 次调用", day, c.calls),
+                    format!("总计   : {}", fmt_commas(c.total_tokens())),
+                    format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                    format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                    format!("输出   : {}", fmt_commas(c.output_tokens)),
+                    format!("峰值Ctx: {}", fmt_commas(c.peak_context)),
+                ],
+            })
+            .collect();
+        draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "暂无按天数据");
 
-                let rows: Vec<Vec<String>> = days_asc
-                    .iter()
-                    .rev()
-                    .map(|(day, c)| {
-                        let wd = NaiveDate::parse_from_str(day, "%Y-%m-%d").map(weekday_cn).unwrap_or("-");
-                        vec![
-                            (*day).clone(),
-                            wd.into(),
-                            c.calls.to_string(),
-                            fmt_num(c.input_tokens, human),
-                            fmt_num(c.cache_read_tokens, human),
-                            fmt_num(c.output_tokens, human),
-                            fmt_num(c.total_tokens(), human),
-                            fmt_num(c.non_cached_tokens(), human),
-                            format!("{:.1}%", c.cache_hit_rate()),
-                            fmt_num(c.peak_context, human),
-                        ]
-                    })
-                    .collect();
-                self.draw_table(
-                    rt,
-                    fonts,
-                    theme,
-                    tbl_r,
-                    &[
-                        ("日期", 0.12, false),
-                        ("星期", 0.06, false),
-                        ("调用", 0.06, true),
-                        ("新增输入", 0.11, true),
-                        ("缓存读取", 0.12, true),
-                        ("输出", 0.10, true),
-                        ("总 Token", 0.12, true),
-                        ("非缓存", 0.11, true),
-                        ("命中率", 0.09, true),
-                        ("峰值Ctx", 0.11, true),
-                    ],
-                    &rows,
-                );
+        let rows: Vec<Vec<String>> = days_asc
+            .iter()
+            .rev()
+            .map(|(day, c)| {
+                let wd = NaiveDate::parse_from_str(day, "%Y-%m-%d").map(weekday_cn).unwrap_or("-");
+                vec![
+                    (*day).clone(),
+                    wd.into(),
+                    c.calls.to_string(),
+                    fmt_num(c.input_tokens, human),
+                    fmt_num(c.cache_read_tokens, human),
+                    fmt_num(c.output_tokens, human),
+                    fmt_num(c.total_tokens(), human),
+                    fmt_num(c.non_cached_tokens(), human),
+                    format!("{:.1}%", c.cache_hit_rate()),
+                    fmt_num(c.peak_context, human),
+                ]
+            })
+            .collect();
+        self.draw_table(
+            rt,
+            fonts,
+            theme,
+            tbl_r,
+            &[
+                ("日期", 0.12, false),
+                ("星期", 0.06, false),
+                ("调用", 0.06, true),
+                ("新增输入", 0.11, true),
+                ("缓存读取", 0.12, true),
+                ("输出", 0.10, true),
+                ("总 Token", 0.12, true),
+                ("非缓存", 0.11, true),
+                ("命中率", 0.09, true),
+                ("峰值Ctx", 0.11, true),
+            ],
+            &rows,
+        );
+    }
+
+    // ---------- Tab 3: Direct ISO Weekly (with quiet Monthly sub-toggle) ----------
+
+    fn draw_weekly_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
+        let bw = body.right - body.left;
+        let bh = body.bottom - body.top;
+        let chart_h = (bh * 0.50).clamp(190.0, 275.0);
+        let chart_c = rect_f(body.left, body.top, bw, chart_h);
+        fill_round_rect(rt, chart_c, 10.0, theme.surface);
+        stroke_round_rect(rt, chart_c, 10.0, theme.border, 1.0);
+
+        // Quiet Weekly / Monthly sub-toggle inside card header
+        let mut gx = chart_c.left + 14.0;
+        for (mode, lbl, gw) in [
+            (WeeklyMode::Weekly, "按周 (ISO)", 76.0),
+            (WeeklyMode::Monthly, "按月", 46.0),
+        ] {
+            let r = rect_f(gx, chart_c.top + 9.0, gw, 22.0);
+            let act = self.weekly_mode == mode;
+            if act {
+                fill_round_rect(rt, r, 6.0, theme.hover);
             }
-            TrendGranularity::Weekly => {
+            draw_text(rt, lbl, &fonts.ui_small_center, r, if act { theme.text } else { theme.muted });
+            self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectWeeklyMode(mode) });
+            gx += gw + 4.0;
+        }
+        if self.scope == DateScope::Today {
+            let hint_r = rect_f(gx + 6.0, chart_c.top + 9.0, 108.0, 22.0);
+            self.draw_ghost_btn(rt, fonts, theme, hint_r, "仅今日 · 展开全部", true, ClickAction::SelectScope(DateScope::All));
+        }
+        self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
+
+        let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
+        let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
+
+        match self.weekly_mode {
+            WeeklyMode::Weekly => {
                 let weeks_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_week.iter().collect();
                 let mut wow: HashMap<String, String> = HashMap::new();
                 let mut prev: Option<u64> = None;
@@ -992,7 +1127,7 @@ impl DashboardView {
                     &rows,
                 );
             }
-            TrendGranularity::Monthly => {
+            WeeklyMode::Monthly => {
                 let m_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_month.iter().collect();
                 let bars: Vec<BarItem> = m_asc
                     .iter()
@@ -1051,86 +1186,152 @@ impl DashboardView {
         }
     }
 
-    // ---------- Tab 3: Session Explorer + Turn-by-Turn Context Anatomy ----------
+    // ---------- Tab 4: Session Explorer + Per-Session Cache Hit Rate & Turn Anatomy ----------
 
     fn draw_sessions_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
-        let top_h = (bh * 0.46).clamp(150.0, 250.0);
+        let top_h = (bh * 0.48).clamp(160.0, 265.0);
         let top_c = rect_f(body.left, body.top, bw, top_h);
         fill_round_rect(rt, top_c, 10.0, theme.surface);
         stroke_round_rect(rt, top_c, 10.0, theme.border, 1.0);
 
-        draw_text(rt, "会话记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 10.0, 90.0, 20.0), theme.text);
+        draw_text(rt, "会话记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 9.0, 72.0, 20.0), theme.text);
+        draw_text(
+            rt,
+            &format!("{} 个", self.cached_sessions.len()),
+            &fonts.ui_micro,
+            rect_f(top_c.left + 86.0, top_c.top + 11.0, 60.0, 16.0),
+            theme.muted,
+        );
 
         let sorts = [
             (SessionSort::Recent, "最近", 40.0),
+            (SessionSort::NonCached, "非缓存", 48.0),
             (SessionSort::TotalTokens, "总Token", 56.0),
-            (SessionSort::OutputTokens, "输出", 40.0),
+            (SessionSort::HitRateLow, "命中低→高", 68.0),
             (SessionSort::PeakContext, "峰值Ctx", 54.0),
         ];
         let mut sx = top_c.right - 14.0;
         for (so, lbl, sw) in sorts.iter().rev() {
             sx -= *sw + 4.0;
-            let r = rect_f(sx, top_c.top + 9.0, *sw, 22.0);
+            let r = rect_f(sx, top_c.top + 8.0, *sw, 22.0);
             let act = self.sort == *so;
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
             if act {
                 fill_round_rect(rt, r, 5.0, theme.hover);
+            } else if hov {
+                fill_round_rect(rt, r, 5.0, with_alpha(theme.text, 0.04));
             }
-            draw_text(rt, lbl, &fonts.ui_small_center, r, if act { theme.text } else { theme.muted });
+            draw_text(rt, lbl, &fonts.ui_small_center, r, if act { theme.text } else if hov { theme.sub } else { theme.muted });
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectSort(*so) });
         }
 
         let mut sorted = self.cached_sessions.clone();
         match self.sort {
             SessionSort::Recent => sorted.sort_by(|a, b| b.last_time.cmp(&a.last_time)),
+            SessionSort::NonCached => sorted.sort_by(|a, b| b.counts.non_cached_tokens().cmp(&a.counts.non_cached_tokens())),
             SessionSort::TotalTokens => sorted.sort_by(|a, b| b.counts.total_tokens().cmp(&a.counts.total_tokens())),
-            SessionSort::OutputTokens => sorted.sort_by(|a, b| b.counts.output_tokens.cmp(&a.counts.output_tokens)),
+            SessionSort::HitRateLow => sorted.sort_by(|a, b| {
+                // Multi-turn sessions first (lowest cache hit at top), cold-start 1-turn sessions after
+                let a_single = a.counts.calls <= 1;
+                let b_single = b.counts.calls <= 1;
+                a_single
+                    .cmp(&b_single)
+                    .then_with(|| {
+                        a.counts
+                            .cache_hit_rate()
+                            .partial_cmp(&b.counts.cache_hit_rate())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| b.counts.total_tokens().cmp(&a.counts.total_tokens()))
+            }),
             SessionSort::PeakContext => sorted.sort_by(|a, b| b.counts.peak_context.cmp(&a.counts.peak_context)),
         }
 
-        let list_y = top_c.top + 38.0;
-        let row_h = 28.0;
+        let rr_l = top_c.left + 10.0;
+        let rr_w = bw - 24.0;
+        let rx = rr_l + rr_w - 8.0;
+        let model_w = if rr_w >= 880.0 { 132.0 } else { 90.0 };
+        let model_x = rx - 338.0 - model_w;
+        let title_x = rr_l + 150.0;
+        let title_w = (model_x - 10.0 - title_x).max(80.0);
+
+        // Column headers
+        let hdr_y = top_c.top + 32.0;
+        let hdr_h = 19.0;
+        draw_text(rt, "ID", &fonts.ui_micro, rect_f(rr_l + 8.0, hdr_y, 56.0, hdr_h), theme.muted);
+        draw_text(rt, "时间", &fonts.ui_micro, rect_f(rr_l + 68.0, hdr_y, 76.0, hdr_h), theme.muted);
+        draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
+        draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
+        draw_text(rt, "轮数", &fonts.ui_small_right, rect_f(rx - 332.0, hdr_y, 42.0, hdr_h), theme.muted);
+        draw_text(rt, "命中率", &fonts.ui_small_right, rect_f(rx - 284.0, hdr_y, 60.0, hdr_h), theme.muted);
+        draw_text(rt, "非缓存", &fonts.ui_small_right, rect_f(rx - 218.0, hdr_y, 66.0, hdr_h), theme.muted);
+        draw_text(rt, "总计", &fonts.ui_small_right, rect_f(rx - 146.0, hdr_y, 72.0, hdr_h), theme.muted);
+        draw_text(rt, "峰值Ctx", &fonts.ui_small_right, rect_f(rx - 68.0, hdr_y, 68.0, hdr_h), theme.muted);
+        draw_line(rt, top_c.left + 14.0, top_c.top + 52.0, top_c.right - 14.0, top_c.top + 52.0, theme.border, 1.0);
+
+        let list_y = top_c.top + 55.0;
+        let row_h = 27.0;
         let vis = (((top_c.bottom - 8.0 - list_y) / row_h).floor() as usize).max(1);
         self.max_scroll = sorted.len().saturating_sub(vis);
         if self.scroll_rows > self.max_scroll {
             self.scroll_rows = self.max_scroll;
         }
 
-        for (vi, s) in sorted.iter().skip(self.scroll_rows).take(vis).enumerate() {
-            let ry = list_y + vi as f32 * row_h;
-            let rr = rect_f(top_c.left + 10.0, ry, bw - 22.0, row_h - 2.0);
-            let sel = self.selected_session.as_deref() == Some(s.conversation_id.as_str());
-            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
-            if sel {
-                fill_round_rect(rt, rr, 6.0, theme.hover);
-                fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, rr.bottom - rr.top - 10.0), 1.25, theme.accent);
-            } else if hov {
-                fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
+        if sorted.is_empty() {
+            draw_text(
+                rt,
+                "当前范围暂无会话 · 可在右上角切换 7天 / 30天 / 全部",
+                &fonts.ui_reg_center,
+                rect_f(top_c.left, list_y, bw, (top_c.bottom - list_y).max(30.0)),
+                theme.muted,
+            );
+        } else {
+            for (vi, s) in sorted.iter().skip(self.scroll_rows).take(vis).enumerate() {
+                let ry = list_y + vi as f32 * row_h;
+                let rr = rect_f(rr_l, ry, rr_w, row_h - 2.0);
+                let sel = self.selected_session.as_deref() == Some(s.conversation_id.as_str());
+                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
+                if sel {
+                    fill_round_rect(rt, rr, 6.0, theme.hover);
+                    fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, rr.bottom - rr.top - 10.0), 1.25, theme.accent);
+                } else if hov {
+                    fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
+                }
+                let sid = &s.conversation_id[..s.conversation_id.len().min(8)];
+                let t_str = s.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
+                let m_str = s.models.iter().next().cloned().unwrap_or_else(|| "-".into());
+                let hit_str = format!("{:.1}%", s.counts.cache_hit_rate());
+                let hit_col = cache_hit_color(theme, &s.counts);
+
+                draw_text(rt, sid, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 56.0, row_h - 2.0), theme.muted);
+                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 68.0, ry, 76.0, row_h - 2.0), theme.sub);
+                draw_text(rt, &s.title, &fonts.ui_reg, rect_f(title_x, ry, title_w, row_h - 2.0), theme.text);
+
+                draw_text(rt, &m_str, &fonts.mono_small_right, rect_f(model_x, ry, model_w, row_h - 2.0), theme.muted);
+                draw_text(rt, &format!("{}轮", s.counts.calls), &fonts.mono_small_right, rect_f(rx - 332.0, ry, 42.0, row_h - 2.0), theme.sub);
+                draw_text(rt, &hit_str, &fonts.mono_small_right, rect_f(rx - 284.0, ry, 60.0, row_h - 2.0), hit_col);
+                draw_text(rt, &fmt_num(s.counts.non_cached_tokens(), human), &fonts.mono_small_right, rect_f(rx - 218.0, ry, 66.0, row_h - 2.0), theme.sub);
+                draw_text(rt, &fmt_num(s.counts.total_tokens(), human), &fonts.mono_med_right, rect_f(rx - 146.0, ry, 72.0, row_h - 2.0), theme.text);
+                draw_text(rt, &fmt_compact(s.counts.peak_context), &fonts.mono_small_right, rect_f(rx - 68.0, ry, 68.0, row_h - 2.0), theme.sub);
+
+                self.hit_boxes.push(HitBox {
+                    rect: rr,
+                    action: ClickAction::SelectSession(s.conversation_id.clone()),
+                });
             }
-            let sid = &s.conversation_id[..s.conversation_id.len().min(8)];
-            let t_str = s.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
-            let m_str = s.models.iter().next().cloned().unwrap_or_else(|| "-".into());
-            let rx = rr.right - 10.0;
-            let title_x = rr.left + 162.0;
-            let title_w = (rx - 404.0 - title_x).max(80.0);
 
-            draw_text(rt, sid, &fonts.mono_small, rect_f(rr.left + 10.0, ry, 62.0, row_h - 2.0), theme.muted);
-            draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr.left + 76.0, ry, 82.0, row_h - 2.0), theme.sub);
-            draw_text(rt, &s.title, &fonts.ui_reg, rect_f(title_x, ry, title_w, row_h - 2.0), theme.text);
-
-            draw_text(rt, &m_str, &fonts.mono_small_right, rect_f(rx - 398.0, ry, 146.0, row_h - 2.0), theme.muted);
-            draw_text(rt, &format!("{}轮", s.counts.calls), &fonts.mono_small_right, rect_f(rx - 246.0, ry, 46.0, row_h - 2.0), theme.sub);
-            draw_text(rt, &fmt_num(s.counts.total_tokens(), human), &fonts.mono_med_right, rect_f(rx - 194.0, ry, 86.0, row_h - 2.0), theme.text);
-            draw_text(rt, &format!("峰值 {}", fmt_compact(s.counts.peak_context)), &fonts.mono_small_right, rect_f(rx - 100.0, ry, 100.0, row_h - 2.0), theme.sub);
-
-            self.hit_boxes.push(HitBox {
-                rect: rr,
-                action: ClickAction::SelectSession(s.conversation_id.clone()),
-            });
+            if self.max_scroll > 0 {
+                let track_h = (top_c.bottom - 10.0 - list_y).max(20.0);
+                let thumb_h = ((vis as f32 / sorted.len() as f32) * track_h).clamp(24.0, track_h);
+                let ratio = self.scroll_rows as f32 / self.max_scroll as f32;
+                let thumb_y = list_y + ratio * (track_h - thumb_h);
+                fill_round_rect(rt, rect_f(top_c.right - 7.0, thumb_y, 3.0, thumb_h), 1.5, theme.muted);
+            }
         }
 
-        // Bottom: Turn-by-Turn Context Anatomy
+        // Bottom: Turn-by-Turn Context Anatomy + Per-Session Cache Hit Summary
         let bot_c = rect_f(body.left, top_c.bottom + 12.0, bw, (body.bottom - top_c.bottom - 12.0).max(140.0));
         fill_round_rect(rt, bot_c, 10.0, theme.surface);
         stroke_round_rect(rt, bot_c, 10.0, theme.border, 1.0);
@@ -1142,8 +1343,17 @@ impl DashboardView {
             .cloned();
 
         if let Some(s) = sel {
-            let hdr = format!("逐轮上下文剖析 · {}  ({} 轮)", s.title, s.turns.len());
-            draw_text(rt, &hdr, &fonts.ui_section, rect_f(bot_c.left + 16.0, bot_c.top + 10.0, (bw - 320.0).max(160.0), 20.0), theme.text);
+            let hdr = format!("逐轮剖析 · {}", s.title);
+            draw_text(rt, &hdr, &fonts.ui_section, rect_f(bot_c.left + 16.0, bot_c.top + 9.0, (bw - 320.0).max(160.0), 19.0), theme.text);
+            let meta = format!(
+                "{} 轮  ·  缓存命中 {:.1}%  ·  非缓存 {}  ·  总计 {}  ·  峰值Ctx {}",
+                s.turns.len(),
+                s.counts.cache_hit_rate(),
+                fmt_compact(s.counts.non_cached_tokens()),
+                fmt_compact(s.counts.total_tokens()),
+                fmt_compact(s.counts.peak_context),
+            );
+            draw_text(rt, &meta, &fonts.mono_small, rect_f(bot_c.left + 16.0, bot_c.top + 28.0, (bw - 32.0).max(160.0), 15.0), theme.sub);
             self.draw_chart_legend_and_toggle(rt, fonts, theme, bot_c);
 
             let bars: Vec<BarItem> = s
@@ -1162,20 +1372,20 @@ impl DashboardView {
                             format!("模型   : {}", t.model),
                             format!("新输入 : {}", fmt_commas(t.input_tokens)),
                             format!("缓存读 : {} ({:.1}%)", fmt_commas(t.cache_read_tokens), t.cache_hit_rate()),
-                            format!("上下文 : {}", fmt_commas(t.total_input())),
+                            format!("Ctx    : {}", fmt_commas(t.total_input())),
                             format!("输出   : {}", fmt_commas(t.output_tokens)),
                         ],
                     }
                 })
                 .collect();
-            let plot = rect_f(bot_c.left + 12.0, bot_c.top + 40.0, bw - 24.0, bot_c.bottom - bot_c.top - 48.0);
+            let plot = rect_f(bot_c.left + 12.0, bot_c.top + 48.0, bw - 24.0, (bot_c.bottom - bot_c.top - 56.0).max(60.0));
             draw_editorial_bars(rt, fonts, theme, plot, &bars, self.fresh_only, self.mouse_dip, "无逐轮记录");
         } else {
             draw_text(rt, "点击上方会话查看逐轮上下文增长趋势", &fonts.ui_reg_center, bot_c, theme.muted);
         }
     }
 
-    // ---------- Tab 4: Minimalist Telemetry Studio (90s Waveform + Interactive Crosshair) ----------
+    // ---------- System Telemetry Studio (Opened via Hero CPU/RAM Ring Block) ----------
 
     #[allow(clippy::too_many_arguments)]
     fn draw_system_tab(
@@ -1200,7 +1410,6 @@ impl DashboardView {
 
         draw_text(rt, "实时系统负载 (90 秒采样 · 悬停查看历史时刻)", &fonts.ui_section, rect_f(chart_c.left + 16.0, chart_c.top + 11.0, 320.0, 20.0), theme.text);
 
-        // Legend top-right
         let leg_x = chart_c.right - 160.0;
         fill_circle(rt, leg_x, chart_c.top + 21.0, 3.0, theme.accent);
         draw_text(rt, "CPU", &fonts.ui_small, rect_f(leg_x + 8.0, chart_c.top + 13.0, 36.0, 16.0), theme.sub);
@@ -1241,7 +1450,6 @@ impl DashboardView {
                 fill_circle(rt, lx, ly, 3.0, theme.accent);
             }
 
-            // Interactive hover crosshair along the 90s timeline
             if let Some((mx, my)) = self.mouse_dip {
                 if mx >= x0 && mx <= pr && my >= pt_y && my <= pb_y {
                     let idx = (((mx - x0) / dx).round() as isize).clamp(0, (n - 1) as isize) as usize;
@@ -1269,7 +1477,6 @@ impl DashboardView {
             }
         }
 
-        // Bottom 2 clean radial gauge cards
         let cy_top = chart_c.bottom + 12.0;
         let half_w = (bw - 12.0) * 0.5;
         let cur = telemetry.latest;
@@ -1302,13 +1509,12 @@ impl DashboardView {
         );
         draw_text(
             rt,
-            &format!("详情窗独立进程 {:.1} MB · 关闭即归零 · 常驻胶囊 ~8–11 MB", cur.self_mb),
+            &format!("本进程内存 {:.1} MB · 面板常驻缓存秒开 · 隐藏时 0 渲染开销", cur.self_mb),
             &fonts.ui_micro,
             rect_f(c_right.left + 114.0, cy_top + 76.0, half_w - 130.0, 16.0),
             theme.muted,
         );
 
-        // Quiet single-line editorial footer (no noisy neon trust badges!)
         let foot = format!(
             "严格只读 · 0 写盘 · 不碰 SQLite · 增量扫描命中 {} / {} 文件 ({:.1} ms) · {}",
             snapshot.files_cached,

@@ -149,12 +149,34 @@ pub enum DateScope {
     All,
 }
 
+impl DateScope {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => DateScope::Today,
+            1 => DateScope::Days7,
+            2 => DateScope::Days30,
+            3 => DateScope::All,
+            _ => DateScope::Today,
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            DateScope::Today => 0,
+            DateScope::Days7 => 1,
+            DateScope::Days30 => 2,
+            DateScope::All => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSort {
     Recent,
+    NonCached,
     TotalTokens,
+    HitRateLow,
     PeakContext,
-    OutputTokens,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,16 +654,31 @@ pub fn fmt_num(v: u64, human: bool) -> String {
 
 fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> {
     let fh = File::open(path).ok()?;
-    let reader = BufReader::new(fh);
+    let mut reader = BufReader::with_capacity(64 * 1024, fh);
     let mut by_step: BTreeMap<i64, TurnRecord> = BTreeMap::new();
     let mut fallback_step: i64 = -1;
     let mut first_user_preview = String::new();
     let mut skipped_lines = 0usize;
+    let mut line = String::new();
 
-    for line_res in reader.lines() {
-        let Ok(line) = line_res else { break };
+    loop {
+        line.clear();
+        let Ok(n) = reader.read_line(&mut line) else { break };
+        if n == 0 {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        // Fast path: skip full JSON DOM parsing for bulky tool-result / non-token lines
+        // that are syntactically framed as a JSON object and carry no token counters.
+        let need_preview = first_user_preview.is_empty() && trimmed.contains("USER_INPUT");
+        if trimmed.starts_with('{')
+            && trimmed.ends_with('}')
+            && !need_preview
+            && !trimmed.contains("_tokens")
+        {
             continue;
         }
         let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
