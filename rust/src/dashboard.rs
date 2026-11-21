@@ -1509,7 +1509,7 @@ impl DashboardView {
         );
         draw_text(
             rt,
-            &format!("本进程内存 {:.1} MB · 面板常驻缓存秒开 · 隐藏时 0 渲染开销", cur.self_mb),
+            &format!("本进程内存 {:.1} MB · 隐藏自动释放画布并回收工作集", cur.self_mb),
             &fonts.ui_micro,
             rect_f(c_right.left + 114.0, cy_top + 76.0, half_w - 130.0, 16.0),
             theme.muted,

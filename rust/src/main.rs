@@ -53,8 +53,8 @@ use stats::{DateScope, IncrementalScanner, ScanSnapshot};
 use telemetry::{
     apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, enable_dpi_awareness,
     get_work_area, load_user_prefs, monitor_index_for_point, read_self_private_mb,
-    save_user_prefs, window_dpi_scale, SingleInstanceGuard, SystemTelemetry, UserPrefs,
-    WM_APP_SYNC_PREFS,
+    read_self_working_set_mb, save_user_prefs, trim_self_working_set, window_dpi_scale,
+    SingleInstanceGuard, SystemTelemetry, UserPrefs, WM_APP_SYNC_PREFS,
 };
 
 const TIMER_TELEMETRY: usize = 1;
@@ -269,6 +269,8 @@ fn hide_dashboard_safe() {
         app.dash_visible = false;
         if let Some(view) = &mut app.dash_view {
             view.mouse_dip = None;
+            // Genuinely free the large offscreen DIB + D2D DCRenderTarget while hidden
+            view.invalidate_surface();
         }
         (app.dash_hwnd, app.dashboard_only)
     })
@@ -282,6 +284,7 @@ fn hide_dashboard_safe() {
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
         }
+        trim_self_working_set();
     }
 }
 
@@ -1079,6 +1082,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
         } else {
             let _ = ShowWindow(pill_hwnd, SW_SHOWNOACTIVATE);
             with_app(|app| app.redraw_pill());
+            trim_self_working_set();
             if opts.open_detail {
                 open_or_focus_dashboard_safe();
             }
@@ -1126,14 +1130,15 @@ fn run_app(opts: CliOpts) -> Result<()> {
             }
             let open_mb = read_self_private_mb();
             hide_dashboard_safe();
+            let hide_priv_mb = read_self_private_mb();
+            let hide_ws_mb = read_self_working_set_mb();
             let t_reopen = Instant::now();
             open_or_focus_dashboard_safe();
             let reopen_ms = t_reopen.elapsed().as_secs_f64() * 1000.0;
             destroy_dashboard_safe();
-            let after_close_mb = read_self_private_mb();
             let summary = with_app(|app| {
                 format!(
-                    "RUST_SELF_TEST_OK theme={} sessions={} total_tokens={} cold_scan_ms={:.1} cached_ms={:.2} open1_ms={:.1} reopen_ms={:.1} pill_idle_mb={:.1} dash_open_mb={:.1} after_close_mb={:.1}",
+                    "RUST_SELF_TEST_OK theme={} sessions={} total_tokens={} cold_scan_ms={:.1} cached_ms={:.2} open1_ms={:.1} reopen_ms={:.1} pill_idle_mb={:.1} dash_open_mb={:.1} hide_priv_mb={:.1} hide_ws_mb={:.1}",
                     if app.light_theme { "paper" } else { "obsidian" },
                     app.snapshot.sessions.len(),
                     app.snapshot.agg.total.total_tokens(),
@@ -1143,7 +1148,8 @@ fn run_app(opts: CliOpts) -> Result<()> {
                     reopen_ms,
                     idle_mb,
                     open_mb,
-                    after_close_mb,
+                    hide_priv_mb,
+                    hide_ws_mb,
                 )
             })
             .unwrap_or_default();

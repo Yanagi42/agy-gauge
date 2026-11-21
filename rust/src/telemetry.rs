@@ -14,7 +14,9 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+use windows::Win32::System::ProcessStatus::{
+    K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD,
@@ -383,6 +385,30 @@ pub fn read_self_private_mb() -> f32 {
             pmc.WorkingSetSize
         };
         bytes as f32 / (1024.0 * 1024.0)
+    }
+}
+
+pub fn read_self_working_set_mb() -> f32 {
+    unsafe {
+        let mut pmc: PROCESS_MEMORY_COUNTERS_EX = zeroed();
+        pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if !K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut pmc as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+            pmc.cb,
+        )
+        .as_bool()
+        {
+            return 0.0;
+        }
+        pmc.WorkingSetSize as f32 / (1024.0 * 1024.0)
+    }
+}
+
+/// Politely return idle dashboard pages (WARP / font cache) of THIS process only to Windows Standby RAM.
+pub fn trim_self_working_set() {
+    unsafe {
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
     }
 }
 
