@@ -522,6 +522,142 @@ class AgyTokenStatsTests(unittest.TestCase):
             self.assertEqual(js_child["parent_id"], parent_id)
             self.assertEqual(js_child["parent_title"], "SubVault Review")
 
+    def test_redaction_across_text_json_csv_and_pricing(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "Users" / "alice" / ".gemini" / "antigravity-cli"
+            parent_id = "8c1095e2-1558-4a06-bfde-446204f978aa"
+            child_id = "14ee4713-eb4d-4a3c-b6a9-6745e2e553e2"
+            p_logs = root / "brain" / parent_id / ".system_generated" / "logs"
+            c_logs = root / "brain" / child_id / ".system_generated" / "logs"
+            cache_dir = root / "cache"
+            p_logs.mkdir(parents=True)
+            c_logs.mkdir(parents=True)
+            cache_dir.mkdir(parents=True)
+
+            (cache_dir / "conversation_metadata.json").write_text(
+                json.dumps({
+                    "conversations": {
+                        parent_id: {
+                            "summary": {
+                                "Title": "Confidential Payroll Refactor",
+                                "WorkspaceURIs": ["file:///C:/Users/alice/secret-payroll"],
+                            }
+                        },
+                        child_id: {"is_internal": True},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (p_logs / "transcript.jsonl").write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-22T14:48:00Z",
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2000,
+                    "cache_read_tokens": 8000,
+                    "output_tokens": 500,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (c_logs / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T14:48:47Z sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=Inspect alice private key table.\n</SYSTEM_MESSAGE>",
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-22T14:49:00Z",
+                        "model": "gemini-4-hydrogen-tiered-xhigh",
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 4000,
+                        "output_tokens": 200,
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            rep = mod.scan_usage(root, tz=tz_utc, pricing_path=None)
+            agg = mod.aggregate_sessions(rep.sessions)
+
+            secrets = (
+                "alice",
+                "secret-payroll",
+                "Confidential Payroll",
+                "private key table",
+                "8c1095e2",
+                "14ee4713",
+            )
+
+            # 1. Full text table (grouped + flat subagents + single-session detail)
+            txt_all = mod.render_text(
+                rep, agg, view="all", sort_by="time", limit=10, human=True,
+                tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                color=False, show_subagents=True, redact=True,
+            )
+            for s_val in secrets:
+                self.assertNotIn(s_val, txt_all)
+            self.assertIn("~/.gemini/antigravity-cli", txt_all)
+            self.assertIn("Project A", txt_all)
+            self.assertIn("S-001", txt_all)
+            self.assertIn("Session #1", txt_all)
+            self.assertIn("Subagent #1.1", txt_all)
+            self.assertIn("gemini-4-neon-xhigh", txt_all)
+            self.assertIn("gemini-4-hydrogen-tiered-xhigh", txt_all)
+
+            rep_child = mod.scan_usage(root, tz=tz_utc, session_filter="14ee4713", pricing_path=None)
+            txt_detail = mod.render_text(
+                rep_child, mod.aggregate_sessions(rep_child.sessions), view="summary", sort_by="time",
+                limit=10, human=True, tz_label="UTC", since=None, until=None, model_filter=None,
+                session_filter="14ee4713", color=False, redact=True,
+            )
+            for s_val in secrets:
+                self.assertNotIn(s_val, txt_detail)
+            self.assertIn("Session=<redacted>", txt_detail)
+            self.assertIn("Project A", txt_detail)
+
+            # 2. JSON export preserves structure, models, tokens, costs with zero leaked PII
+            js_raw = mod.render_json(rep, agg, sort_by="time", tz_label="UTC", include_turns=True, redact=True)
+            for s_val in secrets:
+                self.assertNotIn(s_val, js_raw)
+            js = json.loads(js_raw)
+            self.assertTrue(js["redacted"])
+            self.assertEqual(js["data_dir"], "~/.gemini/antigravity-cli")
+            self.assertIn("Project A", js["by_workspace"])
+            self.assertEqual(js["overview"]["total_tokens"], 15700)
+            js_sub = next(s for s in js["sessions"] if s["is_subagent"])
+            self.assertEqual(js_sub["conversation_id"], "S-001.1")
+            self.assertEqual(js_sub["parent_id"], "S-001")
+            self.assertEqual(js_sub["parent_title"], "Session #1")
+
+            # 3. CSV exports (session + workspace)
+            csv_sess = mod.render_csv(rep, agg, view="session", sort_by="time", redact=True)
+            csv_ws = mod.render_csv(rep, agg, view="workspace", sort_by="time", redact=True)
+            for s_val in secrets:
+                self.assertNotIn(s_val, csv_sess)
+                self.assertNotIn(s_val, csv_ws)
+            self.assertIn("S-001", csv_sess)
+            self.assertIn("Project A", csv_ws)
+
+            # 4. Pricing table redacts local pricing.json directory path
+            custom_pricing = pathlib.Path(tmp) / "Users" / "alice" / "agy-token-stats" / "pricing.json"
+            pricing_txt = mod.render_pricing_table(
+                mod.PricingCatalog(custom_pricing), ["gemini-4-neon-xhigh"], dt.date(2026, 11, 22), False, redact=True
+            )
+            self.assertNotIn("alice", pricing_txt)
+            self.assertIn("./pricing.json", pricing_txt)
+
+            # 5. Custom non-standard data_dir does not leak folder name
+            self.assertEqual(mod._redact_data_dir(pathlib.Path(r"D:\PrivateClient\agy-data")), "<redacted>")
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}

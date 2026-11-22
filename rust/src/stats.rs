@@ -155,6 +155,7 @@ impl SessionInfo {
             .unwrap_or_else(|| "-".to_string())
     }
 
+    #[allow(dead_code)]
     pub fn workspace_short(&self) -> String {
         workspace_short_name(&self.workspace)
     }

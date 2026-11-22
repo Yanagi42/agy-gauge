@@ -9,7 +9,8 @@
 //!   - Interactive "总计 / 仅增量" toggle and Registry-persisted DateScope (defaults to Today).
 
 use chrono::{Local, NaiveDate, Timelike};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::Instant;
 
 use windows::core::Result;
@@ -77,6 +78,183 @@ pub enum ModelSort {
     HitRateDesc,
 }
 
+fn is_unknown_workspace(ws: &str) -> bool {
+    let t = ws.trim();
+    t.is_empty() || t == "(未知工作区)" || t == "(unknown)"
+}
+
+fn alpha_label(mut idx: usize) -> String {
+    let mut chars = Vec::new();
+    loop {
+        chars.push((b'A' + (idx % 26) as u8) as char);
+        if idx < 26 {
+            break;
+        }
+        idx = idx / 26 - 1;
+    }
+    chars.into_iter().rev().collect()
+}
+
+pub fn redact_data_dir(path: &Path) -> String {
+    let norm = path.to_string_lossy().replace('\\', "/");
+    let trimmed = norm.trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == ".gemini/antigravity-cli" || lower.ends_with("/.gemini/antigravity-cli") {
+        "~/.gemini/antigravity-cli".to_string()
+    } else {
+        "<已脱敏目录>".to_string()
+    }
+}
+
+pub fn redact_pricing_path(path: Option<&Path>) -> String {
+    let fname = path
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("pricing.json");
+    format!("./{fname}")
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Redactor {
+    session_ids: HashMap<String, String>,
+    session_titles: HashMap<String, String>,
+    parent_titles: HashMap<String, String>,
+    workspaces: HashMap<String, String>,
+}
+
+impl Redactor {
+    pub fn build(sessions: &[SessionInfo], agg: &AggregatedStats) -> Self {
+        let mut out = Self::default();
+
+        // 1) Deterministic workspace aliases ranked by total token volume descending.
+        let mut ws_ranked: Vec<(&str, u64)> = agg
+            .by_workspace
+            .iter()
+            .filter(|(ws, _)| !is_unknown_workspace(ws))
+            .map(|(ws, (_, c))| (ws.as_str(), c.total_tokens()))
+            .collect();
+        ws_ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (idx, (ws, _)) in ws_ranked.into_iter().enumerate() {
+            out.workspaces
+                .insert(ws.to_string(), format!("项目 {}", alpha_label(idx)));
+        }
+        let mut next_ws = out.workspaces.len();
+        let mut extra_ws: Vec<&str> = sessions
+            .iter()
+            .map(|s| s.workspace.as_str())
+            .filter(|ws| !is_unknown_workspace(ws) && !out.workspaces.contains_key(*ws))
+            .collect();
+        extra_ws.sort_unstable();
+        extra_ws.dedup();
+        for ws in extra_ws {
+            out.workspaces
+                .insert(ws.to_string(), format!("项目 {}", alpha_label(next_ws)));
+            next_ws += 1;
+        }
+
+        // 2) Deterministic session & subagent aliases (preserves parent-child linkage).
+        let present: HashSet<&str> = sessions.iter().map(|s| s.conversation_id.as_str()).collect();
+        let mut root_nums: HashMap<&str, usize> = HashMap::new();
+        let mut root_idx = 0usize;
+        for s in sessions {
+            let attached_child = s.is_subagent
+                && s.parent_id
+                    .as_deref()
+                    .map(|pid| present.contains(pid))
+                    .unwrap_or(false);
+            if attached_child {
+                continue;
+            }
+            root_idx += 1;
+            root_nums.insert(s.conversation_id.as_str(), root_idx);
+            let sid = format!("S-{root_idx:03}");
+            let title = if s.is_subagent {
+                format!("子会话 #{root_idx}")
+            } else {
+                format!("会话 #{root_idx}")
+            };
+            out.session_ids.insert(s.conversation_id.clone(), sid);
+            out.session_titles.insert(s.conversation_id.clone(), title.clone());
+            out.parent_titles.insert(s.conversation_id.clone(), title);
+        }
+
+        let mut sub_counts: HashMap<&str, usize> = HashMap::new();
+        let mut orphan_parent_idx = 0usize;
+        for s in sessions {
+            if let Some(pid) = s.parent_id.as_deref() {
+                if s.is_subagent {
+                    if let Some(&p_num) = root_nums.get(pid) {
+                        let c = sub_counts.entry(pid).or_insert(0);
+                        *c += 1;
+                        let sub_n = *c;
+                        out.session_ids
+                            .insert(s.conversation_id.clone(), format!("S-{p_num:03}.{sub_n}"));
+                        out.session_titles
+                            .insert(s.conversation_id.clone(), format!("子任务 #{p_num}.{sub_n}"));
+                    } else if !out.parent_titles.contains_key(pid) {
+                        orphan_parent_idx += 1;
+                        out.parent_titles
+                            .insert(pid.to_string(), format!("父任务 #{orphan_parent_idx}"));
+                        out.session_ids
+                            .entry(pid.to_string())
+                            .or_insert_with(|| format!("P-{orphan_parent_idx:03}"));
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    pub fn session_id(&self, cid: &str) -> String {
+        self.session_ids
+            .get(cid)
+            .cloned()
+            .unwrap_or_else(|| "S-???".to_string())
+    }
+
+    pub fn session_title(&self, s: &SessionInfo) -> String {
+        self.session_titles
+            .get(&s.conversation_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                if s.is_subagent {
+                    "子会话".to_string()
+                } else {
+                    "会话".to_string()
+                }
+            })
+    }
+
+    pub fn parent_title(&self, pid: &str) -> String {
+        self.parent_titles
+            .get(pid)
+            .or_else(|| self.session_titles.get(pid))
+            .cloned()
+            .unwrap_or_else(|| "父任务".to_string())
+    }
+
+    pub fn workspace_label(&self, ws: &str) -> String {
+        if is_unknown_workspace(ws) {
+            "(未知工作区)".to_string()
+        } else {
+            self.workspaces
+                .get(ws)
+                .cloned()
+                .unwrap_or_else(|| "项目 ?".to_string())
+        }
+    }
+
+    pub fn workspace_short(&self, ws: &str) -> String {
+        if workspace_short_name(ws).is_empty() {
+            String::new()
+        } else {
+            self.workspace_label(ws)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionFilter {
     Model(String),
@@ -87,18 +265,28 @@ pub enum SessionFilter {
 }
 
 impl SessionFilter {
-    fn label(&self) -> String {
+    fn label(&self, redactor: Option<&Redactor>) -> String {
         match self {
             SessionFilter::Model(m) => format!("模型: {}  ×", m),
             SessionFilter::Workspace(ws) => {
-                let s = workspace_short_name(ws);
-                format!("项目: {}  ×", if s.is_empty() { ws.as_str() } else { s.as_str() })
+                let disp = match redactor {
+                    Some(r) => r.workspace_label(ws),
+                    None => {
+                        let s = workspace_short_name(ws);
+                        if s.is_empty() { ws.clone() } else { s }
+                    }
+                };
+                format!("项目: {}  ×", disp)
             }
             SessionFilter::Date(d) => format!("日期: {}  ×", d),
             SessionFilter::Week(w) => format!("周: {}  ×", w),
-            SessionFilter::Parent(_, title) => {
-                let short: String = title.chars().take(18).collect();
-                let ell = if title.chars().count() > 18 { "…" } else { "" };
+            SessionFilter::Parent(pid, title) => {
+                let disp = match redactor {
+                    Some(r) => r.parent_title(pid),
+                    None => title.clone(),
+                };
+                let short: String = disp.chars().take(18).collect();
+                let ell = if disp.chars().count() > 18 { "…" } else { "" };
                 format!("任务组: {}{}  ×", short, ell)
             }
         }
@@ -152,6 +340,7 @@ pub enum ClickAction {
     SelectScope(DateScope),
     SetCostMode(bool),
     ToggleCostMode,
+    TogglePrivacyMode,
     ToggleGroupSubagents,
     ToggleFreshOnly,
     ToggleLightTheme,
@@ -185,6 +374,7 @@ pub struct DashboardView {
     pub session_filter: Option<SessionFilter>,
     pub cost_mode: bool,
     pub group_subagents: bool,
+    pub privacy_mode: bool,
     pub fresh_only: bool,
     pub selected_session: Option<String>,
     pub pricing_selected_model: Option<String>,
@@ -203,6 +393,7 @@ pub struct DashboardView {
     session_copied_until: Option<Instant>,
     cached_sessions: Vec<SessionInfo>,
     cached_agg: AggregatedStats,
+    redactor: Redactor,
     cached_date: NaiveDate,
     dirty_filter: bool,
 }
@@ -226,7 +417,13 @@ fn cache_hit_color(theme: &Theme, c: &TokenCounts) -> D2D1_COLOR_F {
 }
 
 impl DashboardView {
-    pub fn new(fresh_only: bool, scope: DateScope, cost_mode: bool, group_subagents: bool) -> Self {
+    pub fn new(
+        fresh_only: bool,
+        scope: DateScope,
+        cost_mode: bool,
+        group_subagents: bool,
+        privacy_mode: bool,
+    ) -> Self {
         Self {
             surface: None,
             active_tab: Tab::Overview,
@@ -241,6 +438,7 @@ impl DashboardView {
             session_filter: None,
             cost_mode,
             group_subagents,
+            privacy_mode,
             fresh_only,
             selected_session: None,
             pricing_selected_model: None,
@@ -259,9 +457,96 @@ impl DashboardView {
             session_copied_until: None,
             cached_sessions: Vec::new(),
             cached_agg: AggregatedStats::default(),
+            redactor: Redactor::default(),
             cached_date: Local::now().date_naive(),
             dirty_filter: true,
         }
+    }
+
+    fn format_session_id(&self, cid: &str) -> String {
+        if self.privacy_mode {
+            self.redactor.session_id(cid)
+        } else {
+            cid[..cid.len().min(8)].to_string()
+        }
+    }
+
+    fn format_session_title(&self, s: &SessionInfo) -> String {
+        if self.privacy_mode {
+            self.redactor.session_title(s)
+        } else {
+            s.title.clone()
+        }
+    }
+
+    fn format_parent_title(&self, pid: &str, raw_title: &str) -> String {
+        if self.privacy_mode {
+            self.redactor.parent_title(pid)
+        } else {
+            raw_title.to_string()
+        }
+    }
+
+    fn format_workspace_label(&self, ws: &str) -> String {
+        if self.privacy_mode {
+            self.redactor.workspace_label(ws)
+        } else {
+            let short = workspace_short_name(ws);
+            if short.is_empty() {
+                "(未知工作区)".to_string()
+            } else {
+                short
+            }
+        }
+    }
+
+    fn format_workspace_short(&self, ws: &str) -> String {
+        if self.privacy_mode {
+            self.redactor.workspace_short(ws)
+        } else {
+            workspace_short_name(ws)
+        }
+    }
+
+    fn format_session_detail_clipboard(&self, s: &SessionInfo) -> String {
+        let ws = self.format_workspace_short(&s.workspace);
+        let title = self.format_session_title(s);
+        let sid = self.format_session_id(&s.conversation_id);
+        let cp = s.compaction_count();
+        let (misses, miss_tok) = s.cache_miss_stats();
+        let range = match (s.first_time, s.last_time) {
+            (Some(a), Some(b)) => format!("{} -> {}", a.format("%m/%d %H:%M"), b.format("%H:%M")),
+            _ => "-".to_string(),
+        };
+        let mut events = String::new();
+        if cp > 0 {
+            events.push_str(&format!(" · {}次压缩", cp));
+        }
+        if misses > 0 {
+            events.push_str(&format!(" · {}次缓存未命中(重灌{})", misses, fmt_compact(miss_tok)));
+        }
+        format!(
+            "AGY 会话明细 · {}\n- ID: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
+            title,
+            sid,
+            range,
+            s.primary_model(),
+            if ws.is_empty() { String::new() } else { format!(" | 项目: {}", ws) },
+            s.counts.calls,
+            events,
+            s.counts.cache_hit_rate(),
+            fmt_cost(&s.counts.cost, s.counts.calls, false),
+            fmt_usd_precise(s.counts.cost.input_plus_write_usd()),
+            fmt_usd_precise(s.counts.cost.cache_read_usd),
+            fmt_usd_precise(s.counts.cost.output_usd),
+            fmt_usd_precise(s.counts.cost.cache_saved_usd),
+            fmt_commas(s.counts.input_tokens),
+            fmt_commas(s.counts.cache_read_tokens),
+            fmt_commas(s.counts.output_tokens),
+            fmt_commas(s.counts.total_tokens()),
+            fmt_commas(s.counts.non_cached_tokens()),
+            fmt_commas(s.counts.peak_context),
+        )
     }
 
     fn bar_unit(&self) -> BarUnit {
@@ -696,6 +981,10 @@ impl DashboardView {
                 self.cost_mode = !self.cost_mode;
                 (false, true)
             }
+            ClickAction::TogglePrivacyMode => {
+                self.privacy_mode = !self.privacy_mode;
+                (false, true)
+            }
             ClickAction::ToggleGroupSubagents => {
                 self.group_subagents = !self.group_subagents;
                 self.scroll_rows = 0;
@@ -802,42 +1091,7 @@ impl DashboardView {
                     .as_deref()
                     .and_then(|id| self.cached_sessions.iter().find(|s| s.conversation_id == id));
                 if let Some(s) = sel {
-                    let ws = s.workspace_short();
-                    let cp = s.compaction_count();
-                    let (misses, miss_tok) = s.cache_miss_stats();
-                    let range = match (s.first_time, s.last_time) {
-                        (Some(a), Some(b)) => format!("{} -> {}", a.format("%m/%d %H:%M"), b.format("%H:%M")),
-                        _ => "-".to_string(),
-                    };
-                    let mut events = String::new();
-                    if cp > 0 {
-                        events.push_str(&format!(" · {}次压缩", cp));
-                    }
-                    if misses > 0 {
-                        events.push_str(&format!(" · {}次缓存未命中(重灌{})", misses, fmt_compact(miss_tok)));
-                    }
-                    let text = format!(
-                        "AGY 会话明细 · {}\n- ID: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
-                        s.title,
-                        &s.conversation_id[..s.conversation_id.len().min(8)],
-                        range,
-                        s.primary_model(),
-                        if ws.is_empty() { String::new() } else { format!(" | 项目: {}", ws) },
-                        s.counts.calls,
-                        events,
-                        s.counts.cache_hit_rate(),
-                        fmt_cost(&s.counts.cost, s.counts.calls, false),
-                        fmt_usd_precise(s.counts.cost.input_plus_write_usd()),
-                        fmt_usd_precise(s.counts.cost.cache_read_usd),
-                        fmt_usd_precise(s.counts.cost.output_usd),
-                        fmt_usd_precise(s.counts.cost.cache_saved_usd),
-                        fmt_commas(s.counts.input_tokens),
-                        fmt_commas(s.counts.cache_read_tokens),
-                        fmt_commas(s.counts.output_tokens),
-                        fmt_commas(s.counts.total_tokens()),
-                        fmt_commas(s.counts.non_cached_tokens()),
-                        fmt_commas(s.counts.peak_context),
-                    );
+                    let text = self.format_session_detail_clipboard(s);
                     if copy_text_to_clipboard(hwnd, &text) {
                         self.session_copied_until =
                             Some(Instant::now() + std::time::Duration::from_millis(1600));
@@ -894,6 +1148,7 @@ impl DashboardView {
         }
         self.cached_date = today;
         let (sessions, agg) = filter_snapshot(snapshot, self.scope);
+        self.redactor = Redactor::build(&sessions, &agg);
         self.cached_sessions = sessions;
         self.cached_agg = agg;
         self.dirty_filter = false;
@@ -988,25 +1243,25 @@ impl DashboardView {
         draw_line(rt, 0.0, h, w, h, theme.border, 1.0);
 
         // Minimalist brand mark
-        fill_circle(rt, 24.0, h * 0.5, 3.2, theme.accent);
-        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(33.0, 0.0, 40.0, h), theme.text);
+        fill_circle(rt, 22.0, h * 0.5, 3.2, theme.accent);
+        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(31.0, 0.0, 36.0, h), theme.text);
         draw_text(
             rt,
             if self.cost_mode { "/ 费用" } else { "/ 用量" },
             &fonts.ui_small,
-            rect_f(69.0, 1.0, 44.0, h),
+            rect_f(66.0, 1.0, 40.0, h),
             theme.muted,
         );
 
         // Flattened 5 direct token tabs (System monitor lives on Hero CPU/RAM rings)
         let tabs = [
-            (Tab::Overview, "概览", 42.0),
-            (Tab::Daily, "按天", 42.0),
-            (Tab::Weekly, "按周", 42.0),
-            (Tab::Models, "模型", 42.0),
-            (Tab::Sessions, "会话", 42.0),
+            (Tab::Overview, "概览", 38.0),
+            (Tab::Daily, "按天", 38.0),
+            (Tab::Weekly, "按周", 38.0),
+            (Tab::Models, "模型", 38.0),
+            (Tab::Sessions, "会话", 38.0),
         ];
-        let mut tx = 122.0;
+        let mut tx = 112.0;
         for (tab, lbl, tw) in tabs {
             let r = rect_f(tx, 0.0, tw, h);
             let act = self.active_tab == tab;
@@ -1019,10 +1274,10 @@ impl DashboardView {
                 if act { theme.text } else if hov { theme.sub } else { theme.muted },
             );
             if act {
-                fill_round_rect(rt, rect_f(tx + 7.0, h - 2.5, tw - 14.0, 2.5), 1.25, theme.accent);
+                fill_round_rect(rt, rect_f(tx + 6.0, h - 2.5, tw - 12.0, 2.5), 1.25, theme.accent);
             }
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectTab(tab) });
-            tx += tw + 6.0;
+            tx += tw + 4.0;
         }
 
         // Right minimalist utility actions
@@ -1030,12 +1285,12 @@ impl DashboardView {
         let btn_y = 10.0;
         let btn_h = 26.0;
 
-        let r_ref = rect_f(rx - 40.0, btn_y, 40.0, btn_h);
+        let r_ref = rect_f(rx - 38.0, btn_y, 38.0, btn_h);
         self.draw_ghost_btn(rt, fonts, theme, r_ref, "刷新", false, ClickAction::Refresh);
-        rx -= 45.0;
+        rx -= 42.0;
 
         let copied = self.copied_until.map(|t| Instant::now() < t).unwrap_or(false);
-        let r_copy = rect_f(rx - 48.0, btn_y, 48.0, btn_h);
+        let r_copy = rect_f(rx - 44.0, btn_y, 44.0, btn_h);
         self.draw_ghost_btn(
             rt,
             fonts,
@@ -1045,13 +1300,13 @@ impl DashboardView {
             copied,
             ClickAction::CopySummary,
         );
-        rx -= 53.0;
+        rx -= 48.0;
 
-        let r_km = rect_f(rx - 40.0, btn_y, 40.0, btn_h);
+        let r_km = rect_f(rx - 38.0, btn_y, 38.0, btn_h);
         self.draw_ghost_btn(rt, fonts, theme, r_km, if human { "K/M" } else { "精确" }, false, ClickAction::ToggleHuman);
-        rx -= 45.0;
+        rx -= 42.0;
 
-        let r_th = rect_f(rx - 40.0, btn_y, 40.0, btn_h);
+        let r_th = rect_f(rx - 38.0, btn_y, 38.0, btn_h);
         self.draw_ghost_btn(
             rt,
             fonts,
@@ -1061,10 +1316,27 @@ impl DashboardView {
             false,
             ClickAction::ToggleLightTheme,
         );
-        rx -= 47.0;
+        rx -= 42.0;
+
+        // One-click Privacy / Redaction toggle (persisted in Registry, hotkey: P)
+        let priv_w = if self.privacy_mode { 46.0 } else { 38.0 };
+        let r_priv = rect_f(rx - priv_w, btn_y, priv_w, btn_h);
+        self.draw_ghost_btn(
+            rt,
+            fonts,
+            theme,
+            r_priv,
+            if self.privacy_mode { "已脱敏" } else { "脱敏" },
+            self.privacy_mode,
+            ClickAction::TogglePrivacyMode,
+        );
+        if self.privacy_mode {
+            stroke_round_rect(rt, r_priv, 6.0, with_alpha(theme.accent, 0.72), 0.9);
+        }
+        rx -= priv_w + 5.0;
 
         // Tactile Tok | $ display mode switch (persisted in Registry, hotkey: D)
-        let sw_w = 68.0;
+        let sw_w = 66.0;
         let r_mode = rect_f(rx - sw_w, btn_y + 1.0, sw_w, btn_h - 2.0);
         let mode_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r_mode, mx, my)).unwrap_or(false);
         fill_round_rect(rt, r_mode, 6.0, theme.surface_subtle);
@@ -1075,8 +1347,8 @@ impl DashboardView {
             if mode_hov { theme.accent } else { theme.border },
             0.8,
         );
-        let r_tok = rect_f(r_mode.left + 2.0, r_mode.top + 2.0, 34.0, r_mode.bottom - r_mode.top - 4.0);
-        let r_usd = rect_f(r_mode.left + 38.0, r_mode.top + 2.0, 28.0, r_mode.bottom - r_mode.top - 4.0);
+        let r_tok = rect_f(r_mode.left + 2.0, r_mode.top + 2.0, 33.0, r_mode.bottom - r_mode.top - 4.0);
+        let r_usd = rect_f(r_mode.left + 37.0, r_mode.top + 2.0, 27.0, r_mode.bottom - r_mode.top - 4.0);
         if !self.cost_mode {
             fill_round_rect(rt, r_tok, 4.5, theme.hover);
         } else {
@@ -1092,17 +1364,17 @@ impl DashboardView {
             rect: r_usd,
             action: ClickAction::SetCostMode(true),
         });
-        rx -= sw_w + 9.0;
+        rx -= sw_w + 7.0;
 
         draw_line(rt, rx, 14.0, rx, h - 14.0, theme.border, 1.0);
-        rx -= 9.0;
+        rx -= 7.0;
 
         // Scope filter (borderless editorial text toggles; persisted in Registry)
         let scopes = [
-            (DateScope::All, "全部", 36.0),
-            (DateScope::Days30, "30天", 38.0),
-            (DateScope::Days7, "7天", 32.0),
-            (DateScope::Today, "今日", 36.0),
+            (DateScope::All, "全部", 34.0),
+            (DateScope::Days30, "30天", 36.0),
+            (DateScope::Days7, "7天", 30.0),
+            (DateScope::Today, "今日", 34.0),
         ];
         for (sc, lbl, sw) in scopes {
             let r = rect_f(rx - sw, btn_y, sw, btn_h);
@@ -1123,7 +1395,7 @@ impl DashboardView {
                 );
                 self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectScope(sc) });
             }
-            rx -= sw + 3.0;
+            rx -= sw + 2.0;
         }
     }
 
@@ -1817,10 +2089,11 @@ impl DashboardView {
                 let hit_str = format!("{:.1}%", row.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &row.counts);
                 let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
+                let base_title = self.format_session_title(s);
                 let title_disp = if row.is_child_row {
-                    format!("↳ {}", s.title)
+                    format!("↳ {}", base_title)
                 } else {
-                    s.title.clone()
+                    base_title
                 };
                 let sub_badge = if !row.is_child_row && row.subagent_count > 0 {
                     Some(format!("+{}子", row.subagent_count))
@@ -2053,8 +2326,7 @@ impl DashboardView {
             .by_workspace
             .iter()
             .map(|(ws, (cnt, c))| {
-                let short = workspace_short_name(ws);
-                let label = if short.is_empty() { "(未知工作区)".to_string() } else { short };
+                let label = self.format_workspace_label(ws);
                 (ws.clone(), label, *cnt, *c)
             })
             .collect();
@@ -3144,11 +3416,15 @@ impl DashboardView {
         }
 
         // Bottom metadata hints
-        let path_hint = snapshot
-            .pricing_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "pricing.json".to_string());
+        let path_hint = if self.privacy_mode {
+            redact_pricing_path(snapshot.pricing_path.as_deref())
+        } else {
+            snapshot
+                .pricing_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "pricing.json".to_string())
+        };
         let line1 = format!(
             "优先级：精确模型名 > 前缀匹配（如 gemini-4-neon 匹配全档位） > 内置默认  ·  Tab 切框 / Enter 保存"
         );
@@ -3313,7 +3589,7 @@ impl DashboardView {
 
         // Dismissible drill-down filter chip (precisely measured so long model names don't clip!)
         if let Some(f) = self.session_filter.clone() {
-            let chip_lbl = f.label();
+            let chip_lbl = f.label(self.privacy_mode.then_some(&self.redactor));
             let max_w = (sx - 8.0 - left_cursor).max(0.0);
             if max_w >= 72.0 {
                 let measured = factories.measure_text_width(&chip_lbl, &fonts.ui_small_center) + 18.0;
@@ -3389,15 +3665,16 @@ impl DashboardView {
                 } else if hov {
                     fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
                 }
-                let sid = &s.conversation_id[..s.conversation_id.len().min(8)];
+                let sid = self.format_session_id(&s.conversation_id);
                 let t_str = row.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
                 let hit_str = format!("{:.1}%", row.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &row.counts);
                 let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
+                let base_title = self.format_session_title(s);
                 let title_disp = if row.is_child_row {
-                    format!("↳ {}", s.title)
+                    format!("↳ {}", base_title)
                 } else {
-                    s.title.clone()
+                    base_title
                 };
                 let sub_badge = if !row.is_child_row && row.subagent_count > 0 {
                     Some(format!("+{}子", row.subagent_count))
@@ -3405,7 +3682,7 @@ impl DashboardView {
                     None
                 };
 
-                draw_text(rt, sid, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 52.0, row_h - 2.0), theme.muted);
+                draw_text(rt, &sid, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 52.0, row_h - 2.0), theme.muted);
                 draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 64.0, ry, 74.0, row_h - 2.0), theme.sub);
                 let (actual_title_w, badge_rect) = if let Some(ref b) = sub_badge {
                     let bw = (factories.measure_text_width(b, &fonts.ui_small_center) + 10.0).ceil();
@@ -3486,7 +3763,7 @@ impl DashboardView {
             } else {
                 "逐轮剖析"
             };
-            let hdr = format!("{} · {}", hdr_prefix, s.title);
+            let hdr = format!("{} · {}", hdr_prefix, self.format_session_title(&s));
             draw_text(rt, &hdr, &fonts.ui_section, rect_f(bot_c.left + 16.0, bot_c.top + 9.0, (bw - 320.0).max(160.0), 19.0), theme.text);
 
             let mut meta = if self.cost_mode {
@@ -3516,8 +3793,15 @@ impl DashboardView {
                     sub_cnt,
                     fmt_cost_compact(&sub_agg.cost, sub_agg.calls)
                 ));
-            } else if s.is_subagent && !s.parent_title.is_empty() {
-                meta.push_str(&format!(" · 所属: {}", s.parent_title));
+            } else if s.is_subagent && (!s.parent_title.is_empty() || s.parent_id.is_some()) {
+                let p_disp = match s.parent_id.as_deref() {
+                    Some(pid) => self.format_parent_title(pid, &s.parent_title),
+                    None if self.privacy_mode => "父任务".to_string(),
+                    None => s.parent_title.clone(),
+                };
+                if !p_disp.is_empty() {
+                    meta.push_str(&format!(" · 所属: {}", p_disp));
+                }
             }
             let cp = s.compaction_count();
             if cp > 0 {
@@ -3527,7 +3811,7 @@ impl DashboardView {
             if misses > 0 {
                 meta.push_str(&format!(" · {}未命中", misses));
             }
-            let ws = s.workspace_short();
+            let ws = self.format_workspace_short(&s.workspace);
             if !ws.is_empty() {
                 meta.push_str(&format!(" · {}", ws));
             }
@@ -3801,13 +4085,18 @@ impl DashboardView {
         } else {
             String::new()
         };
+        let dir_disp = if self.privacy_mode {
+            redact_data_dir(&snapshot.data_dir)
+        } else {
+            snapshot.data_dir.display().to_string()
+        };
         let foot = format!(
             "严格只读 · 0 写盘 · 不碰 SQLite · 增量扫描命中 {} / {} 文件 ({:.1} ms){} · {}",
             snapshot.files_cached,
             snapshot.files_cached + snapshot.files_reparsed,
             snapshot.scan_ms,
             pricing_note,
-            snapshot.data_dir.display()
+            dir_disp
         );
         draw_text(rt, &foot, &fonts.mono_small, rect_f(body.left + 4.0, c_left.bottom + 8.0, bw - 8.0, footer_h), theme.muted);
     }
@@ -3998,7 +4287,7 @@ mod tests {
         assert!(SessionFilter::Model("gemini-4-neon-high".into()).matches(&s2));
         assert!(SessionFilter::Week("2026-W47".into()).matches(&s1));
 
-        let mut view = DashboardView::new(false, DateScope::All, false, true);
+        let mut view = DashboardView::new(false, DateScope::All, false, true, false);
         view.active_tab = Tab::Sessions;
         view.cached_sessions = vec![s1, s2];
         view.selected_session = Some("s1".into());
@@ -4017,7 +4306,7 @@ mod tests {
         child.parent_id = Some("p1".into());
         child.parent_title = "p1".into();
 
-        let mut view = DashboardView::new(false, DateScope::All, false, true);
+        let mut view = DashboardView::new(false, DateScope::All, false, true, false);
         view.cached_sessions = vec![parent, child];
 
         // Grouped mode rolls child into parent (1 row, 5 calls total, subagent_count=1)
@@ -4054,7 +4343,7 @@ mod tests {
 
     #[test]
     fn test_smart_hover_repaint_gating() {
-        let mut view = DashboardView::new(false, DateScope::Today, false, true);
+        let mut view = DashboardView::new(false, DateScope::Today, false, true, false);
         view.hit_boxes.push(HitBox {
             rect: rect_f(10.0, 10.0, 50.0, 20.0),
             action: ClickAction::Refresh,
@@ -4080,7 +4369,7 @@ mod tests {
 
     #[test]
     fn test_ordered_models_pins_compaction_to_secondary() {
-        let mut view = DashboardView::new(false, DateScope::All, false, true);
+        let mut view = DashboardView::new(false, DateScope::All, false, true, false);
         let mut hi = TokenCounts::default();
         hi.add_call_with_cost(
             1_000,
@@ -4135,5 +4424,133 @@ mod tests {
                 assert_eq!(pri[1].0, "model-lo");
             }
         }
+    }
+
+    #[test]
+    fn test_privacy_redactor_filters_paths_and_clipboard() {
+        let mut parent = make_session(
+            "a1b2c3d4-0000-0000-0000-000000000001",
+            "C:/Users/alice/secret-client",
+            "gemini-4-neon-xhigh",
+            (2026, 11, 22),
+            5,
+        );
+        parent.title = "修复 SecretProject 登录秘钥".into();
+
+        let mut child = make_session(
+            "e5f60708-0000-0000-0000-000000000002",
+            "C:/Users/alice/secret-client",
+            "gemini-4-hydrogen-tiered-xhigh",
+            (2026, 11, 22),
+            2,
+        );
+        child.title = "子任务分析 alice 内部文档".into();
+        child.is_subagent = true;
+        child.parent_id = Some(parent.conversation_id.clone());
+        child.parent_title = parent.title.clone();
+
+        let mut other = make_session(
+            "99998888-0000-0000-0000-000000000003",
+            "C:/Users/alice/hobby-blog",
+            "claude-opus-5-5",
+            (2026, 11, 21),
+            1,
+        );
+        other.title = "个人博客草稿".into();
+
+        let mut orphan = make_session(
+            "77776666-0000-0000-0000-000000000004",
+            "(未知工作区)",
+            "gemini-4-carbon-high",
+            (2026, 11, 20),
+            1,
+        );
+        orphan.title = "孤立子代理提示词".into();
+        orphan.is_subagent = true;
+        orphan.parent_id = Some("deadbeef-0000-0000-0000-000000000099".into());
+        orphan.parent_title = "未加载的涉密父会话".into();
+
+        let sessions = vec![parent.clone(), child.clone(), other.clone(), orphan.clone()];
+        let agg = crate::stats::aggregate_sessions(&sessions);
+        let redactor = Redactor::build(&sessions, &agg);
+
+        // Workspaces ranked by token volume desc: secret-client (7 calls) -> 项目 A, hobby-blog (1 call) -> 项目 B
+        assert_eq!(redactor.workspace_label("C:/Users/alice/secret-client"), "项目 A");
+        assert_eq!(redactor.workspace_label("C:/Users/alice/hobby-blog"), "项目 B");
+        assert_eq!(redactor.workspace_label("(未知工作区)"), "(未知工作区)");
+        assert_eq!(redactor.workspace_short("(未知工作区)"), "");
+
+        // Session IDs and titles preserve parent-child linkage without leaking raw values
+        assert_eq!(redactor.session_id(&parent.conversation_id), "S-001");
+        assert_eq!(redactor.session_title(&parent), "会话 #1");
+        assert_eq!(redactor.session_id(&child.conversation_id), "S-001.1");
+        assert_eq!(redactor.session_title(&child), "子任务 #1.1");
+        assert_eq!(redactor.parent_title(&parent.conversation_id), "会话 #1");
+        assert_eq!(redactor.session_id(&other.conversation_id), "S-002");
+        assert_eq!(redactor.session_title(&other), "会话 #2");
+        assert_eq!(redactor.session_id(&orphan.conversation_id), "S-003");
+        assert_eq!(redactor.session_title(&orphan), "子会话 #3");
+        assert_eq!(
+            redactor.parent_title("deadbeef-0000-0000-0000-000000000099"),
+            "父任务 #1"
+        );
+
+        // Alpha label rollover past Z -> AA, AB
+        assert_eq!(alpha_label(0), "A");
+        assert_eq!(alpha_label(25), "Z");
+        assert_eq!(alpha_label(26), "AA");
+        assert_eq!(alpha_label(27), "AB");
+
+        // Filter chip labels sanitize workspace & parent title while keeping model names intact
+        let f_ws = SessionFilter::Workspace("C:/Users/alice/secret-client".into());
+        assert_eq!(f_ws.label(Some(&redactor)), "项目: 项目 A  ×");
+        assert_eq!(f_ws.label(None), "项目: secret-client  ×");
+        let f_parent = SessionFilter::Parent(parent.conversation_id.clone(), parent.title.clone());
+        assert_eq!(f_parent.label(Some(&redactor)), "任务组: 会话 #1  ×");
+        let f_model = SessionFilter::Model("gemini-4-neon-xhigh".into());
+        assert_eq!(f_model.label(Some(&redactor)), "模型: gemini-4-neon-xhigh  ×");
+
+        // Clipboard output under privacy mode strips title, UUID, workspace, username while preserving model/tokens/cost
+        let mut view = DashboardView::new(false, DateScope::All, false, true, true);
+        view.redactor = redactor;
+        let clip_redacted = view.format_session_detail_clipboard(&parent);
+        assert!(clip_redacted.contains("会话 #1"));
+        assert!(clip_redacted.contains("S-001"));
+        assert!(clip_redacted.contains("项目: 项目 A"));
+        assert!(clip_redacted.contains("gemini-4-neon-xhigh"));
+        assert!(!clip_redacted.contains("SecretProject"));
+        assert!(!clip_redacted.contains("a1b2c3d4"));
+        assert!(!clip_redacted.contains("secret-client"));
+        assert!(!clip_redacted.contains("alice"));
+
+        // Toggling privacy mode off restores real details and marks prefs dirty
+        let mut human = true;
+        let mut light = false;
+        let (_, prefs_changed) = view.apply_action(HWND::default(), ClickAction::TogglePrivacyMode, &mut human, &mut light);
+        assert!(prefs_changed);
+        assert!(!view.privacy_mode);
+        let clip_raw = view.format_session_detail_clipboard(&parent);
+        assert!(clip_raw.contains("SecretProject"));
+        assert!(clip_raw.contains("a1b2c3d4"));
+        assert!(clip_raw.contains("secret-client"));
+
+        // Path redaction strips Windows usernames & custom directories
+        assert_eq!(
+            redact_data_dir(Path::new(r"C:\Users\alice\.gemini\antigravity-cli")),
+            "~/.gemini/antigravity-cli"
+        );
+        assert_eq!(
+            redact_data_dir(Path::new("/home/alice/.gemini/antigravity-cli/")),
+            "~/.gemini/antigravity-cli"
+        );
+        assert_eq!(
+            redact_data_dir(Path::new(r"D:\Work\PrivateClient\agy-data")),
+            "<已脱敏目录>"
+        );
+        assert_eq!(
+            redact_pricing_path(Some(Path::new(r"C:\Users\alice\agy-token-stats\pricing.json"))),
+            "./pricing.json"
+        );
+        assert_eq!(redact_pricing_path(None), "./pricing.json");
     }
 }

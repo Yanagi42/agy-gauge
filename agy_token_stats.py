@@ -1426,6 +1426,134 @@ def _counts_headers(label_header: str, include_cache_write: bool) -> tuple[list[
     return headers, aligns
 
 
+# ---------- Privacy / Redaction ----------
+
+
+def _is_unknown_workspace(ws: str) -> bool:
+    t = ws.strip()
+    return not t or t in ("(unknown)", "(未知工作区)")
+
+
+def _alpha_label(idx: int) -> str:
+    chars: list[str] = []
+    n = idx
+    while True:
+        chars.append(chr(ord("A") + (n % 26)))
+        if n < 26:
+            break
+        n = n // 26 - 1
+    return "".join(reversed(chars))
+
+
+def _redact_data_dir(path: pathlib.Path) -> str:
+    norm = str(path).replace("\\", "/").rstrip("/")
+    lower = norm.lower()
+    if lower == ".gemini/antigravity-cli" or lower.endswith("/.gemini/antigravity-cli"):
+        return "~/.gemini/antigravity-cli"
+    return "<redacted>"
+
+
+def _redact_pricing_path(path: pathlib.Path | None) -> str:
+    name = path.name if path is not None and path.name else "pricing.json"
+    return f"./{name}"
+
+
+def _redact_warning(msg: str, data_dir: pathlib.Path) -> str:
+    redacted_dir = _redact_data_dir(data_dir)
+    out = msg.replace(str(data_dir), redacted_dir)
+    out = out.replace(str(data_dir).replace("\\", "/"), redacted_dir)
+    home = str(pathlib.Path.home())
+    if home:
+        out = out.replace(home, "~").replace(home.replace("\\", "/"), "~")
+    return out
+
+
+class Redactor:
+    """Deterministic privacy mapper for session IDs, titles, workspaces, and local paths."""
+
+    def __init__(self, sessions: Sequence[SessionInfo], agg: dict[str, Any]) -> None:
+        self._session_ids: dict[str, str] = {}
+        self._session_titles: dict[str, str] = {}
+        self._parent_ids: dict[str, str] = {}
+        self._parent_titles: dict[str, str] = {}
+        self._workspaces: dict[str, str] = {}
+
+        # Rank workspaces deterministically by total token volume descending.
+        ws_items = [
+            (ws, c.total_tokens)
+            for ws, c in agg.get("by_workspace", {}).items()
+            if not _is_unknown_workspace(ws)
+        ]
+        ws_items.sort(key=lambda kv: (-kv[1], kv[0]))
+        for idx, (ws, _) in enumerate(ws_items):
+            self._workspaces[ws] = f"Project {_alpha_label(idx)}"
+        for ws in sorted({s.workspace for s in sessions if not _is_unknown_workspace(s.workspace)}):
+            if ws not in self._workspaces:
+                self._workspaces[ws] = f"Project {_alpha_label(len(self._workspaces))}"
+
+        # Rank sessions deterministically by last_time descending (matches default display order).
+        min_dt = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        ordered = sorted(
+            sessions,
+            key=lambda s: (-(s.last_time.timestamp() if s.last_time else min_dt.timestamp()), s.conversation_id),
+        )
+        present = {s.conversation_id for s in ordered}
+        root_nums: dict[str, int] = {}
+        root_idx = 0
+        for s in ordered:
+            attached_child = bool(s.is_subagent and s.parent_id and s.parent_id in present)
+            if attached_child:
+                continue
+            root_idx += 1
+            root_nums[s.conversation_id] = root_idx
+            sid = f"S-{root_idx:03d}"
+            title = f"Subagent #{root_idx}" if s.is_subagent else f"Session #{root_idx}"
+            self._session_ids[s.conversation_id] = sid
+            self._session_titles[s.conversation_id] = title
+            self._parent_ids[s.conversation_id] = sid
+            self._parent_titles[s.conversation_id] = title
+
+        sub_counts: dict[str, int] = defaultdict(int)
+        orphan_parent_idx = 0
+        for s in ordered:
+            if s.is_subagent and s.parent_id:
+                pid = s.parent_id
+                if pid in root_nums:
+                    p_num = root_nums[pid]
+                    sub_counts[pid] += 1
+                    sub_n = sub_counts[pid]
+                    self._session_ids[s.conversation_id] = f"S-{p_num:03d}.{sub_n}"
+                    self._session_titles[s.conversation_id] = f"Subagent #{p_num}.{sub_n}"
+                elif pid not in self._parent_ids:
+                    orphan_parent_idx += 1
+                    self._parent_ids[pid] = f"P-{orphan_parent_idx:03d}"
+                    self._parent_titles[pid] = f"Parent #{orphan_parent_idx}"
+
+    def session_id(self, cid: str) -> str:
+        return self._session_ids.get(cid, "S-???")
+
+    def parent_id(self, pid: str | None) -> str | None:
+        if pid is None:
+            return None
+        return self._parent_ids.get(pid, self._session_ids.get(pid, "P-???"))
+
+    def session_title(self, s: SessionInfo) -> str:
+        return self._session_titles.get(
+            s.conversation_id,
+            "Subagent" if s.is_subagent else "Session",
+        )
+
+    def parent_title(self, pid: str | None, raw_title: str) -> str:
+        if pid is not None:
+            return self._parent_titles.get(pid, self._session_titles.get(pid, "Parent"))
+        return "Parent" if raw_title else ""
+
+    def workspace(self, ws: str) -> str:
+        if _is_unknown_workspace(ws):
+            return "(unknown)"
+        return self._workspaces.get(ws, "Project ?")
+
+
 # ---------- Output formatters ----------
 
 
@@ -1489,14 +1617,18 @@ def render_text(
     session_filter: str | None,
     color: bool,
     show_subagents: bool = False,
+    redact: bool = False,
 ) -> str:
     total: TokenCounts = agg["total"]
     include_cw = total.cache_write_tokens > 0
+    redactor = Redactor(report.sessions, agg) if redact else None
     out: list[str] = []
 
-    header = _style("Antigravity CLI (agy) Token Usage [Read-Only]", "1;36", color)
+    hdr_tag = "Read-Only, Redacted" if redact else "Read-Only"
+    header = _style(f"Antigravity CLI (agy) Token Usage [{hdr_tag}]", "1;36", color)
     out.append(header)
-    out.append(f"Data Dir : {report.data_dir}")
+    data_dir_disp = _redact_data_dir(report.data_dir) if redact else str(report.data_dir)
+    out.append(f"Data Dir : {data_dir_disp}")
 
     filters: list[str] = [f"TZ={tz_label}"]
     if since or until:
@@ -1504,7 +1636,7 @@ def render_text(
     if model_filter:
         filters.append(f"Model~={model_filter}")
     if session_filter:
-        filters.append(f"Session={session_filter}*")
+        filters.append("Session=<redacted>" if redact else f"Session={session_filter}*")
     out.append(f"Scope    : {', '.join(filters)}")
     out.append("")
 
@@ -1556,12 +1688,20 @@ def render_text(
                 miss_cnt += 1
                 miss_tok += t.input_tokens
         out.append("")
-        out.append(_style(f"Session Detail: {s.conversation_id}", "1;33", color))
-        out.append(f"  Title     : {s.title}")
+        sid_disp = redactor.session_id(s.conversation_id) if redactor else s.conversation_id
+        title_disp = redactor.session_title(s) if redactor else s.title
+        ws_disp = redactor.workspace(s.workspace) if redactor else s.workspace
+        out.append(_style(f"Session Detail: {sid_disp}", "1;33", color))
+        out.append(f"  Title     : {title_disp}")
         if s.is_subagent and s.parent_id:
-            p_lbl = f"{s.parent_id[:8]} ({s.parent_title})" if s.parent_title else s.parent_id[:8]
+            if redactor:
+                pid_disp = redactor.parent_id(s.parent_id) or "P-???"
+                pt_disp = redactor.parent_title(s.parent_id, s.parent_title)
+                p_lbl = f"{pid_disp} ({pt_disp})" if pt_disp else pid_disp
+            else:
+                p_lbl = f"{s.parent_id[:8]} ({s.parent_title})" if s.parent_title else s.parent_id[:8]
             out.append(f"  Parent    : {p_lbl}")
-        out.append(f"  Workspace : {s.workspace}")
+        out.append(f"  Workspace : {ws_disp}")
         out.append(f"  Range     : {_fmt_time_sec(s.first_time)} -> {_fmt_time_sec(s.last_time)}")
         out.append(
             f"  Est. Cost : {_fmt_cost(s.counts.cost, s.counts.calls, human)}"
@@ -1693,7 +1833,7 @@ def render_text(
         )
         rows = [
             [
-                ws,
+                redactor.workspace(ws) if redactor else ws,
                 str(agg["workspace_sessions"][ws]),
                 str(c.calls),
                 _fmt_num(c.input_tokens, human),
@@ -1741,16 +1881,17 @@ def render_text(
         for s, counts, last_time, models, primary, sub_count in shown:
             real_models = [m for m in sorted(models) if m != "compaction"]
             models_str = primary if len(real_models) <= 1 else f"{primary}+{len(real_models)-1}"
+            raw_or_redacted_title = redactor.session_title(s) if redactor else s.title
             if sub_count > 0:
                 suffix = f" (+{sub_count} sub)"
-                title_cell = _truncate_display(s.title, max(8, 42 - _display_width(suffix))) + suffix
+                title_cell = _truncate_display(raw_or_redacted_title, max(8, 42 - _display_width(suffix))) + suffix
             elif s.is_subagent:
-                title_cell = f"↳ {s.title}"
+                title_cell = f"↳ {raw_or_redacted_title}"
             else:
-                title_cell = s.title
+                title_cell = raw_or_redacted_title
             s_rows.append(
                 [
-                    s.conversation_id[:8],
+                    redactor.session_id(s.conversation_id) if redactor else s.conversation_id[:8],
                     _fmt_time(last_time),
                     str(counts.calls),
                     models_str,
@@ -1783,17 +1924,31 @@ def render_json(
     sort_by: str,
     tz_label: str,
     include_turns: bool,
+    redact: bool = False,
 ) -> str:
+    redactor = Redactor(report.sessions, agg) if redact else None
     ordered = _sort_sessions(report.sessions, sort_by)
     sessions_json = []
     for s in ordered:
+        if redactor:
+            cid_val = redactor.session_id(s.conversation_id)
+            title_val = redactor.session_title(s)
+            ws_val = redactor.workspace(s.workspace)
+            pid_val = redactor.parent_id(s.parent_id)
+            ptitle_val = redactor.parent_title(s.parent_id, s.parent_title) or None
+        else:
+            cid_val = s.conversation_id
+            title_val = s.title
+            ws_val = s.workspace
+            pid_val = s.parent_id
+            ptitle_val = s.parent_title or None
         entry: dict[str, Any] = {
-            "conversation_id": s.conversation_id,
-            "title": s.title,
-            "workspace": s.workspace,
+            "conversation_id": cid_val,
+            "title": title_val,
+            "workspace": ws_val,
             "is_subagent": s.is_subagent,
-            "parent_id": s.parent_id,
-            "parent_title": s.parent_title or None,
+            "parent_id": pid_val,
+            "parent_title": ptitle_val,
             "models": sorted(s.models),
             "first_time": s.first_time.isoformat() if s.first_time else None,
             "last_time": s.last_time.isoformat() if s.last_time else None,
@@ -1820,9 +1975,15 @@ def render_json(
             ]
         sessions_json.append(entry)
 
-    payload = {
-        "data_dir": str(report.data_dir),
+    by_ws_json: dict[str, Any] = {}
+    for k, v in sorted(agg["by_workspace"].items()):
+        ws_key = redactor.workspace(k) if redactor else k
+        by_ws_json[ws_key] = {"sessions": agg["workspace_sessions"][k], **v.to_dict()}
+
+    payload: dict[str, Any] = {
+        "data_dir": _redact_data_dir(report.data_dir) if redact else str(report.data_dir),
         "timezone": tz_label,
+        "redacted": redact,
         "session_count": len(report.sessions),
         "overview": agg["total"].to_dict(),
         "by_model": {k: v.to_dict() for k, v in sorted(agg["by_model"].items())},
@@ -1837,17 +1998,22 @@ def render_json(
         },
         "by_month": {k: v.to_dict() for k, v in sorted(agg["by_month"].items())},
         "by_hour": {f"{h:02d}": v.to_dict() for h, v in sorted(agg["by_hour"].items()) if v.calls > 0},
-        "by_workspace": {
-            k: {"sessions": agg["workspace_sessions"][k], **v.to_dict()}
-            for k, v in sorted(agg["by_workspace"].items())
-        },
+        "by_workspace": by_ws_json,
         "sessions": sessions_json,
-        "warnings": report.warnings,
+        "warnings": [_redact_warning(w, report.data_dir) for w in report.warnings] if redact else report.warnings,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def render_csv(report: ScanReport, agg: dict[str, Any], *, view: str, sort_by: str) -> str:
+def render_csv(
+    report: ScanReport,
+    agg: dict[str, Any],
+    *,
+    view: str,
+    sort_by: str,
+    redact: bool = False,
+) -> str:
+    redactor = Redactor(report.sessions, agg) if redact else None
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
 
@@ -1874,13 +2040,14 @@ def render_csv(report: ScanReport, agg: dict[str, Any], *, view: str, sort_by: s
     elif view == "workspace":
         writer.writerow(["workspace", "sessions", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
         for k, c in sorted(agg["by_workspace"].items(), key=lambda kv: kv[1].total_tokens, reverse=True):
-            writer.writerow([k, agg["workspace_sessions"][k], c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
+            ws_cell = redactor.workspace(k) if redactor else k
+            writer.writerow([ws_cell, agg["workspace_sessions"][k], c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
     else:
         writer.writerow(["conversation_id", "first_time", "last_time", "models", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd", "workspace", "title"])
         for s in _sort_sessions(report.sessions, sort_by):
             c = s.counts
             writer.writerow([
-                s.conversation_id,
+                redactor.session_id(s.conversation_id) if redactor else s.conversation_id,
                 s.first_time.isoformat() if s.first_time else "",
                 s.last_time.isoformat() if s.last_time else "",
                 ";".join(sorted(s.models)),
@@ -1896,8 +2063,8 @@ def render_csv(report: ScanReport, agg: dict[str, Any], *, view: str, sort_by: s
                 c.peak_context,
                 round(c.cost.total_usd, 6),
                 round(c.cost.cache_saved_usd, 6),
-                s.workspace,
-                s.title,
+                redactor.workspace(s.workspace) if redactor else s.workspace,
+                redactor.session_title(s) if redactor else s.title,
             ])
     return buf.getvalue().rstrip("\n")
 
@@ -1925,12 +2092,14 @@ def render_pricing_table(
     observed_models: Sequence[str],
     date_obj: dt.date,
     color: bool,
+    redact: bool = False,
 ) -> str:
     rows_data = pricing.build_table(observed_models, date_obj)
     out = [_style("API Pricing Table (USD / 1M tokens)", "1;33", color)]
     if pricing.override_path is not None:
         exists = pricing.override_path.is_file() and not pricing.override_path.is_symlink()
-        out.append(f"Override : {pricing.override_path} ({'loaded' if exists else 'not created yet'})")
+        path_disp = _redact_pricing_path(pricing.override_path) if redact else str(pricing.override_path)
+        out.append(f"Override : {path_disp} ({'loaded' if exists else 'not created yet'})")
     out.append("")
     headers = ["Model / Rule", "Source", "Matched", "Input", "CacheRead", "CacheWrite", "Output"]
     aligns = ["left", "left", "left", "right", "right", "right", "right"]
@@ -2061,6 +2230,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="List internal subagent sessions individually instead of grouping under their parent session",
     )
     parser.add_argument(
+        "--redact",
+        "--privacy",
+        dest="redact",
+        action="store_true",
+        help="Redact session titles, workspace names, session IDs, and local paths (keeps models, tokens, and costs)",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI colors in table output",
@@ -2120,7 +2296,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reverse=True,
             )
         ]
-        print(render_pricing_table(PricingCatalog(pricing_path), observed, today, _use_color(args.no_color)))
+        print(
+            render_pricing_table(
+                PricingCatalog(pricing_path),
+                observed,
+                today,
+                _use_color(args.no_color),
+                redact=args.redact,
+            )
+        )
         return 0
 
     if args.format == "json":
@@ -2132,10 +2316,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_by=args.sort,
                 tz_label=tz_label,
                 include_turns=include_turns,
+                redact=args.redact,
             )
         )
     elif args.format == "csv":
-        print(render_csv(report, agg, view=args.view, sort_by=args.sort))
+        print(render_csv(report, agg, view=args.view, sort_by=args.sort, redact=args.redact))
     else:
         print(
             render_text(
@@ -2152,11 +2337,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session_filter=args.session,
                 color=_use_color(args.no_color),
                 show_subagents=args.show_subagents,
+                redact=args.redact,
             )
         )
 
     for warn in report.warnings:
-        print(f"Note: {warn}", file=sys.stderr)
+        w_out = _redact_warning(warn, report.data_dir) if args.redact else warn
+        print(f"Note: {w_out}", file=sys.stderr)
 
     return 0
 

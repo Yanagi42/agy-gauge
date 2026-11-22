@@ -39,6 +39,7 @@ pub const CMD_TOGGLE_TOPMOST: u32 = 1005;
 pub const CMD_TOGGLE_HUMAN: u32 = 1006;
 pub const CMD_REDOCK: u32 = 1007;
 pub const CMD_QUIT: u32 = 1008;
+pub const CMD_TOGGLE_PRIVACY: u32 = 1009;
 pub const CMD_MONITOR_BASE: u32 = 1100;
 pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1206 -> bit 0..6
 pub const CMD_PILL_ITEMS_RESET: u32 = 1210;
@@ -451,6 +452,7 @@ pub fn show_context_menu(
     light_theme: bool,
     topmost: bool,
     human: bool,
+    privacy_mode: bool,
     current_monitor: usize,
     pill_items: u32,
 ) -> Option<u32> {
@@ -508,6 +510,12 @@ pub fn show_context_menu(
             MF_STRING | if human { MF_CHECKED } else { MF_UNCHECKED },
             CMD_TOGGLE_HUMAN as usize,
             w!("简写数字 (K/M)"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | if privacy_mode { MF_CHECKED } else { MF_UNCHECKED },
+            CMD_TOGGLE_PRIVACY as usize,
+            w!("脱敏模式 (隐藏隐私)"),
         );
 
         let monitors = get_monitors();

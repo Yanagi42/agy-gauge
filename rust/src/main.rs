@@ -70,7 +70,7 @@ use dashboard::{BreakdownMode, ClickAction, DashboardView, ModelViewMode, Tab, W
 use pill::{
     show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_PILL_ITEMS_RESET,
     CMD_PILL_ITEM_BASE, CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT,
-    CMD_TOGGLE_TOPMOST,
+    CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST,
 };
 use pricing::ModelRate;
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
@@ -373,6 +373,7 @@ struct AppState {
     human: bool,
     cost_mode: bool,
     group_subagents: bool,
+    privacy_mode: bool,
     fresh_only: bool,
     date_scope: DateScope,
     pill_items: u32,
@@ -568,6 +569,7 @@ fn create_dashboard_window_local() {
                     app.date_scope,
                     app.cost_mode,
                     app.group_subagents,
+                    app.privacy_mode,
                 ));
                 app.dash_visible = true;
                 app.dash_monitor_index = mon_idx;
@@ -732,6 +734,11 @@ impl AppState {
                 .as_ref()
                 .map(|v| v.group_subagents)
                 .unwrap_or(self.group_subagents),
+            privacy_mode: self
+                .dash_view
+                .as_ref()
+                .map(|v| v.privacy_mode)
+                .unwrap_or(self.privacy_mode),
             monitor_index: self.monitor_index,
             fresh_only: self.dash_view.as_ref().map(|v| v.fresh_only).unwrap_or(self.fresh_only),
             date_scope: self.dash_view.as_ref().map(|v| v.scope).unwrap_or(self.date_scope).to_u8(),
@@ -745,6 +752,7 @@ impl AppState {
         let p = self.to_prefs();
         self.cost_mode = p.cost_mode;
         self.group_subagents = p.group_subagents;
+        self.privacy_mode = p.privacy_mode;
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
         self.pill_items = p.pill_items;
@@ -758,6 +766,7 @@ impl AppState {
         self.human = p.human;
         self.cost_mode = p.cost_mode;
         self.group_subagents = p.group_subagents;
+        self.privacy_mode = p.privacy_mode;
         self.monitor_index = p.monitor_index;
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
@@ -766,6 +775,7 @@ impl AppState {
         if let Some(view) = &mut self.dash_view {
             view.cost_mode = p.cost_mode;
             view.group_subagents = p.group_subagents;
+            view.privacy_mode = p.privacy_mode;
             view.fresh_only = p.fresh_only;
             if view.scope != self.date_scope {
                 view.scope = self.date_scope;
@@ -1205,14 +1215,22 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_RBUTTONUP => {
             let state = with_app(|app| {
                 app.pill_menu_open = true;
-                (app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible, app.pill_items)
+                (
+                    app.light_theme,
+                    app.topmost,
+                    app.human,
+                    app.privacy_mode,
+                    app.monitor_index,
+                    app.dash_visible,
+                    app.pill_items,
+                )
             });
-            if let Some((light, topmost, human, mon, local_vis, items)) = state {
+            if let Some((light, topmost, human, privacy_mode, mon, local_vis, items)) = state {
                 let dash_open = local_vis
                     || FindWindowW(w!("AgyTokenDashboardClass"), None)
                         .map(|h| !h.0.is_null() && IsWindowVisible(h).as_bool())
                         .unwrap_or(false);
-                let chosen = show_context_menu(hwnd, dash_open, light, topmost, human, mon, items);
+                let chosen = show_context_menu(hwnd, dash_open, light, topmost, human, privacy_mode, mon, items);
                 with_app(|app| app.pill_menu_open = false);
                 let mut handled_topmost = false;
                 if let Some(cmd) = chosen {
@@ -1242,6 +1260,16 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             with_app(|app| {
                                 app.human = !app.human;
                                 app.redraw_pill();
+                                app.persist_and_sync(hwnd);
+                                app.invalidate_dashboard();
+                            });
+                        }
+                        CMD_TOGGLE_PRIVACY => {
+                            with_app(|app| {
+                                app.privacy_mode = !app.privacy_mode;
+                                if let Some(view) = &mut app.dash_view {
+                                    view.privacy_mode = app.privacy_mode;
+                                }
                                 app.persist_and_sync(hwnd);
                                 app.invalidate_dashboard();
                             });
@@ -1501,6 +1529,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         prefs_changed = res.1;
                         app.cost_mode = view.cost_mode;
                         app.group_subagents = view.group_subagents;
+                        app.privacy_mode = view.privacy_mode;
                         app.fresh_only = view.fresh_only;
                         app.date_scope = view.scope;
                     }
@@ -1584,8 +1613,9 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 0x34 => Some(ClickAction::SelectTab(Tab::Models)),    // '4'
                 0x35 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '5'
                 0x36 => Some(ClickAction::ToggleSystemView),          // '6'
-                0x44 if !ctrl => Some(ClickAction::ToggleCostMode),   // 'D'
-                0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),  // 'T'
+                0x44 if !ctrl => Some(ClickAction::ToggleCostMode),    // 'D'
+                0x50 if !ctrl => Some(ClickAction::TogglePrivacyMode), // 'P'
+                0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),   // 'T'
                 0x52 => Some(ClickAction::Refresh),                   // 'R'
                 x if x == VK_F5.0 => Some(ClickAction::Refresh),
                 x if x == VK_BACK.0 => Some(ClickAction::ClearSessionFilter),
@@ -1602,6 +1632,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         prefs_changed = res.1;
                         app.cost_mode = view.cost_mode;
                         app.group_subagents = view.group_subagents;
+                        app.privacy_mode = view.privacy_mode;
                         app.fresh_only = view.fresh_only;
                         app.date_scope = view.scope;
                     }
@@ -1733,6 +1764,7 @@ struct CliOpts {
     mini: Option<bool>,
     light: Option<bool>,
     cost_mode: Option<bool>,
+    privacy_mode: Option<bool>,
     open_detail: bool,
     dashboard_only: bool,
     human: Option<bool>,
@@ -1748,6 +1780,7 @@ fn parse_args() -> CliOpts {
         mini: None,
         light: None,
         cost_mode: None,
+        privacy_mode: None,
         open_detail: false,
         dashboard_only: false,
         human: None,
@@ -1763,6 +1796,8 @@ fn parse_args() -> CliOpts {
             "--dark" => opts.light = Some(false),
             "--cost" | "--usd" => opts.cost_mode = Some(true),
             "--tokens" => opts.cost_mode = Some(false),
+            "--redact" | "--privacy" => opts.privacy_mode = Some(true),
+            "--no-redact" => opts.privacy_mode = Some(false),
             "--open-detail" => opts.open_detail = true,
             "--dashboard-only" => opts.dashboard_only = true,
             "--exact" => opts.human = Some(false),
@@ -1825,6 +1860,9 @@ fn run_app(opts: CliOpts) -> Result<()> {
     }
     if let Some(v) = opts.cost_mode {
         prefs.cost_mode = v;
+    }
+    if let Some(v) = opts.privacy_mode {
+        prefs.privacy_mode = v;
     }
     if let Some(v) = opts.monitor {
         prefs.monitor_index = v;
@@ -1942,6 +1980,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             human: prefs.human,
             cost_mode: prefs.cost_mode,
             group_subagents: prefs.group_subagents,
+            privacy_mode: prefs.privacy_mode,
             fresh_only: prefs.fresh_only,
             date_scope: DateScope::from_u8(prefs.date_scope),
             pill_items: prefs.pill_items,
@@ -1985,11 +2024,12 @@ fn run_app(opts: CliOpts) -> Result<()> {
             let t_open = Instant::now();
             create_dashboard_window_local();
             let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
-            for cost_m in [false, true] {
+            for (cost_m, priv_m) in [(false, false), (true, false), (false, true)] {
                 for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::System] {
                     with_app(|app| {
                         if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
                             view.cost_mode = cost_m;
+                            view.privacy_mode = priv_m;
                             view.active_tab = tab;
                             let dpi = window_dpi_scale(hwnd) * 96.0;
                             let _ = view.render_to_hdc(

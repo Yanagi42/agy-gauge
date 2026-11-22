@@ -74,6 +74,7 @@ pub struct UserPrefs {
     pub human: bool,
     pub cost_mode: bool,
     pub group_subagents: bool,
+    pub privacy_mode: bool,
     pub monitor_index: usize,
     pub fresh_only: bool,
     pub date_scope: u8,
@@ -91,6 +92,7 @@ impl Default for UserPrefs {
             human: true,
             cost_mode: false,
             group_subagents: true,
+            privacy_mode: false,
             monitor_index: 0,
             fresh_only: false,
             date_scope: 0, // Default to Today (matches corner pill)
@@ -143,6 +145,9 @@ pub fn load_user_prefs() -> UserPrefs {
     }
     if let Some(v) = reg_read_u32(w!("group_subagents")) {
         p.group_subagents = v != 0;
+    }
+    if let Some(v) = reg_read_u32(w!("privacy_mode")) {
+        p.privacy_mode = v != 0;
     }
     if let Some(v) = reg_read_u32(w!("monitor_index")) {
         p.monitor_index = v as usize;
@@ -198,13 +203,14 @@ pub fn save_user_prefs(p: &UserPrefs) {
             if m != 0 { m } else { PILL_ITEMS_DEFAULT }
         };
         let derived_mini = (pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
-        let entries: [(PCWSTR, u32); 14] = [
+        let entries: [(PCWSTR, u32); 15] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(derived_mini)),
             (w!("topmost"), u32::from(p.topmost)),
             (w!("human"), u32::from(p.human)),
             (w!("cost_mode"), u32::from(p.cost_mode)),
             (w!("group_subagents"), u32::from(p.group_subagents)),
+            (w!("privacy_mode"), u32::from(p.privacy_mode)),
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
             (w!("date_scope"), p.date_scope as u32),
