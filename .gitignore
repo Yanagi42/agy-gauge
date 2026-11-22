@@ -2,6 +2,12 @@
 rust/target/
 *.exe
 
+# Local runtime state / user overrides (written only beside exe)
+statusline_state.json
+budget.json
+archive.json
+pricing.json
+
 # Python caches
 __pycache__/
 *.py[cod]

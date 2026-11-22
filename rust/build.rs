@@ -16,5 +16,8 @@ fn main() {
         .expect("failed to invoke windres to embed app.ico");
     assert!(status.success(), "windres failed");
 
-    println!("cargo:rustc-link-arg={}", res_obj.display());
+    println!(
+        "cargo:rustc-link-arg-bin=agy-token-monitor={}",
+        res_obj.display()
+    );
 }

@@ -8,8 +8,9 @@
 //!     with per-session cache hit rate.
 //!   - Interactive "总计 / 仅增量" toggle and Registry-persisted DateScope (defaults to Today).
 
-use chrono::{Local, NaiveDate, Timelike};
-use std::collections::{HashMap, HashSet};
+use chrono::{Datelike, Local, NaiveDate, Timelike, Utc};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -21,18 +22,21 @@ use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::d2d::{
-    brush, draw_area_series, draw_editorial_bars, draw_line, draw_ring_gauge, draw_text,
-    fill_circle, fill_round_rect, hit_rect, load_color, rect_f, stroke_round_rect,
-    theme_for, with_alpha, BarItem, BarUnit, D2DFactories, Fonts, Theme, WindowSurface,
+    brush, draw_activity_heatmap, draw_area_series, draw_editorial_bars, draw_line, draw_pace_bar,
+    draw_ring_gauge, draw_text, fill_circle, fill_round_rect, hit_rect, load_color, rect_f,
+    stroke_round_rect, theme_for, with_alpha, BarItem, BarUnit, D2DFactories, Fonts, HeatmapDay,
+    Theme, WindowSurface,
 };
 use crate::pricing::{
     fmt_cost, fmt_cost_compact, fmt_rate_plain, fmt_usd, fmt_usd_compact, fmt_usd_precise,
     PriceSource, PricingTableRow,
 };
+use crate::quota::{fmt_countdown, AlertSeverity, BudgetConfig, QuotaProvenance};
 use crate::stats::{
-    filter_snapshot, fmt_commas, fmt_compact, fmt_gap, fmt_num, is_compaction_model, iso_week_key,
-    iso_week_range_label, weekday_cn, workspace_short_name, AggregatedStats, DateScope,
-    ModelCacheStats, ScanSnapshot, SessionInfo, SessionSort, TokenCounts, TurnRecord,
+    filter_snapshot_range, fmt_commas, fmt_compact, fmt_duration_short, fmt_gap, fmt_num,
+    is_compaction_model, iso_week_key, iso_week_range_label, weekday_cn, workspace_short_name,
+    AggregatedStats, DateScope, ModelCacheStats, ScanSnapshot, SessionInfo, SessionSort,
+    SourceKind, TokenCounts, TurnRecord,
 };
 use crate::telemetry::{apply_win11_frame, copy_text_to_clipboard, SystemTelemetry};
 
@@ -47,6 +51,18 @@ pub enum Tab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DailyViewMode {
+    Bars,
+    Heatmap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewTopMode {
+    QuotaPace,
+    WeeklyCompare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeeklyMode {
     Weekly,
     Monthly,
@@ -56,6 +72,7 @@ pub enum WeeklyMode {
 pub enum BreakdownMode {
     Model,
     Workspace,
+    Tools,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +85,7 @@ pub enum ModelCardMetric {
 pub enum ModelViewMode {
     CacheCompare,
     Pricing,
+    Budget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,11 +117,12 @@ pub fn redact_data_dir(path: &Path) -> String {
     let norm = path.to_string_lossy().replace('\\', "/");
     let trimmed = norm.trim_end_matches('/');
     let lower = trimmed.to_ascii_lowercase();
-    if lower == ".gemini/antigravity-cli" || lower.ends_with("/.gemini/antigravity-cli") {
-        "~/.gemini/antigravity-cli".to_string()
-    } else {
-        "<已脱敏目录>".to_string()
+    for suffix in ["antigravity-cli", "antigravity", "antigravity-ide"] {
+        if lower == format!(".gemini/{suffix}") || lower.ends_with(&format!("/.gemini/{suffix}")) {
+            return format!("~/.gemini/{suffix}");
+        }
     }
+    "<已脱敏目录>".to_string()
 }
 
 pub fn redact_pricing_path(path: Option<&Path>) -> String {
@@ -327,15 +346,24 @@ struct DisplaySessionRow {
 pub enum ClickAction {
     SelectTab(Tab),
     ToggleSystemView,
+    SelectDailyView(DailyViewMode),
+    SelectOverviewTop(OverviewTopMode),
     SelectWeeklyMode(WeeklyMode),
     SelectBreakdown(BreakdownMode),
     SelectModelCardMetric(ModelCardMetric),
     SelectModelView(ModelViewMode),
     OpenPricingTable,
+    OpenBudgetView,
     PickPricingRow(usize),
     NewPricingEntry,
     SavePricingEntry,
     ResetPricingEntry,
+    SaveBudgetEntry,
+    ClearBudgetEntry,
+    CopyStatuslineConfig,
+    ExportMenu,
+    ApplyCustomDate,
+    ClearSearch,
     SelectModelSort(ModelSort),
     SelectScope(DateScope),
     SetCostMode(bool),
@@ -364,12 +392,21 @@ pub struct DashboardView {
     surface: Option<WindowSurface>,
     pub active_tab: Tab,
     prev_token_tab: Tab,
+    pub daily_view: DailyViewMode,
+    pub overview_top: OverviewTopMode,
     pub weekly_mode: WeeklyMode,
     pub breakdown_mode: BreakdownMode,
     pub model_card_metric: ModelCardMetric,
     pub model_view: ModelViewMode,
     pub model_sort: ModelSort,
     pub scope: DateScope,
+    pub custom_since: Option<NaiveDate>,
+    pub custom_until: Option<NaiveDate>,
+    pub custom_date_rects: Option<[D2D_RECT_F; 2]>,
+    pub custom_date_focused: Option<usize>,
+    pub search_query: String,
+    pub search_field_rect: Option<D2D_RECT_F>,
+    pub search_focused: bool,
     pub sort: SessionSort,
     pub session_filter: Option<SessionFilter>,
     pub cost_mode: bool,
@@ -381,9 +418,11 @@ pub struct DashboardView {
     pub pricing_editing_custom_key: Option<String>,
     pub pricing_status: Option<(String, bool, Instant)>,
     pub pricing_field_rects: Option<[D2D_RECT_F; 5]>,
+    pub budget_field_rects: Option<[D2D_RECT_F; 5]>,
     pub pricing_focused_field: Option<usize>,
+    pub export_btn_rect: Option<D2D_RECT_F>,
     pub mouse_dip: Option<(f32, f32)>,
-    scroll_rows: usize,
+    pub scroll_rows: usize,
     max_scroll: usize,
     sessions_vis_rows: usize,
     hit_boxes: Vec<HitBox>,
@@ -391,6 +430,7 @@ pub struct DashboardView {
     last_hover_sig: (Option<usize>, bool),
     copied_until: Option<Instant>,
     session_copied_until: Option<Instant>,
+    banner_status: Option<(String, bool, Instant)>,
     cached_sessions: Vec<SessionInfo>,
     cached_agg: AggregatedStats,
     redactor: Redactor,
@@ -428,12 +468,21 @@ impl DashboardView {
             surface: None,
             active_tab: Tab::Overview,
             prev_token_tab: Tab::Overview,
+            daily_view: DailyViewMode::Bars,
+            overview_top: OverviewTopMode::QuotaPace,
             weekly_mode: WeeklyMode::Weekly,
             breakdown_mode: BreakdownMode::Model,
             model_card_metric: ModelCardMetric::Volume,
             model_view: ModelViewMode::CacheCompare,
             model_sort: ModelSort::TotalDesc,
             scope,
+            custom_since: Local::now().date_naive().checked_sub_days(chrono::Days::new(6)),
+            custom_until: Some(Local::now().date_naive()),
+            custom_date_rects: None,
+            custom_date_focused: None,
+            search_query: String::new(),
+            search_field_rect: None,
+            search_focused: false,
             sort: SessionSort::Recent,
             session_filter: None,
             cost_mode,
@@ -445,7 +494,9 @@ impl DashboardView {
             pricing_editing_custom_key: None,
             pricing_status: None,
             pricing_field_rects: None,
+            budget_field_rects: None,
             pricing_focused_field: None,
+            export_btn_rect: None,
             mouse_dip: None,
             scroll_rows: 0,
             max_scroll: 0,
@@ -455,6 +506,7 @@ impl DashboardView {
             last_hover_sig: (None, false),
             copied_until: None,
             session_copied_until: None,
+            banner_status: None,
             cached_sessions: Vec::new(),
             cached_agg: AggregatedStats::default(),
             redactor: Redactor::default(),
@@ -685,10 +737,37 @@ impl DashboardView {
         }
     }
 
+    fn session_matches_search(&self, s: &SessionInfo) -> bool {
+        let q = self.search_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return true;
+        }
+        let title = self.format_session_title(s).to_ascii_lowercase();
+        let sid = self.format_session_id(&s.conversation_id).to_ascii_lowercase();
+        let ws = self.format_workspace_label(&s.workspace).to_ascii_lowercase();
+        if title.contains(&q) || sid.contains(&q) || ws.contains(&q) {
+            return true;
+        }
+        if s.source.label_short().to_ascii_lowercase().contains(&q) {
+            return true;
+        }
+        if s.models.iter().any(|m| m.to_ascii_lowercase().contains(&q)) {
+            return true;
+        }
+        if s.turns
+            .iter()
+            .any(|t| t.tool_names.iter().any(|tn| tn.to_ascii_lowercase().contains(&q)))
+        {
+            return true;
+        }
+        false
+    }
+
     /// Builds session list rows, rolling up subagents into their parent session when `group_subagents`
     /// is enabled (unless drilling into a Parent group or filtering specifically to subagent-only models).
     fn display_sessions(&self, apply_filter: bool) -> Vec<DisplaySessionRow> {
         let filter = if apply_filter { self.session_filter.as_ref() } else { None };
+        let apply_search = apply_filter && !self.search_query.trim().is_empty();
 
         // Parent drill-down always expands parent + all its subagents flat for inspection.
         if let Some(SessionFilter::Parent(pid, _)) = filter {
@@ -696,6 +775,7 @@ impl DashboardView {
                 .cached_sessions
                 .iter()
                 .filter(|s| s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
+                .filter(|s| !apply_search || self.session_matches_search(s))
                 .map(|s| DisplaySessionRow {
                     counts: s.counts,
                     primary_model: s.primary_model(),
@@ -709,14 +789,16 @@ impl DashboardView {
             return rows;
         }
 
-        // Model filter shows exact matching sessions (including subagents that ran that model).
-        let force_flat = matches!(filter, Some(SessionFilter::Model(_)));
+        // Model filter or active search shows exact matching sessions (including subagents that match).
+        let force_flat = matches!(filter, Some(SessionFilter::Model(_))) || apply_search;
         let use_grouping = self.group_subagents && !force_flat;
 
-        let filtered: Vec<&SessionInfo> = match filter {
-            Some(f) => self.cached_sessions.iter().filter(|s| f.matches(s)).collect(),
-            None => self.cached_sessions.iter().collect(),
-        };
+        let filtered: Vec<&SessionInfo> = self
+            .cached_sessions
+            .iter()
+            .filter(|s| filter.map(|f| f.matches(s)).unwrap_or(true))
+            .filter(|s| !apply_search || self.session_matches_search(s))
+            .collect();
 
         if !use_grouping {
             let mut rows: Vec<DisplaySessionRow> = filtered
@@ -835,8 +917,193 @@ impl DashboardView {
         ));
     }
 
+    pub fn set_banner_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        let dur = if is_error { 4200 } else { 2400 };
+        self.banner_status = Some((
+            msg.into(),
+            is_error,
+            Instant::now() + std::time::Duration::from_millis(dur),
+        ));
+    }
+
     pub fn is_pricing_editor_active(&self) -> bool {
         self.active_tab == Tab::Models && self.model_view == ModelViewMode::Pricing
+    }
+
+    pub fn is_budget_editor_active(&self) -> bool {
+        self.active_tab == Tab::Models && self.model_view == ModelViewMode::Budget
+    }
+
+    pub fn is_search_active(&self) -> bool {
+        self.active_tab == Tab::Sessions
+    }
+
+    pub fn is_custom_date_active(&self) -> bool {
+        self.scope == DateScope::Custom
+    }
+
+    pub fn format_budget_fields(cfg: &BudgetConfig) -> [String; 5] {
+        let fmt_b = |v: f64| if v > 0.0 { format!("{v:.2}") } else { String::new() };
+        [
+            fmt_b(cfg.block_5h_usd),
+            fmt_b(cfg.daily_usd),
+            fmt_b(cfg.weekly_usd),
+            format!("{:.0}", cfg.warn_pct),
+            format!("{:.0}", cfg.critical_pct),
+        ]
+    }
+
+    pub fn format_custom_date_fields(&self) -> [String; 2] {
+        [
+            self.custom_since
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+            self.custom_until
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+        ]
+    }
+
+    pub fn format_statusline_config_snippet() -> String {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("agy-statusline.exe")));
+        let path_str = exe_dir
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "agy-statusline.exe".to_string());
+        let escaped = path_str.replace('\\', "\\\\");
+        format!(
+            "{{\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": \"\\\"{}\\\"\",\n    \"stack_with_default\": false\n  }}\n}}",
+            escaped
+        )
+    }
+
+    pub fn export_sessions_csv(&self) -> String {
+        let mut out = String::from("\u{FEFF}id,source,archived,last_active,calls,active_secs,thinking_turns,model,cache_hit_pct,input_tokens,cache_read_tokens,output_tokens,total_tokens,cost_usd,peak_context,workspace,title\n");
+        let csv_esc = |s: &str| {
+            if s.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        };
+        for row in self.display_sessions(true) {
+            let s = &row.session;
+            let sid = self.format_session_id(&s.conversation_id);
+            let title = self.format_session_title(s);
+            let ws = self.format_workspace_label(&s.workspace);
+            let last = row
+                .last_time
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let c = row.counts;
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{:.6},{},{},{}\n",
+                csv_esc(&sid),
+                s.source.as_str(),
+                s.is_archived,
+                csv_esc(&last),
+                c.calls,
+                s.active_duration_secs(),
+                s.thinking_turns(),
+                csv_esc(&row.primary_model),
+                c.cache_hit_rate(),
+                c.input_tokens,
+                c.cache_read_tokens,
+                c.output_tokens,
+                c.total_tokens(),
+                c.cost.total_usd(),
+                c.peak_context,
+                csv_esc(&ws),
+                csv_esc(&title),
+            ));
+        }
+        out
+    }
+
+    pub fn export_daily_csv(&self) -> String {
+        let mut out = String::from("\u{FEFF}date,calls,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,non_cached_tokens,cache_hit_pct,cost_usd,cache_saved_usd,peak_context\n");
+        for (day, c) in &self.cached_agg.by_day {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{:.2},{:.6},{:.6},{}\n",
+                day,
+                c.calls,
+                c.input_tokens,
+                c.cache_read_tokens,
+                c.cache_write_tokens,
+                c.output_tokens,
+                c.total_tokens(),
+                c.non_cached_tokens(),
+                c.cache_hit_rate(),
+                c.cost.total_usd(),
+                c.cost.cache_saved_usd,
+                c.peak_context,
+            ));
+        }
+        out
+    }
+
+    pub fn export_snapshot_json(&self, snapshot: &ScanSnapshot) -> String {
+        let tc_json = |c: &TokenCounts| {
+            json!({
+                "calls": c.calls,
+                "input_tokens": c.input_tokens,
+                "cache_read_tokens": c.cache_read_tokens,
+                "cache_write_tokens": c.cache_write_tokens,
+                "output_tokens": c.output_tokens,
+                "total_tokens": c.total_tokens(),
+                "non_cached_tokens": c.non_cached_tokens(),
+                "cache_hit_rate_pct": (c.cache_hit_rate() * 100.0).round() / 100.0,
+                "peak_context": c.peak_context,
+                "cost_usd": (c.cost.total_usd() * 1e6).round() / 1e6,
+                "cache_saved_usd": (c.cost.cache_saved_usd * 1e6).round() / 1e6,
+            })
+        };
+        let sessions_v: Vec<Value> = self
+            .display_sessions(true)
+            .into_iter()
+            .map(|r| {
+                let s = &r.session;
+                json!({
+                    "id": self.format_session_id(&s.conversation_id),
+                    "title": self.format_session_title(s),
+                    "workspace": self.format_workspace_label(&s.workspace),
+                    "source": s.source.as_str(),
+                    "is_archived": s.is_archived,
+                    "primary_model": r.primary_model,
+                    "active_duration_secs": s.active_duration_secs(),
+                    "thinking_turns": s.thinking_turns(),
+                    "tools": s.tool_counts(),
+                    "stats": tc_json(&r.counts),
+                })
+            })
+            .collect();
+        let by_day: BTreeMap<&String, Value> = self
+            .cached_agg
+            .by_day
+            .iter()
+            .map(|(k, c)| (k, tc_json(c)))
+            .collect();
+        let by_model: BTreeMap<&String, Value> = self
+            .cached_agg
+            .by_model
+            .iter()
+            .map(|(k, c)| (k, tc_json(c)))
+            .collect();
+        let payload = json!({
+            "exported_at": Utc::now().to_rfc3339(),
+            "redacted": self.privacy_mode,
+            "scope": format!("{:?}", self.scope),
+            "overview": tc_json(&self.cached_agg.total),
+            "active_duration_secs": self.cached_agg.total_active_secs,
+            "thinking_turns": self.cached_agg.total_thinking_turns,
+            "by_tool": self.cached_agg.by_tool,
+            "by_day": by_day,
+            "by_model": by_model,
+            "sessions": sessions_v,
+            "archived_sessions_count": snapshot.archived_sessions_count,
+        });
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
     }
 
     pub fn format_row_fields(row: &PricingTableRow) -> [String; 5] {
@@ -932,6 +1199,15 @@ impl DashboardView {
                 self.scroll_rows = 0;
                 (false, false)
             }
+            ClickAction::SelectDailyView(mode) => {
+                self.daily_view = mode;
+                self.scroll_rows = 0;
+                (false, false)
+            }
+            ClickAction::SelectOverviewTop(mode) => {
+                self.overview_top = mode;
+                (false, false)
+            }
             ClickAction::SelectWeeklyMode(m) => {
                 self.weekly_mode = m;
                 self.scroll_rows = 0;
@@ -957,10 +1233,34 @@ impl DashboardView {
                 self.scroll_rows = 0;
                 (false, false)
             }
+            ClickAction::OpenBudgetView => {
+                self.active_tab = Tab::Models;
+                self.prev_token_tab = Tab::Models;
+                self.model_view = ModelViewMode::Budget;
+                self.scroll_rows = 0;
+                (false, false)
+            }
+            ClickAction::CopyStatuslineConfig => {
+                let snippet = Self::format_statusline_config_snippet();
+                if copy_text_to_clipboard(hwnd, &snippet) {
+                    self.set_banner_status("已复制 /statusline 配置片段（粘贴至 settings.json 即可接入官方配额）", false);
+                    self.set_pricing_status("已复制 /statusline 配置片段到剪贴板", false);
+                }
+                (false, false)
+            }
+            ClickAction::ClearSearch => {
+                self.search_query.clear();
+                self.scroll_rows = 0;
+                (false, false)
+            }
             ClickAction::PickPricingRow(_)
             | ClickAction::NewPricingEntry
             | ClickAction::SavePricingEntry
-            | ClickAction::ResetPricingEntry => (false, false),
+            | ClickAction::ResetPricingEntry
+            | ClickAction::SaveBudgetEntry
+            | ClickAction::ClearBudgetEntry
+            | ClickAction::ExportMenu
+            | ClickAction::ApplyCustomDate => (false, false),
             ClickAction::SelectModelSort(sort) => {
                 self.model_sort = sort;
                 self.scroll_rows = 0;
@@ -1011,6 +1311,7 @@ impl DashboardView {
                     DateScope::Days7 => "近7天",
                     DateScope::Days30 => "近30天",
                     DateScope::All => "全部",
+                    DateScope::Custom => "自定义范围",
                 };
                 let text = if self.active_tab == Tab::Models {
                     let (primary, secondary) = self.ordered_models(self.model_sort);
@@ -1147,7 +1448,8 @@ impl DashboardView {
             return;
         }
         self.cached_date = today;
-        let (sessions, agg) = filter_snapshot(snapshot, self.scope);
+        let (sessions, agg) =
+            filter_snapshot_range(snapshot, self.scope, self.custom_since, self.custom_until);
         self.redactor = Redactor::build(&sessions, &agg);
         self.cached_sessions = sessions;
         self.cached_agg = agg;
@@ -1200,6 +1502,10 @@ impl DashboardView {
         self.hit_boxes.clear();
         self.plot_rects.clear();
         self.pricing_field_rects = None;
+        self.budget_field_rects = None;
+        self.search_field_rect = None;
+        self.custom_date_rects = None;
+        self.export_btn_rect = None;
         let theme = theme_for(light_theme);
 
         let Some(surface) = self.surface.take() else {
@@ -1210,22 +1516,105 @@ impl DashboardView {
                 rt.Clear(Some(&theme.bg));
             }
             self.draw_header(rt, fonts, theme, w, human, light_theme);
-            self.draw_hero_strip(factories, rt, fonts, theme, w, telemetry, human);
+            let y_off = if self.scope == DateScope::Custom {
+                self.draw_custom_date_bar(rt, fonts, theme, w);
+                32.0
+            } else {
+                0.0
+            };
+            self.draw_hero_strip(factories, rt, fonts, theme, w, 58.0 + y_off, telemetry, human);
 
-            let body = rect_f(20.0, 148.0, (w - 40.0).max(200.0), (h - 166.0).max(200.0));
+            let body = rect_f(
+                20.0,
+                148.0 + y_off,
+                (w - 40.0).max(200.0),
+                (h - 166.0 - y_off).max(180.0),
+            );
             match self.active_tab {
                 Tab::Overview => self.draw_overview_tab(factories, rt, fonts, theme, body, snapshot, human),
-                Tab::Daily => self.draw_daily_tab(rt, fonts, theme, body, human),
+                Tab::Daily => self.draw_daily_tab(rt, fonts, theme, body, snapshot, human),
                 Tab::Weekly => self.draw_weekly_tab(rt, fonts, theme, body, human),
                 Tab::Models => self.draw_models_tab(factories, rt, fonts, theme, body, snapshot, human),
                 Tab::Sessions => self.draw_sessions_tab(factories, rt, fonts, theme, body, human),
                 Tab::System => self.draw_system_tab(factories, rt, fonts, theme, body, snapshot, telemetry),
+            }
+
+            // Quiet bottom-center ephemeral confirmation toast (export / statusline copy)
+            if let Some((ref msg, is_err, until)) = self.banner_status {
+                if Instant::now() < until {
+                    let tw = (factories.measure_text_width(msg, &fonts.ui_small) + 28.0).clamp(180.0, w - 60.0);
+                    let th = 28.0;
+                    let tr = rect_f((w - tw) * 0.5, h - th - 14.0, tw, th);
+                    fill_round_rect(rt, tr, 7.0, theme.tooltip_bg);
+                    stroke_round_rect(rt, tr, 7.0, if is_err { theme.danger } else { theme.sage }, 1.0);
+                    draw_text(rt, msg, &fonts.ui_small_center, tr, if is_err { theme.danger } else { theme.text });
+                }
             }
         });
         if res.is_ok() {
             self.surface = Some(surface);
         }
         res
+    }
+
+    fn draw_custom_date_bar(
+        &mut self,
+        rt: &ID2D1RenderTarget,
+        fonts: &Fonts,
+        theme: &Theme,
+        w: f32,
+    ) {
+        let y = 52.0;
+        let h = 28.0;
+        let bar = rect_f(20.0, y, (w - 40.0).max(200.0), h);
+        fill_round_rect(rt, bar, 7.0, theme.surface);
+        stroke_round_rect(rt, bar, 7.0, theme.border, 1.0);
+
+        draw_text(rt, "自定义区间", &fonts.ui_small, rect_f(bar.left + 12.0, y, 66.0, h), theme.sub);
+        let input_bg = if theme.is_dark {
+            crate::d2d::rgb(20, 20, 22)
+        } else {
+            crate::d2d::rgb(246, 244, 241)
+        };
+        let box_w = 96.0;
+        let box_h = 20.0;
+        let box_y = y + 4.0;
+        let x1 = bar.left + 84.0;
+        let r1 = rect_f(x1, box_y, box_w, box_h);
+        fill_round_rect(rt, r1, 5.0, input_bg);
+        stroke_round_rect(
+            rt,
+            r1,
+            5.0,
+            if self.custom_date_focused == Some(0) { theme.accent } else { theme.border },
+            1.0,
+        );
+        draw_text(rt, "至", &fonts.ui_small_center, rect_f(x1 + box_w + 4.0, y, 18.0, h), theme.muted);
+        let x2 = x1 + box_w + 26.0;
+        let r2 = rect_f(x2, box_y, box_w, box_h);
+        fill_round_rect(rt, r2, 5.0, input_bg);
+        stroke_round_rect(
+            rt,
+            r2,
+            5.0,
+            if self.custom_date_focused == Some(1) { theme.accent } else { theme.border },
+            1.0,
+        );
+        self.custom_date_rects = Some([
+            rect_f(r1.left + 6.0, r1.top + 2.0, box_w - 12.0, box_h - 4.0),
+            rect_f(r2.left + 6.0, r2.top + 2.0, box_w - 12.0, box_h - 4.0),
+        ]);
+
+        let apply_r = rect_f(x2 + box_w + 10.0, box_y, 44.0, box_h);
+        self.draw_ghost_btn(rt, fonts, theme, apply_r, "应用", true, ClickAction::ApplyCustomDate);
+
+        draw_text(
+            rt,
+            "格式 YYYY-MM-DD（留空不限 · 按 Enter 生效）",
+            &fonts.ui_micro,
+            rect_f(apply_r.right + 12.0, y, (bar.right - apply_r.right - 22.0).max(80.0), h),
+            theme.muted,
+        );
     }
 
     // ---------- Minimalist Editorial Header (4-Tab Flat Underline Nav) ----------
@@ -1243,25 +1632,25 @@ impl DashboardView {
         draw_line(rt, 0.0, h, w, h, theme.border, 1.0);
 
         // Minimalist brand mark
-        fill_circle(rt, 22.0, h * 0.5, 3.2, theme.accent);
-        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(31.0, 0.0, 36.0, h), theme.text);
+        fill_circle(rt, 21.0, h * 0.5, 3.2, theme.accent);
+        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(29.0, 0.0, 35.0, h), theme.text);
         draw_text(
             rt,
-            if self.cost_mode { "/ 费用" } else { "/ 用量" },
+            if self.cost_mode { "/ $" } else { "/ 额" },
             &fonts.ui_small,
-            rect_f(66.0, 1.0, 40.0, h),
+            rect_f(63.0, 1.0, 28.0, h),
             theme.muted,
         );
 
         // Flattened 5 direct token tabs (System monitor lives on Hero CPU/RAM rings)
         let tabs = [
-            (Tab::Overview, "概览", 38.0),
-            (Tab::Daily, "按天", 38.0),
-            (Tab::Weekly, "按周", 38.0),
-            (Tab::Models, "模型", 38.0),
-            (Tab::Sessions, "会话", 38.0),
+            (Tab::Overview, "概览", 36.0),
+            (Tab::Daily, "按天", 36.0),
+            (Tab::Weekly, "按周", 36.0),
+            (Tab::Models, "模型", 36.0),
+            (Tab::Sessions, "会话", 36.0),
         ];
-        let mut tx = 112.0;
+        let mut tx = 94.0;
         for (tab, lbl, tw) in tabs {
             let r = rect_f(tx, 0.0, tw, h);
             let act = self.active_tab == tab;
@@ -1274,10 +1663,10 @@ impl DashboardView {
                 if act { theme.text } else if hov { theme.sub } else { theme.muted },
             );
             if act {
-                fill_round_rect(rt, rect_f(tx + 6.0, h - 2.5, tw - 12.0, 2.5), 1.25, theme.accent);
+                fill_round_rect(rt, rect_f(tx + 5.0, h - 2.5, tw - 10.0, 2.5), 1.25, theme.accent);
             }
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectTab(tab) });
-            tx += tw + 4.0;
+            tx += tw + 3.0;
         }
 
         // Right minimalist utility actions
@@ -1285,28 +1674,33 @@ impl DashboardView {
         let btn_y = 10.0;
         let btn_h = 26.0;
 
-        let r_ref = rect_f(rx - 38.0, btn_y, 38.0, btn_h);
+        let r_ref = rect_f(rx - 34.0, btn_y, 34.0, btn_h);
         self.draw_ghost_btn(rt, fonts, theme, r_ref, "刷新", false, ClickAction::Refresh);
-        rx -= 42.0;
+        rx -= 37.0;
+
+        let r_exp = rect_f(rx - 36.0, btn_y, 36.0, btn_h);
+        self.export_btn_rect = Some(r_exp);
+        self.draw_ghost_btn(rt, fonts, theme, r_exp, "导出", false, ClickAction::ExportMenu);
+        rx -= 39.0;
 
         let copied = self.copied_until.map(|t| Instant::now() < t).unwrap_or(false);
-        let r_copy = rect_f(rx - 44.0, btn_y, 44.0, btn_h);
+        let r_copy = rect_f(rx - 40.0, btn_y, 40.0, btn_h);
         self.draw_ghost_btn(
             rt,
             fonts,
             theme,
             r_copy,
-            if copied { "已复制" } else { "复制" },
+            if copied { "已复" } else { "复制" },
             copied,
             ClickAction::CopySummary,
         );
-        rx -= 48.0;
+        rx -= 43.0;
 
-        let r_km = rect_f(rx - 38.0, btn_y, 38.0, btn_h);
+        let r_km = rect_f(rx - 34.0, btn_y, 34.0, btn_h);
         self.draw_ghost_btn(rt, fonts, theme, r_km, if human { "K/M" } else { "精确" }, false, ClickAction::ToggleHuman);
-        rx -= 42.0;
+        rx -= 37.0;
 
-        let r_th = rect_f(rx - 38.0, btn_y, 38.0, btn_h);
+        let r_th = rect_f(rx - 34.0, btn_y, 34.0, btn_h);
         self.draw_ghost_btn(
             rt,
             fonts,
@@ -1316,10 +1710,10 @@ impl DashboardView {
             false,
             ClickAction::ToggleLightTheme,
         );
-        rx -= 42.0;
+        rx -= 37.0;
 
         // One-click Privacy / Redaction toggle (persisted in Registry, hotkey: P)
-        let priv_w = if self.privacy_mode { 46.0 } else { 38.0 };
+        let priv_w = if self.privacy_mode { 44.0 } else { 36.0 };
         let r_priv = rect_f(rx - priv_w, btn_y, priv_w, btn_h);
         self.draw_ghost_btn(
             rt,
@@ -1333,10 +1727,10 @@ impl DashboardView {
         if self.privacy_mode {
             stroke_round_rect(rt, r_priv, 6.0, with_alpha(theme.accent, 0.72), 0.9);
         }
-        rx -= priv_w + 5.0;
+        rx -= priv_w + 4.0;
 
         // Tactile Tok | $ display mode switch (persisted in Registry, hotkey: D)
-        let sw_w = 66.0;
+        let sw_w = 60.0;
         let r_mode = rect_f(rx - sw_w, btn_y + 1.0, sw_w, btn_h - 2.0);
         let mode_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r_mode, mx, my)).unwrap_or(false);
         fill_round_rect(rt, r_mode, 6.0, theme.surface_subtle);
@@ -1347,8 +1741,8 @@ impl DashboardView {
             if mode_hov { theme.accent } else { theme.border },
             0.8,
         );
-        let r_tok = rect_f(r_mode.left + 2.0, r_mode.top + 2.0, 33.0, r_mode.bottom - r_mode.top - 4.0);
-        let r_usd = rect_f(r_mode.left + 37.0, r_mode.top + 2.0, 27.0, r_mode.bottom - r_mode.top - 4.0);
+        let r_tok = rect_f(r_mode.left + 2.0, r_mode.top + 2.0, 30.0, r_mode.bottom - r_mode.top - 4.0);
+        let r_usd = rect_f(r_mode.left + 33.0, r_mode.top + 2.0, 25.0, r_mode.bottom - r_mode.top - 4.0);
         if !self.cost_mode {
             fill_round_rect(rt, r_tok, 4.5, theme.hover);
         } else {
@@ -1364,21 +1758,22 @@ impl DashboardView {
             rect: r_usd,
             action: ClickAction::SetCostMode(true),
         });
-        rx -= sw_w + 7.0;
+        rx -= sw_w + 6.0;
 
         draw_line(rt, rx, 14.0, rx, h - 14.0, theme.border, 1.0);
-        rx -= 7.0;
+        rx -= 6.0;
 
         // Scope filter (borderless editorial text toggles; persisted in Registry)
         let scopes = [
-            (DateScope::All, "全部", 34.0),
-            (DateScope::Days30, "30天", 36.0),
-            (DateScope::Days7, "7天", 30.0),
-            (DateScope::Today, "今日", 34.0),
+            (DateScope::Custom, "自定义", 42.0),
+            (DateScope::All, "全部", 32.0),
+            (DateScope::Days30, "30天", 34.0),
+            (DateScope::Days7, "7天", 28.0),
+            (DateScope::Today, "今日", 32.0),
         ];
         for (sc, lbl, sw) in scopes {
             let r = rect_f(rx - sw, btn_y, sw, btn_h);
-            if r.left > tx + 6.0 {
+            if r.left > tx + 4.0 {
                 let act = self.scope == sc;
                 let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
                 if act {
@@ -1435,10 +1830,10 @@ impl DashboardView {
         fonts: &Fonts,
         theme: &Theme,
         w: f32,
+        y: f32,
         telemetry: &SystemTelemetry,
         human: bool,
     ) {
-        let y = 58.0;
         let h = 76.0;
         let band = rect_f(20.0, y, (w - 40.0).max(200.0), h);
         fill_round_rect(rt, band, 10.0, theme.surface);
@@ -1810,132 +2205,321 @@ impl DashboardView {
             }
         }
 
-        // 2) Top-Right: This Week vs Last Week (full snapshot context) + Model Comparison
+        // 2) Top-Right: Quota & 5h Pace (or ISO Week Compare) + Model/Workspace/Tool Breakdown
         let tr = rect_f(tl.right + gap, body.top, right_w, top_h);
         fill_round_rect(rt, tr, 10.0, theme.surface);
         stroke_round_rect(rt, tr, 10.0, theme.border, 1.0);
 
-        let split_y = tr.top + (top_h * 0.41).clamp(93.0, 100.0);
-        // Clickable upper ISO Week block -> jumps straight to Weekly tab
-        let wk_hit = rect_f(tr.left + 4.0, tr.top + 4.0, right_w - 8.0, (split_y - tr.top - 8.0).max(60.0));
-        let wk_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&wk_hit, mx, my)).unwrap_or(false);
-        if wk_hov {
-            fill_round_rect(rt, wk_hit, 7.0, with_alpha(theme.text, 0.035));
+        let split_y = tr.top + (top_h * 0.44).clamp(100.0, 114.0);
+        let mut ox = tr.left + 14.0;
+        for (mode, lbl, ow) in [
+            (OverviewTopMode::QuotaPace, "额度 / 5h", 64.0),
+            (OverviewTopMode::WeeklyCompare, "本周同比", 60.0),
+        ] {
+            let r = rect_f(ox, tr.top + 8.0, ow, 20.0);
+            let act = self.overview_top == mode;
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
+            if act {
+                fill_round_rect(rt, r, 5.0, theme.hover);
+            } else if hov {
+                fill_round_rect(rt, r, 5.0, with_alpha(theme.text, 0.04));
+            }
+            draw_text(
+                rt,
+                lbl,
+                &fonts.ui_small_center,
+                r,
+                if act { theme.text } else if hov { theme.sub } else { theme.muted },
+            );
+            self.hit_boxes.push(HitBox {
+                rect: r,
+                action: ClickAction::SelectOverviewTop(mode),
+            });
+            ox += ow + 4.0;
         }
-        self.hit_boxes.push(HitBox {
-            rect: wk_hit,
-            action: ClickAction::SelectTab(Tab::Weekly),
-        });
 
-        let cur_wk = iso_week_key(today);
-        let prev_wk = today
-            .checked_sub_days(chrono::Days::new(7))
-            .map(iso_week_key)
-            .unwrap_or_default();
-        let wk_c = snapshot.agg.by_week.get(&cur_wk).copied().unwrap_or_default();
-        let prev_c = snapshot.agg.by_week.get(&prev_wk).copied().unwrap_or_default();
-        let wk_days = snapshot.agg.week_active_days.get(&cur_wk).copied().unwrap_or(0);
+        match self.overview_top {
+            OverviewTopMode::QuotaPace => {
+                let now_utc = Utc::now();
+                let prov = snapshot
+                    .statusline
+                    .as_ref()
+                    .map(|s| s.provenance(now_utc))
+                    .unwrap_or(QuotaProvenance::LocalEstimate);
+                let prov_col = match prov {
+                    QuotaProvenance::OfficialLive => theme.sage,
+                    QuotaProvenance::OfficialStale => theme.warn,
+                    QuotaProvenance::LocalEstimate => theme.muted,
+                };
+                let b_btn = rect_f(tr.right - 56.0, tr.top + 8.0, 44.0, 20.0);
+                self.draw_ghost_btn(rt, fonts, theme, b_btn, "预算 ›", false, ClickAction::OpenBudgetView);
+                draw_text(
+                    rt,
+                    prov.label_cn(),
+                    &fonts.ui_small_right,
+                    rect_f(ox + 2.0, tr.top + 10.0, (b_btn.left - ox - 8.0).max(40.0), 16.0),
+                    prov_col,
+                );
 
-        draw_text(
-            rt,
-            &format!("本周 · {}  ›", cur_wk),
-            &fonts.ui_section,
-            rect_f(tr.left + 16.0, tr.top + 10.0, 160.0, 20.0),
-            if wk_hov { theme.accent } else { theme.text },
-        );
-        draw_text(rt, &iso_week_range_label(&cur_wk), &fonts.mono_small_right, rect_f(tr.right - 120.0, tr.top + 12.0, 104.0, 16.0), theme.muted);
+                let inner_l = tr.left + 16.0;
+                let inner_w = right_w - 32.0;
+                let mut cy = tr.top + 32.0;
 
-        if self.cost_mode {
-            draw_text(
-                rt,
-                &fmt_cost(&wk_c.cost, wk_c.calls, human),
-                &fonts.mono_kpi,
-                rect_f(tr.left + 16.0, tr.top + 32.0, (right_w - 150.0).max(90.0), 24.0),
-                theme.text,
-            );
-            let (wow_str, wow_col) = if prev_c.cost.total_usd() > 0.0 {
-                let pct = ((wk_c.cost.total_usd() - prev_c.cost.total_usd()) / prev_c.cost.total_usd()) * 100.0;
-                (format!("较上周 {:+.1}%", pct), if pct >= 0.0 { theme.accent } else { theme.sage })
-            } else {
-                ("上周无记录".to_string(), theme.muted)
-            };
-            draw_text(rt, &wow_str, &fonts.mono_small_right, rect_f(tr.right - 134.0, tr.top + 36.0, 118.0, 18.0), wow_col);
-            let wk_avg_usd = if wk_days > 0 { wk_c.cost.total_usd() / wk_days as f64 } else { 0.0 };
-            draw_text(
-                rt,
-                &format!(
-                    "日均 {}  ·  活跃 {} 天  ·  非缓存 {}",
-                    fmt_usd_compact(wk_avg_usd),
-                    wk_days,
-                    fmt_usd_compact(wk_c.cost.non_cached_usd())
-                ),
-                &fonts.ui_micro,
-                rect_f(tr.left + 16.0, tr.top + 59.0, right_w - 32.0, 15.0),
-                theme.sub,
-            );
-            let prev_lbl = if prev_c.calls > 0 {
-                fmt_cost(&prev_c.cost, prev_c.calls, true)
-            } else {
-                "-".to_string()
-            };
-            draw_text(
-                rt,
-                &format!(
-                    "本周缓存已省 {}  ·  上周 {}",
-                    fmt_usd_compact(wk_c.cost.cache_saved_usd),
-                    prev_lbl
-                ),
-                &fonts.ui_micro,
-                rect_f(tr.left + 16.0, tr.top + 76.0, right_w - 32.0, 15.0),
-                theme.muted,
-            );
-        } else {
-            let wk_avg = if wk_days > 0 { wk_c.total_tokens() / wk_days as u64 } else { 0 };
-            draw_text(rt, &fmt_num(wk_c.total_tokens(), human), &fonts.mono_kpi, rect_f(tr.left + 16.0, tr.top + 32.0, (right_w - 150.0).max(90.0), 24.0), theme.text);
+                let has_official = snapshot
+                    .statusline
+                    .as_ref()
+                    .map(|s| s.provenance(now_utc) != QuotaProvenance::LocalEstimate)
+                    .unwrap_or(false);
 
-            let (wow_str, wow_col) = if prev_c.total_tokens() > 0 {
-                let pct = ((wk_c.total_tokens() as f64 - prev_c.total_tokens() as f64)
-                    / prev_c.total_tokens() as f64)
-                    * 100.0;
-                (format!("较上周 {:+.1}%", pct), if pct >= 0.0 { theme.accent } else { theme.sage })
-            } else {
-                ("上周无记录".to_string(), theme.muted)
-            };
-            draw_text(rt, &wow_str, &fonts.mono_small_right, rect_f(tr.right - 134.0, tr.top + 36.0, 118.0, 18.0), wow_col);
+                if has_official {
+                    if let Some(sl) = snapshot.statusline.as_ref() {
+                        let show_buckets: Vec<_> = sl
+                            .buckets
+                            .iter()
+                            .filter(|b| !b.disabled && b.remaining_pct().is_some())
+                            .take(2)
+                            .collect();
+                        for b in show_buckets {
+                            let rem_pct = b.remaining_pct().unwrap_or(0.0);
+                            let used_pct = b.used_pct().unwrap_or(0.0);
+                            let time_pct = b.time_elapsed_pct(sl.captured_at_utc, now_utc).map(|v| v as f32);
+                            let rem_str = b
+                                .live_remaining_secs(sl.captured_at_utc, now_utc)
+                                .map(fmt_countdown)
+                                .unwrap_or_else(|| "-".into());
+                            let sev = snapshot.budget.classify_quota_remaining(rem_pct);
+                            let bar_col = match sev {
+                                AlertSeverity::Critical => theme.danger,
+                                AlertSeverity::Warn => theme.warn,
+                                AlertSeverity::Normal => theme.sage,
+                            };
+                            draw_text(rt, &b.label, &fonts.mono_small, rect_f(inner_l, cy, inner_w * 0.45, 14.0), theme.text);
+                            draw_text(
+                                rt,
+                                &format!("剩 {:.0}% · {}后重置", rem_pct, rem_str),
+                                &fonts.mono_small_right,
+                                rect_f(inner_l + inner_w * 0.42, cy, inner_w * 0.58, 14.0),
+                                bar_col,
+                            );
+                            draw_pace_bar(rt, theme, rect_f(inner_l, cy + 16.0, inner_w, 5.0), used_pct as f32, time_pct, bar_col);
+                            cy += 27.0;
+                        }
+                    }
+                    if let Some(blk) = snapshot.active_block.as_ref() {
+                        let line = format!(
+                            "5h 块 {} · 速率 {}/h · 预计 {} · 剩 {}",
+                            fmt_cost_compact(&blk.counts.cost, blk.counts.calls),
+                            fmt_usd_compact(blk.usd_per_hour),
+                            fmt_usd_compact(blk.projected_usd),
+                            fmt_countdown(blk.remaining_secs),
+                        );
+                        draw_text(rt, &line, &fonts.ui_micro, rect_f(inner_l, (split_y - 17.0).max(cy), inner_w, 14.0), theme.sub);
+                    }
+                } else if let Some(blk) = snapshot.active_block.as_ref() {
+                    let b_cost = blk.counts.cost.total_usd();
+                    let time_pct = blk.time_progress_pct() as f32;
+                    let (title_r, fill_pct, bar_col) = if snapshot.budget.block_5h_usd > 0.0 {
+                        let used_p = (b_cost / snapshot.budget.block_5h_usd) * 100.0;
+                        let sev = snapshot.budget.classify_usage_pct(used_p);
+                        let col = match sev {
+                            AlertSeverity::Critical => theme.danger,
+                            AlertSeverity::Warn => theme.warn,
+                            AlertSeverity::Normal => theme.accent,
+                        };
+                        (
+                            format!("{} / ${:.0} ({:.0}%)", fmt_cost_compact(&blk.counts.cost, blk.counts.calls), snapshot.budget.block_5h_usd, used_p),
+                            used_p as f32,
+                            col,
+                        )
+                    } else {
+                        (
+                            format!("{} · {} ({:.0}%窗口)", fmt_cost_compact(&blk.counts.cost, blk.counts.calls), fmt_compact(blk.counts.total_tokens()), time_pct),
+                            time_pct,
+                            theme.accent,
+                        )
+                    };
+                    draw_text(
+                        rt,
+                        &format!("5h 活跃窗口 ({})", blk.local_range_label()),
+                        &fonts.mono_small,
+                        rect_f(inner_l, cy, inner_w * 0.50, 15.0),
+                        theme.text,
+                    );
+                    draw_text(
+                        rt,
+                        &title_r,
+                        &fonts.mono_small_right,
+                        rect_f(inner_l + inner_w * 0.48, cy, inner_w * 0.52, 15.0),
+                        bar_col,
+                    );
+                    draw_pace_bar(
+                        rt,
+                        theme,
+                        rect_f(inner_l, cy + 19.0, inner_w, 6.0),
+                        fill_pct,
+                        if snapshot.budget.block_5h_usd > 0.0 { Some(time_pct) } else { None },
+                        bar_col,
+                    );
+                    let rate_line = format!(
+                        "速率 {}/h ({}/m) · 窗口预计 {} · 剩 {}",
+                        fmt_usd_compact(blk.usd_per_hour),
+                        fmt_compact(blk.tokens_per_min.round() as u64),
+                        fmt_usd_compact(blk.projected_usd),
+                        fmt_countdown(blk.remaining_secs),
+                    );
+                    draw_text(rt, &rate_line, &fonts.ui_micro, rect_f(inner_l, cy + 31.0, inner_w, 15.0), theme.sub);
+                    let sl_btn = rect_f(inner_l, (split_y - 19.0).max(cy + 48.0), inner_w, 16.0);
+                    let sl_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&sl_btn, mx, my)).unwrap_or(false);
+                    draw_text(
+                        rt,
+                        "点击复制 /statusline 配置，合规接入官方剩余配额 ›",
+                        &fonts.ui_micro,
+                        sl_btn,
+                        if sl_hov { theme.accent } else { theme.muted },
+                    );
+                    self.hit_boxes.push(HitBox {
+                        rect: sl_btn,
+                        action: ClickAction::CopyStatuslineConfig,
+                    });
+                } else {
+                    draw_text(rt, "当前无活跃 5h 滚动窗口（空闲中）", &fonts.ui_small, rect_f(inner_l, cy + 8.0, inner_w, 18.0), theme.sub);
+                    let sl_btn = rect_f(inner_l, cy + 32.0, inner_w, 18.0);
+                    let sl_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&sl_btn, mx, my)).unwrap_or(false);
+                    draw_text(
+                        rt,
+                        "点击复制 /statusline 配置，接入官方剩余配额 ›",
+                        &fonts.ui_micro,
+                        sl_btn,
+                        if sl_hov { theme.accent } else { theme.muted },
+                    );
+                    self.hit_boxes.push(HitBox {
+                        rect: sl_btn,
+                        action: ClickAction::CopyStatuslineConfig,
+                    });
+                }
+            }
+            OverviewTopMode::WeeklyCompare => {
+                let wk_hit = rect_f(tr.left + 8.0, tr.top + 30.0, right_w - 16.0, (split_y - tr.top - 34.0).max(52.0));
+                let wk_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&wk_hit, mx, my)).unwrap_or(false);
+                if wk_hov {
+                    fill_round_rect(rt, wk_hit, 7.0, with_alpha(theme.text, 0.035));
+                }
+                self.hit_boxes.push(HitBox {
+                    rect: wk_hit,
+                    action: ClickAction::SelectTab(Tab::Weekly),
+                });
 
-            draw_text(
-                rt,
-                &format!("日均 {}  ·  活跃 {} 天  ·  非缓存 {}", fmt_compact(wk_avg), wk_days, fmt_compact(wk_c.non_cached_tokens())),
-                &fonts.ui_micro,
-                rect_f(tr.left + 16.0, tr.top + 59.0, right_w - 32.0, 15.0),
-                theme.sub,
-            );
-            let prev_lbl = if prev_c.total_tokens() > 0 {
-                fmt_compact(prev_c.total_tokens())
-            } else {
-                "-".to_string()
-            };
-            draw_text(
-                rt,
-                &format!(
-                    "命中 {:.1}%  ·  本周约 {}  ·  上周 {}",
-                    wk_c.cache_hit_rate(),
-                    fmt_cost_compact(&wk_c.cost, wk_c.calls),
-                    prev_lbl
-                ),
-                &fonts.ui_micro,
-                rect_f(tr.left + 16.0, tr.top + 76.0, right_w - 32.0, 15.0),
-                theme.muted,
-            );
+                let cur_wk = iso_week_key(today);
+                let prev_wk = today
+                    .checked_sub_days(chrono::Days::new(7))
+                    .map(iso_week_key)
+                    .unwrap_or_default();
+                let wk_c = snapshot.agg.by_week.get(&cur_wk).copied().unwrap_or_default();
+                let prev_c = snapshot.agg.by_week.get(&prev_wk).copied().unwrap_or_default();
+                let wk_days = snapshot.agg.week_active_days.get(&cur_wk).copied().unwrap_or(0);
+
+                draw_text(
+                    rt,
+                    &format!("{} ({}) ›", cur_wk, iso_week_range_label(&cur_wk)),
+                    &fonts.mono_small_right,
+                    rect_f(ox + 4.0, tr.top + 10.0, (tr.right - 16.0 - ox).max(80.0), 16.0),
+                    if wk_hov { theme.accent } else { theme.muted },
+                );
+
+                if self.cost_mode {
+                    draw_text(
+                        rt,
+                        &fmt_cost(&wk_c.cost, wk_c.calls, human),
+                        &fonts.mono_kpi,
+                        rect_f(tr.left + 16.0, tr.top + 33.0, (right_w - 150.0).max(90.0), 24.0),
+                        theme.text,
+                    );
+                    let (wow_str, wow_col) = if prev_c.cost.total_usd() > 0.0 {
+                        let pct = ((wk_c.cost.total_usd() - prev_c.cost.total_usd()) / prev_c.cost.total_usd()) * 100.0;
+                        (format!("较上周 {:+.1}%", pct), if pct >= 0.0 { theme.accent } else { theme.sage })
+                    } else {
+                        ("上周无记录".to_string(), theme.muted)
+                    };
+                    draw_text(rt, &wow_str, &fonts.mono_small_right, rect_f(tr.right - 134.0, tr.top + 37.0, 118.0, 18.0), wow_col);
+                    let wk_avg_usd = if wk_days > 0 { wk_c.cost.total_usd() / wk_days as f64 } else { 0.0 };
+                    draw_text(
+                        rt,
+                        &format!(
+                            "日均 {}  ·  活跃 {} 天  ·  非缓存 {}",
+                            fmt_usd_compact(wk_avg_usd),
+                            wk_days,
+                            fmt_usd_compact(wk_c.cost.non_cached_usd())
+                        ),
+                        &fonts.ui_micro,
+                        rect_f(tr.left + 16.0, tr.top + 61.0, right_w - 32.0, 15.0),
+                        theme.sub,
+                    );
+                    let prev_lbl = if prev_c.calls > 0 {
+                        fmt_cost(&prev_c.cost, prev_c.calls, true)
+                    } else {
+                        "-".to_string()
+                    };
+                    draw_text(
+                        rt,
+                        &format!(
+                            "本周缓存已省 {}  ·  上周 {}",
+                            fmt_usd_compact(wk_c.cost.cache_saved_usd),
+                            prev_lbl
+                        ),
+                        &fonts.ui_micro,
+                        rect_f(tr.left + 16.0, tr.top + 79.0, right_w - 32.0, 15.0),
+                        theme.muted,
+                    );
+                } else {
+                    let wk_avg = if wk_days > 0 { wk_c.total_tokens() / wk_days as u64 } else { 0 };
+                    draw_text(rt, &fmt_num(wk_c.total_tokens(), human), &fonts.mono_kpi, rect_f(tr.left + 16.0, tr.top + 33.0, (right_w - 150.0).max(90.0), 24.0), theme.text);
+
+                    let (wow_str, wow_col) = if prev_c.total_tokens() > 0 {
+                        let pct = ((wk_c.total_tokens() as f64 - prev_c.total_tokens() as f64)
+                            / prev_c.total_tokens() as f64)
+                            * 100.0;
+                        (format!("较上周 {:+.1}%", pct), if pct >= 0.0 { theme.accent } else { theme.sage })
+                    } else {
+                        ("上周无记录".to_string(), theme.muted)
+                    };
+                    draw_text(rt, &wow_str, &fonts.mono_small_right, rect_f(tr.right - 134.0, tr.top + 37.0, 118.0, 18.0), wow_col);
+
+                    draw_text(
+                        rt,
+                        &format!("日均 {}  ·  活跃 {} 天  ·  非缓存 {}", fmt_compact(wk_avg), wk_days, fmt_compact(wk_c.non_cached_tokens())),
+                        &fonts.ui_micro,
+                        rect_f(tr.left + 16.0, tr.top + 61.0, right_w - 32.0, 15.0),
+                        theme.sub,
+                    );
+                    let prev_lbl = if prev_c.total_tokens() > 0 {
+                        fmt_compact(prev_c.total_tokens())
+                    } else {
+                        "-".to_string()
+                    };
+                    draw_text(
+                        rt,
+                        &format!(
+                            "命中 {:.1}%  ·  本周约 {}  ·  上周 {}",
+                            wk_c.cache_hit_rate(),
+                            fmt_cost_compact(&wk_c.cost, wk_c.calls),
+                            prev_lbl
+                        ),
+                        &fonts.ui_micro,
+                        rect_f(tr.left + 16.0, tr.top + 79.0, right_w - 32.0, 15.0),
+                        theme.muted,
+                    );
+                }
+            }
         }
 
         draw_line(rt, tr.left + 16.0, split_y, tr.right - 16.0, split_y, theme.border, 1.0);
 
-        // Quiet "模型 | 项目" breakdown toggle inside lower right section
+        // Quiet "模型 | 项目 | 工具" breakdown toggle inside lower right section
         let mut bx = tr.left + 14.0;
         for (mode, lbl, bw_btn) in [
-            (BreakdownMode::Model, "模型分布", 62.0),
-            (BreakdownMode::Workspace, "项目分布", 62.0),
+            (BreakdownMode::Model, "模型", 42.0),
+            (BreakdownMode::Workspace, "项目", 42.0),
+            (BreakdownMode::Tools, "工具", 42.0),
         ] {
             let r = rect_f(bx, split_y + 7.0, bw_btn, 20.0);
             let act = self.breakdown_mode == mode;
@@ -1956,7 +2540,7 @@ impl DashboardView {
                 rect: r,
                 action: ClickAction::SelectBreakdown(mode),
             });
-            bx += bw_btn + 4.0;
+            bx += bw_btn + 3.0;
         }
         if self.breakdown_mode == BreakdownMode::Model {
             let mut mx = tr.right - 98.0;
@@ -1985,7 +2569,7 @@ impl DashboardView {
                 });
                 mx += mw + 3.0;
             }
-        } else {
+        } else if self.breakdown_mode == BreakdownMode::Workspace {
             draw_text(
                 rt,
                 "占比 · 会话数",
@@ -1993,11 +2577,20 @@ impl DashboardView {
                 rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0),
                 theme.muted,
             );
+        } else {
+            draw_text(
+                rt,
+                "调用频次",
+                &fonts.ui_small_right,
+                rect_f(tr.right - 100.0, split_y + 9.0, 84.0, 16.0),
+                theme.muted,
+            );
         }
         let bd_bounds = rect_f(tr.left + 16.0, split_y + 31.0, right_w - 32.0, (tr.bottom - split_y - 37.0).max(24.0));
         match self.breakdown_mode {
             BreakdownMode::Model => self.draw_compact_models(factories, rt, fonts, theme, bd_bounds, human),
             BreakdownMode::Workspace => self.draw_compact_workspaces(rt, fonts, theme, bd_bounds, human),
+            BreakdownMode::Tools => self.draw_compact_tools(rt, fonts, theme, bd_bounds),
         }
 
         // 3) Bottom Full-Width: Recent Active Sessions (grouped by parent session when enabled)
@@ -2090,11 +2683,17 @@ impl DashboardView {
                 let hit_col = cache_hit_color(theme, &row.counts);
                 let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
                 let base_title = self.format_session_title(s);
-                let title_disp = if row.is_child_row {
-                    format!("↳ {}", base_title)
-                } else {
-                    base_title
-                };
+                let mut prefix = String::new();
+                if row.is_child_row {
+                    prefix.push_str("↳ ");
+                }
+                if s.source != SourceKind::Cli {
+                    prefix.push_str(&format!("[{}] ", s.source.label_short()));
+                }
+                if s.is_archived {
+                    prefix.push_str("[归档] ");
+                }
+                let title_disp = format!("{prefix}{base_title}");
                 let sub_badge = if !row.is_child_row && row.subagent_count > 0 {
                     Some(format!("+{}子", row.subagent_count))
                 } else {
@@ -2391,6 +2990,44 @@ impl DashboardView {
         }
     }
 
+    fn draw_compact_tools(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F) {
+        let mut items: Vec<(String, u64)> = self
+            .cached_agg
+            .by_tool
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if items.is_empty() {
+            draw_text(rt, "当前范围暂无工具调用记录", &fonts.ui_small, bounds, theme.muted);
+            return;
+        }
+        let total: u64 = items.iter().map(|(_, v)| *v).sum::<u64>().max(1);
+        let avail_h = (bounds.bottom - bounds.top).max(24.0);
+        let max_show = if avail_h >= 94.0 { 4 } else if avail_h >= 66.0 { 3 } else { 2 };
+        let show_n = items.len().min(max_show);
+        let row_h = (avail_h / show_n as f32).clamp(21.5, 32.0);
+        let w = bounds.right - bounds.left;
+        let palette = [theme.accent, theme.output, theme.ram, theme.sage];
+
+        for (i, (name, cnt)) in items.into_iter().take(show_n).enumerate() {
+            let y = bounds.top + i as f32 * row_h;
+            let share = (cnt as f64 / total as f64) as f32;
+            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.60, 15.0), theme.text);
+            draw_text(
+                rt,
+                &format!("{} 次 ({:.0}%)", cnt, share * 100.0),
+                &fonts.mono_small_right,
+                rect_f(bounds.left + w * 0.56, y, w * 0.44, 15.0),
+                theme.sub,
+            );
+            fill_round_rect(rt, rect_f(bounds.left, y + 16.5, w, 3.0), 1.5, theme.grid);
+            if share > 0.0 {
+                fill_round_rect(rt, rect_f(bounds.left, y + 16.5, (w * share).max(3.0), 3.0), 1.5, palette[i % palette.len()]);
+            }
+        }
+    }
+
     fn draw_chart_legend_and_toggle(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, card: D2D_RECT_F) {
         let tw = 112.0;
         let tr = rect_f(card.right - tw - 14.0, card.top + 9.0, tw, 22.0);
@@ -2438,7 +3075,15 @@ impl DashboardView {
 
     // ---------- Tab 2: Direct Daily Analytics ----------
 
-    fn draw_daily_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
+    fn draw_daily_tab(
+        &mut self,
+        rt: &ID2D1RenderTarget,
+        fonts: &Fonts,
+        theme: &Theme,
+        body: D2D_RECT_F,
+        snapshot: &ScanSnapshot,
+        human: bool,
+    ) {
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
         let chart_h = (bh * 0.50).clamp(190.0, 275.0);
@@ -2446,82 +3091,161 @@ impl DashboardView {
         fill_round_rect(rt, chart_c, 10.0, theme.surface);
         stroke_round_rect(rt, chart_c, 10.0, theme.border, 1.0);
 
-        draw_text(
-            rt,
-            if self.cost_mode { "按天费用明细 ($)" } else { "按天用量明细" },
-            &fonts.ui_section,
-            rect_f(chart_c.left + 16.0, chart_c.top + 10.0, 128.0, 20.0),
-            theme.text,
-        );
-        if self.scope == DateScope::Today {
-            let hint_r = rect_f(chart_c.left + 144.0, chart_c.top + 9.0, 108.0, 22.0);
+        let mut dx = chart_c.left + 14.0;
+        for (mode, lbl, dw) in [
+            (DailyViewMode::Bars, "按天柱图", 64.0),
+            (DailyViewMode::Heatmap, "活跃热力图", 74.0),
+        ] {
+            let r = rect_f(dx, chart_c.top + 9.0, dw, 22.0);
+            let act = self.daily_view == mode;
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
+            if act {
+                fill_round_rect(rt, r, 6.0, theme.hover);
+            } else if hov {
+                fill_round_rect(rt, r, 6.0, with_alpha(theme.text, 0.04));
+            }
+            draw_text(rt, lbl, &fonts.ui_small_center, r, if act { theme.text } else if hov { theme.sub } else { theme.muted });
+            self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectDailyView(mode) });
+            dx += dw + 4.0;
+        }
+        if self.scope == DateScope::Today && self.daily_view == DailyViewMode::Bars {
+            let hint_r = rect_f(dx + 6.0, chart_c.top + 9.0, 108.0, 22.0);
             self.draw_ghost_btn(rt, fonts, theme, hint_r, "仅今日 · 展开全部", true, ClickAction::SelectScope(DateScope::All));
         }
-        self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
+        if self.daily_view == DailyViewMode::Bars {
+            self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
+        } else {
+            draw_text(
+                rt,
+                if self.cost_mode { "近 20 周每日估算费用热度" } else { "近 20 周每日 Token 热度" },
+                &fonts.ui_small_right,
+                rect_f(chart_c.right - 190.0, chart_c.top + 11.0, 174.0, 18.0),
+                theme.muted,
+            );
+        }
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
         self.plot_rects.push(plot);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
         let days_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_day.iter().collect();
-        let chart_days: Vec<(String, TokenCounts)> = if self.scope != DateScope::Today && days_asc.len() < 7 && !days_asc.is_empty() {
+
+        if self.daily_view == DailyViewMode::Heatmap {
             let today = Local::now().date_naive();
-            (0..7u64)
-                .rev()
-                .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
-                .map(|d| {
-                    let k = d.format("%Y-%m-%d").to_string();
-                    (k.clone(), self.cached_agg.by_day.get(&k).copied().unwrap_or_default())
-                })
-                .collect()
-        } else {
-            let s = days_asc.len().saturating_sub(30);
-            days_asc[s..].iter().map(|(k, c)| ((*k).clone(), **c)).collect()
-        };
-        let bars: Vec<BarItem> = chart_days
-            .iter()
-            .map(|(day, c)| {
-                let lbl = if day.len() >= 10 { day[5..].to_string() } else { day.clone() };
-                let tip = if self.cost_mode {
+            let n_weeks: usize = 20;
+            let wd_today = today.weekday().num_days_from_monday() as i64;
+            let end_sun = today + chrono::Duration::days(6 - wd_today);
+            let start_mon = end_sun - chrono::Duration::days((n_weeks as i64) * 7 - 1);
+            let mut h_days = Vec::with_capacity(n_weeks * 7);
+            let mut prev_month = 0u32;
+            for offset in 0..(n_weeks * 7) {
+                let d = start_mon + chrono::Duration::days(offset as i64);
+                if d > today {
+                    continue;
+                }
+                let k = d.format("%Y-%m-%d").to_string();
+                let c = snapshot.agg.by_day.get(&k).copied().unwrap_or_default();
+                let val = if self.cost_mode {
+                    c.cost.total_usd()
+                } else {
+                    c.total_tokens() as f64
+                };
+                let month_label = if d.month() != prev_month && d.weekday() == chrono::Weekday::Mon {
+                    prev_month = d.month();
+                    Some(format!("{}月", d.month()))
+                } else if offset == 0 {
+                    prev_month = d.month();
+                    Some(format!("{}月", d.month()))
+                } else {
+                    None
+                };
+                let tip = if c.calls > 0 {
                     vec![
-                        format!("{} · {} 次调用", day, c.calls),
-                        format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
-                        format!("新输入  : {} ({})", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_compact(c.input_tokens)),
-                        format!("缓存读  : {} ({:.1}%)", fmt_usd_precise(c.cost.cache_read_usd), c.cache_hit_rate()),
-                        format!("输出    : {} ({})", fmt_usd_precise(c.cost.output_usd), fmt_compact(c.output_tokens)),
-                        format!("总Token : {}", fmt_commas(c.total_tokens())),
+                        format!("{} ({}) · {} 次调用", k, weekday_cn(d), c.calls),
+                        format!("总计   : {}", fmt_commas(c.total_tokens())),
+                        format!("估算费 : {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
+                        format!("命中率 : {:.1}%  |  峰值Ctx: {}", c.cache_hit_rate(), fmt_compact(c.peak_context)),
                     ]
                 } else {
-                    vec![
-                        format!("{} · {} 次调用", day, c.calls),
-                        format!("总计   : {}", fmt_commas(c.total_tokens())),
-                        format!("估算费 : {}", fmt_cost(&c.cost, c.calls, false)),
-                        format!("新输入 : {}", fmt_commas(c.input_tokens)),
-                        format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
-                        format!("输出   : {}", fmt_commas(c.output_tokens)),
-                        format!("峰值Ctx: {}", fmt_commas(c.peak_context)),
-                    ]
+                    vec![format!("{} ({}) · 无使用记录", k, weekday_cn(d))]
                 };
-                self.make_bar(lbl, c, false, tip)
-            })
-            .collect();
-        let day_slots = draw_editorial_bars(
-            rt,
-            fonts,
-            theme,
-            plot,
-            &bars,
-            self.fresh_only,
-            self.bar_unit(),
-            self.mouse_dip,
-            "暂无按天数据",
-        );
-        for (rect, (day, c)) in day_slots.into_iter().zip(chart_days.iter()) {
-            if c.calls > 0 {
+                h_days.push(HeatmapDay {
+                    date_key: k,
+                    weekday_idx: d.weekday().num_days_from_monday() as usize,
+                    week_col: offset / 7,
+                    month_label,
+                    value: val,
+                    calls: c.calls,
+                    tooltip: tip,
+                });
+            }
+            let cells = draw_activity_heatmap(rt, fonts, theme, plot, n_weeks, &h_days, self.mouse_dip);
+            for (rect, day_key) in cells {
                 self.hit_boxes.push(HitBox {
                     rect,
-                    action: ClickAction::FilterSessions(SessionFilter::Date(day.clone())),
+                    action: ClickAction::FilterSessions(SessionFilter::Date(day_key)),
                 });
+            }
+        } else {
+            let chart_days: Vec<(String, TokenCounts)> = if self.scope != DateScope::Today && days_asc.len() < 7 && !days_asc.is_empty() {
+                let today = Local::now().date_naive();
+                (0..7u64)
+                    .rev()
+                    .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
+                    .map(|d| {
+                        let k = d.format("%Y-%m-%d").to_string();
+                        (k.clone(), self.cached_agg.by_day.get(&k).copied().unwrap_or_default())
+                    })
+                    .collect()
+            } else {
+                let s = days_asc.len().saturating_sub(30);
+                days_asc[s..].iter().map(|(k, c)| ((*k).clone(), **c)).collect()
+            };
+            let bars: Vec<BarItem> = chart_days
+                .iter()
+                .map(|(day, c)| {
+                    let lbl = if day.len() >= 10 { day[5..].to_string() } else { day.clone() };
+                    let tip = if self.cost_mode {
+                        vec![
+                            format!("{} · {} 次调用", day, c.calls),
+                            format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
+                            format!("新输入  : {} ({})", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_compact(c.input_tokens)),
+                            format!("缓存读  : {} ({:.1}%)", fmt_usd_precise(c.cost.cache_read_usd), c.cache_hit_rate()),
+                            format!("输出    : {} ({})", fmt_usd_precise(c.cost.output_usd), fmt_compact(c.output_tokens)),
+                            format!("总Token : {}", fmt_commas(c.total_tokens())),
+                        ]
+                    } else {
+                        vec![
+                            format!("{} · {} 次调用", day, c.calls),
+                            format!("总计   : {}", fmt_commas(c.total_tokens())),
+                            format!("估算费 : {}", fmt_cost(&c.cost, c.calls, false)),
+                            format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                            format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                            format!("输出   : {}", fmt_commas(c.output_tokens)),
+                            format!("峰值Ctx: {}", fmt_commas(c.peak_context)),
+                        ]
+                    };
+                    self.make_bar(lbl, c, false, tip)
+                })
+                .collect();
+            let day_slots = draw_editorial_bars(
+                rt,
+                fonts,
+                theme,
+                plot,
+                &bars,
+                self.fresh_only,
+                self.bar_unit(),
+                self.mouse_dip,
+                "暂无按天数据",
+            );
+            for (rect, (day, c)) in day_slots.into_iter().zip(chart_days.iter()) {
+                if c.calls > 0 {
+                    self.hit_boxes.push(HitBox {
+                        rect,
+                        action: ClickAction::FilterSessions(SessionFilter::Date(day.clone())),
+                    });
+                }
             }
         }
 
@@ -2890,8 +3614,9 @@ impl DashboardView {
     ) -> f32 {
         let mut gx = card_left + 14.0;
         for (mode, lbl, gw) in [
-            (ModelViewMode::CacheCompare, "缓存对比", 66.0),
-            (ModelViewMode::Pricing, "单价表 ($)", 74.0),
+            (ModelViewMode::CacheCompare, "缓存对比", 64.0),
+            (ModelViewMode::Pricing, "单价表 ($)", 72.0),
+            (ModelViewMode::Budget, "预算 / 桥接", 78.0),
         ] {
             let r = rect_f(gx, card_top + 9.0, gw, 22.0);
             let act = self.model_view == mode;
@@ -2930,6 +3655,10 @@ impl DashboardView {
     ) {
         if self.model_view == ModelViewMode::Pricing {
             self.draw_pricing_subview(rt, fonts, theme, body, snapshot);
+            return;
+        }
+        if self.model_view == ModelViewMode::Budget {
+            self.draw_budget_subview(rt, fonts, theme, body, snapshot, human);
             return;
         }
 
@@ -3503,6 +4232,194 @@ impl DashboardView {
         );
     }
 
+    fn draw_budget_subview(
+        &mut self,
+        rt: &ID2D1RenderTarget,
+        fonts: &Fonts,
+        theme: &Theme,
+        body: D2D_RECT_F,
+        snapshot: &ScanSnapshot,
+        human: bool,
+    ) {
+        let bw = body.right - body.left;
+        let edit_h = 152.0;
+        let edit_c = rect_f(body.left, body.top, bw, edit_h);
+        fill_round_rect(rt, edit_c, 10.0, theme.surface);
+        stroke_round_rect(rt, edit_c, 10.0, theme.border, 1.0);
+
+        let toggle_end = self.draw_model_view_toggle(rt, fonts, theme, edit_c.left, edit_c.top);
+
+        let copy_sl_r = rect_f(edit_c.right - 140.0, edit_c.top + 9.0, 126.0, 22.0);
+        self.draw_ghost_btn(rt, fonts, theme, copy_sl_r, "复制 /statusline 配置", true, ClickAction::CopyStatuslineConfig);
+
+        let active_status = self
+            .pricing_status
+            .as_ref()
+            .filter(|(_, _, until)| Instant::now() < *until)
+            .map(|(m, err, _)| (m.as_str(), *err));
+        let (st_text, st_col) = match active_status {
+            Some((msg, true)) => (msg.to_string(), theme.danger),
+            Some((msg, false)) => (msg.to_string(), theme.sage),
+            None => (
+                "留空或填 0 表示不限制 · 到达预警/临界阈值时胶囊变色并弹出托盘提醒".to_string(),
+                theme.muted,
+            ),
+        };
+        let st_l = toggle_end + 10.0;
+        let st_w = (copy_sl_r.left - 10.0 - st_l).max(80.0);
+        draw_text(rt, &st_text, &fonts.ui_small, rect_f(st_l, edit_c.top + 10.0, st_w, 20.0), st_col);
+
+        let inner_l = edit_c.left + 16.0;
+        let inner_r = edit_c.right - 16.0;
+        let btn_save_w = 56.0;
+        let btn_clear_w = 68.0;
+        let btns_w = btn_save_w + 6.0 + btn_clear_w;
+        let fields_r = inner_r - btns_w - 12.0;
+        let fields_w = (fields_r - inner_l).max(260.0);
+        let gap = 8.0;
+        let net_w = (fields_w - gap * 4.0).max(220.0);
+        let fracs = [0.22_f32, 0.22, 0.22, 0.17, 0.17];
+        let labels = [
+            "5h 预算 ($)",
+            "每日预算 ($)",
+            "每周预算 ($)",
+            "预警比例 (%)",
+            "临界比例 (%)",
+        ];
+
+        let lbl_y = edit_c.top + 38.0;
+        let box_y = edit_c.top + 53.0;
+        let box_h = 28.0;
+        let input_bg = if theme.is_dark {
+            crate::d2d::rgb(20, 20, 22)
+        } else {
+            crate::d2d::rgb(246, 244, 241)
+        };
+
+        let mut fx = inner_l;
+        let mut child_rects = [rect_f(0.0, 0.0, 10.0, 10.0); 5];
+        for i in 0..5 {
+            let fw = (net_w * fracs[i]).floor();
+            draw_text(rt, labels[i], &fonts.ui_micro, rect_f(fx + 2.0, lbl_y, fw, 14.0), theme.muted);
+            let outer = rect_f(fx, box_y, fw, box_h);
+            fill_round_rect(rt, outer, 6.0, input_bg);
+            let is_foc = self.pricing_focused_field == Some(i);
+            stroke_round_rect(
+                rt,
+                outer,
+                6.0,
+                if is_foc { theme.accent } else { theme.border },
+                if is_foc { 1.3 } else { 1.0 },
+            );
+            child_rects[i] = rect_f(fx + 7.0, box_y + 5.0, (fw - 14.0).max(16.0), (box_h - 9.0).max(14.0));
+            fx += fw + gap;
+        }
+        self.budget_field_rects = Some(child_rects);
+
+        let r_save = rect_f(inner_r - btns_w, box_y, btn_save_w, box_h);
+        let save_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r_save, mx, my)).unwrap_or(false);
+        fill_round_rect(rt, r_save, 6.0, if save_hov { theme.accent } else { theme.accent_soft });
+        stroke_round_rect(rt, r_save, 6.0, theme.accent, 1.0);
+        draw_text(rt, "保存", &fonts.ui_small_center, r_save, if save_hov { theme.bg } else { theme.accent });
+        self.hit_boxes.push(HitBox { rect: r_save, action: ClickAction::SaveBudgetEntry });
+
+        let r_clear = rect_f(inner_r - btn_clear_w, box_y, btn_clear_w, box_h);
+        let clear_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r_clear, mx, my)).unwrap_or(false);
+        fill_round_rect(rt, r_clear, 6.0, if clear_hov { theme.hover } else { theme.surface_subtle });
+        stroke_round_rect(rt, r_clear, 6.0, theme.border, 1.0);
+        draw_text(rt, "清空预算", &fonts.ui_small_center, r_clear, if clear_hov { theme.text } else { theme.sub });
+        self.hit_boxes.push(HitBox { rect: r_clear, action: ClickAction::ClearBudgetEntry });
+
+        let now_utc = Utc::now();
+        let sl_summary = match snapshot.statusline.as_ref() {
+            Some(sl) => {
+                let prov = sl.provenance(now_utc);
+                let age = fmt_duration_short(sl.age_secs(now_utc) as u64);
+                let b_txt: Vec<String> = sl
+                    .buckets
+                    .iter()
+                    .filter(|b| !b.disabled)
+                    .take(3)
+                    .filter_map(|b| b.remaining_pct().map(|p| format!("{} {:.0}%", b.label, p)))
+                    .collect();
+                format!(
+                    "官方 /statusline 桥接：{}（{}前更新） · {}",
+                    prov.label_cn(),
+                    age,
+                    if b_txt.is_empty() { "尚无配额池字段".into() } else { b_txt.join(" · ") }
+                )
+            }
+            None => "官方 /statusline 桥接：未接入（将右上角配置粘入 settings.json，零侵入接入真实剩余配额）".into(),
+        };
+        let bpath = if self.privacy_mode {
+            "./budget.json".to_string()
+        } else {
+            snapshot
+                .budget_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "budget.json".to_string())
+        };
+        draw_text(rt, &sl_summary, &fonts.ui_micro, rect_f(inner_l, edit_c.top + 90.0, inner_r - inner_l, 15.0), theme.sub);
+        draw_text(
+            rt,
+            &format!("预算保存位置：{} · 官方配额低余量提醒：≤{:.0}% 预警 / ≤{:.0}% 临界", bpath, snapshot.budget.quota_warn_rem_pct, snapshot.budget.quota_crit_rem_pct),
+            &fonts.ui_micro,
+            rect_f(inner_l, edit_c.top + 111.0, inner_r - inner_l, 15.0),
+            theme.muted,
+        );
+        draw_text(
+            rt,
+            "下方为最近 5 小时滚动计费窗口（Blocks）实时速率与消耗记录",
+            &fonts.ui_micro,
+            rect_f(inner_l, edit_c.top + 130.0, inner_r - inner_l, 15.0),
+            theme.muted,
+        );
+
+        let tbl_r = rect_f(body.left, edit_c.bottom + 12.0, bw, (body.bottom - edit_c.bottom - 12.0).max(110.0));
+        let rows: Vec<Vec<String>> = snapshot
+            .recent_blocks
+            .iter()
+            .rev()
+            .map(|b| {
+                let st_l = b.start_utc.with_timezone(&Local);
+                let en_l = b.end_utc.with_timezone(&Local);
+                vec![
+                    format!("{} - {}", st_l.format("%m/%d %H:%M"), en_l.format("%H:%M")),
+                    if b.is_active { "活跃中".into() } else { "已结束".into() },
+                    b.counts.calls.to_string(),
+                    fmt_num(b.counts.total_tokens(), human),
+                    fmt_cost(&b.counts.cost, b.counts.calls, human),
+                    format!("{}/h", fmt_usd_compact(b.usd_per_hour)),
+                    if b.is_active { fmt_usd_compact(b.projected_usd) } else { "-".into() },
+                    if b.is_active { fmt_countdown(b.remaining_secs) } else { "-".into() },
+                    format!("{:.1}%", b.counts.cache_hit_rate()),
+                ]
+            })
+            .collect();
+        self.draw_table(
+            rt,
+            fonts,
+            theme,
+            tbl_r,
+            &[
+                ("5h 窗口 (本地)", 0.19, false),
+                ("状态", 0.08, false),
+                ("调用", 0.07, true),
+                ("总 Token", 0.12, true),
+                ("估算费用", 0.11, true),
+                ("燃烧速率", 0.11, true),
+                ("窗口预计", 0.11, true),
+                ("剩余时间", 0.11, true),
+                ("命中率", 0.10, true),
+            ],
+            &rows,
+            None,
+            None,
+            snapshot.active_block.as_ref().map(|_| 0),
+        );
+    }
+
     // ---------- Tab 4: Session Explorer + Per-Session Cache Hit Rate & Turn Anatomy ----------
 
     #[allow(clippy::too_many_arguments)]
@@ -3593,9 +4510,36 @@ impl DashboardView {
             let max_w = (sx - 8.0 - left_cursor).max(0.0);
             if max_w >= 72.0 {
                 let measured = factories.measure_text_width(&chip_lbl, &fonts.ui_small_center) + 18.0;
-                let est_w = measured.clamp(84.0, max_w);
+                let est_w = measured.clamp(84.0, max_w.min(180.0));
                 let chip_r = rect_f(left_cursor, top_c.top + 8.0, est_w, 22.0);
                 self.draw_ghost_btn(rt, fonts, theme, chip_r, &chip_lbl, true, ClickAction::ClearSessionFilter);
+                left_cursor += est_w + 6.0;
+            }
+        }
+
+        // Inline search box (shortcut `/`, filters title / ID / workspace / model / tools)
+        let avail_search = sx - 8.0 - left_cursor;
+        if avail_search >= 92.0 {
+            let sw = avail_search.clamp(92.0, 210.0);
+            let sr = rect_f(left_cursor, top_c.top + 8.0, sw, 22.0);
+            let input_bg = if theme.is_dark {
+                crate::d2d::rgb(20, 20, 22)
+            } else {
+                crate::d2d::rgb(246, 244, 241)
+            };
+            fill_round_rect(rt, sr, 5.5, input_bg);
+            stroke_round_rect(
+                rt,
+                sr,
+                5.5,
+                if self.search_focused { theme.accent } else { theme.border },
+                if self.search_focused { 1.2 } else { 0.9 },
+            );
+            let clear_w = if self.search_query.is_empty() { 0.0 } else { 18.0 };
+            self.search_field_rect = Some(rect_f(sr.left + 6.0, sr.top + 3.0, (sw - 12.0 - clear_w).max(30.0), 16.0));
+            if !self.search_query.is_empty() {
+                let clr = rect_f(sr.right - 18.0, sr.top + 2.0, 16.0, 18.0);
+                self.draw_ghost_btn(rt, fonts, theme, clr, "×", false, ClickAction::ClearSearch);
             }
         }
 
@@ -3671,11 +4615,17 @@ impl DashboardView {
                 let hit_col = cache_hit_color(theme, &row.counts);
                 let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
                 let base_title = self.format_session_title(s);
-                let title_disp = if row.is_child_row {
-                    format!("↳ {}", base_title)
-                } else {
-                    base_title
-                };
+                let mut prefix = String::new();
+                if row.is_child_row {
+                    prefix.push_str("↳ ");
+                }
+                if s.source != SourceKind::Cli {
+                    prefix.push_str(&format!("[{}] ", s.source.label_short()));
+                }
+                if s.is_archived {
+                    prefix.push_str("[归档] ");
+                }
+                let title_disp = format!("{prefix}{base_title}");
                 let sub_badge = if !row.is_child_row && row.subagent_count > 0 {
                     Some(format!("+{}子", row.subagent_count))
                 } else {
@@ -3811,6 +4761,30 @@ impl DashboardView {
             if misses > 0 {
                 meta.push_str(&format!(" · {}未命中", misses));
             }
+            let active_s = s.active_duration_secs();
+            if active_s > 0 {
+                meta.push_str(&format!(" · 活跃{}", fmt_duration_short(active_s)));
+            }
+            let th_n = s.thinking_turns();
+            if th_n > 0 {
+                meta.push_str(&format!(" · 思考{}/{}", th_n, s.turns.len()));
+            }
+            let mut tools_vec: Vec<(String, u64)> = s.tool_counts().into_iter().collect();
+            tools_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            if !tools_vec.is_empty() {
+                let top_t: Vec<String> = tools_vec
+                    .into_iter()
+                    .take(2)
+                    .map(|(n, c)| format!("{n}×{c}"))
+                    .collect();
+                meta.push_str(&format!(" · 工具 {}", top_t.join("/")));
+            }
+            if s.source != SourceKind::Cli {
+                meta.push_str(&format!(" · [{}]", s.source.label_short()));
+            }
+            if s.is_archived {
+                meta.push_str(" · [归档]");
+            }
             let ws = self.format_workspace_short(&s.workspace);
             if !ws.is_empty() {
                 meta.push_str(&format!(" · {}", ws));
@@ -3919,7 +4893,7 @@ impl DashboardView {
                             fmt_usd_compact(t.cost.output_usd),
                         )
                     };
-                    let tip = vec![
+                    let mut tip = vec![
                         step_hdr,
                         format!("模型   : {}", t.model),
                         cost_line,
@@ -3928,6 +4902,18 @@ impl DashboardView {
                         format!("Ctx    : {}", fmt_commas(t.total_input())),
                         format!("输出   : {}", fmt_commas(t.output_tokens)),
                     ];
+                    if !t.tool_names.is_empty() {
+                        let shown_t: Vec<&str> = t.tool_names.iter().take(4).map(String::as_str).collect();
+                        let more = if t.tool_names.len() > 4 {
+                            format!(" +{}", t.tool_names.len() - 4)
+                        } else {
+                            String::new()
+                        };
+                        tip.push(format!("工具   : {}{}", shown_t.join(", "), more));
+                    }
+                    if t.thinking_chars > 0 {
+                        tip.push(format!("思考   : {} 字", fmt_commas(t.thinking_chars)));
+                    }
                     self.make_turn_bar(lbl, t, tip)
                 })
                 .collect();
@@ -4085,18 +5071,35 @@ impl DashboardView {
         } else {
             String::new()
         };
-        let dir_disp = if self.privacy_mode {
+        let arch_note = if snapshot.archived_sessions_count > 0 {
+            format!(" · 归档回填 {} 会话", snapshot.archived_sessions_count)
+        } else {
+            String::new()
+        };
+        let dirs_disp = if snapshot.data_dirs.len() > 1 {
+            format!(
+                "{} 个来源 ({})",
+                snapshot.data_dirs.len(),
+                snapshot
+                    .data_dirs
+                    .iter()
+                    .map(|(k, _)| k.label_short())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )
+        } else if self.privacy_mode {
             redact_data_dir(&snapshot.data_dir)
         } else {
             snapshot.data_dir.display().to_string()
         };
         let foot = format!(
-            "严格只读 · 0 写盘 · 不碰 SQLite · 增量扫描命中 {} / {} 文件 ({:.1} ms){} · {}",
+            "严格只读 ~/.gemini · 增量缓存 {}/{} ({:.1} ms){}{} · {}",
             snapshot.files_cached,
             snapshot.files_cached + snapshot.files_reparsed,
             snapshot.scan_ms,
             pricing_note,
-            dir_disp
+            arch_note,
+            dirs_disp
         );
         draw_text(rt, &foot, &fonts.mono_small, rect_f(body.left + 4.0, c_left.bottom + 8.0, bw - 8.0, footer_h), theme.muted);
     }
@@ -4257,6 +5260,8 @@ mod tests {
                 cache_read_tokens: 9000,
                 cache_write_tokens: 0,
                 output_tokens: 500,
+                tool_names: Vec::new(),
+                thinking_chars: 0,
                 cost: CostBreakdown::default(),
             });
         }
@@ -4266,6 +5271,8 @@ mod tests {
             conversation_id: id.to_string(),
             title: id.to_string(),
             workspace: ws.to_string(),
+            source: crate::stats::SourceKind::Cli,
+            is_archived: false,
             is_subagent: false,
             parent_id: None,
             parent_title: String::new(),
@@ -4335,10 +5342,113 @@ mod tests {
 
     #[test]
     fn test_date_scope_roundtrip() {
-        for sc in [DateScope::Today, DateScope::Days7, DateScope::Days30, DateScope::All] {
+        for sc in [
+            DateScope::Today,
+            DateScope::Days7,
+            DateScope::Days30,
+            DateScope::All,
+            DateScope::Custom,
+        ] {
             assert_eq!(DateScope::from_u8(sc.to_u8()), sc);
         }
         assert_eq!(DateScope::from_u8(99), DateScope::Today);
+    }
+
+    #[test]
+    fn test_session_search_and_exports_respect_privacy_mode() {
+        let mut s1 = make_session(
+            "secret-uuid-1111",
+            "C:/Users/alice/secret-client",
+            "gemini-4-neon-xhigh",
+            (2026, 11, 22),
+            2,
+        );
+        s1.title = "机密支付网关排查".into();
+        s1.turns[0].tool_names = vec!["read_file".into(), "run_command".into()];
+        s1.turns[0].thinking_chars = 420;
+
+        let mut s2 = make_session(
+            "public-uuid-2222",
+            "C:/Users/alice/notes",
+            "claude-opus-5-5",
+            (2026, 11, 21),
+            1,
+        );
+        s2.title = "普通周报整理".into();
+
+        let sessions = vec![s1.clone(), s2.clone()];
+        let agg = crate::stats::aggregate_sessions(&sessions);
+        let redactor = Redactor::build(&sessions, &agg);
+
+        let mut view = DashboardView::new(false, DateScope::All, false, true, true);
+        view.cached_sessions = sessions;
+        view.cached_agg = agg.clone();
+        view.redactor = redactor;
+
+        // Under privacy_mode, raw secret title/workspace cannot be queried (no oracle leak)
+        view.search_query = "机密支付".into();
+        assert_eq!(view.display_sessions(true).len(), 0);
+        view.search_query = "secret-client".into();
+        assert_eq!(view.display_sessions(true).len(), 0);
+        // Redacted label, model name, and tool name still match cleanly
+        view.search_query = "run_command".into();
+        assert_eq!(view.display_sessions(true).len(), 1);
+        view.search_query = "项目 A".into();
+        assert_eq!(view.display_sessions(true).len(), 1);
+        view.search_query.clear();
+
+        // CSV & JSON exports under privacy_mode must never leak raw title, UUID, or username
+        let csv = view.export_sessions_csv();
+        assert!(csv.starts_with('\u{FEFF}'));
+        assert!(csv.contains("S-001"));
+        assert!(csv.contains("项目 A"));
+        assert!(!csv.contains("机密支付"));
+        assert!(!csv.contains("secret-uuid"));
+        assert!(!csv.contains("alice"));
+
+        let daily_csv = view.export_daily_csv();
+        assert!(daily_csv.starts_with("\u{FEFF}date,calls"));
+        assert!(daily_csv.contains("2026-11-22"));
+
+        let snap = ScanSnapshot {
+            data_dir: std::path::PathBuf::from(r"C:\Users\alice\.gemini\antigravity-cli"),
+            data_dirs: Vec::new(),
+            sessions: view.cached_sessions.clone(),
+            agg,
+            active_block: None,
+            recent_blocks: Vec::new(),
+            statusline: None,
+            statusline_changed: false,
+            budget: BudgetConfig::default(),
+            budget_changed: false,
+            budget_path: None,
+            archived_sessions_count: 1,
+            archive_enabled: true,
+            archive_path: None,
+            model_rate_labels: HashMap::new(),
+            pricing_rows: Vec::new(),
+            pricing_path: None,
+            custom_pricing_count: 0,
+            pricing_changed: false,
+            skipped_empty: 0,
+            skipped_lines: 0,
+            files_cached: 0,
+            files_reparsed: 0,
+            scan_ms: 1.0,
+            warning: None,
+        };
+        let js = view.export_snapshot_json(&snap);
+        let parsed: serde_json::Value = serde_json::from_str(&js).expect("valid export json");
+        assert_eq!(parsed["redacted"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["archived_sessions_count"], serde_json::json!(1));
+        assert!(!js.contains("机密支付"));
+        assert!(!js.contains("secret-client"));
+        assert!(!js.contains("alice"));
+
+        // Turning off privacy_mode allows searching raw titles again
+        view.privacy_mode = false;
+        view.search_query = "机密支付".into();
+        assert_eq!(view.display_sessions(true).len(), 1);
     }
 
     #[test]

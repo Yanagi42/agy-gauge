@@ -37,6 +37,35 @@ from typing import Any, Sequence
 
 DEFAULT_DATA_DIR = pathlib.Path.home() / ".gemini" / "antigravity-cli"
 DEFAULT_PRICING_PATH = pathlib.Path(__file__).resolve().parent / "pricing.json"
+DEFAULT_STATUSLINE_PATH = pathlib.Path(__file__).resolve().parent / "statusline_state.json"
+DEFAULT_ARCHIVE_PATH = pathlib.Path(__file__).resolve().parent / "archive.json"
+DEFAULT_BUDGET_PATH = pathlib.Path(__file__).resolve().parent / "budget.json"
+BLOCK_WINDOW_SECS = 5 * 3600
+
+
+def _infer_source_name(path: pathlib.Path) -> str:
+    low = path.name.lower()
+    if low == "antigravity-cli":
+        return "cli"
+    if low == "antigravity":
+        return "app"
+    if low == "antigravity-ide":
+        return "ide"
+    return "custom"
+
+
+def default_data_dirs() -> list[pathlib.Path]:
+    base = pathlib.Path.home() / ".gemini"
+    candidates = [
+        base / "antigravity-cli",
+        base / "antigravity",
+        base / "antigravity-ide",
+    ]
+    out: list[pathlib.Path] = []
+    for idx, p in enumerate(candidates):
+        if idx == 0 or (p / "brain").is_dir():
+            out.append(p)
+    return out
 
 _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 _PBTXT_TITLE_RE = re.compile(r'(?m)^\s*title\s*:\s*"((?:\\.|[^"\\])*)"')
@@ -431,6 +460,8 @@ class TurnRecord:
     cache_read_tokens: int
     cache_write_tokens: int
     output_tokens: int
+    tool_names: tuple[str, ...] = ()
+    thinking_chars: int = 0
     cost: CostBreakdown = field(default_factory=CostBreakdown)
 
     @property
@@ -453,6 +484,8 @@ class SessionInfo:
     title: str = ""
     workspace: str = ""
     transcript_path: str = ""
+    source: str = "cli"
+    is_archived: bool = False
     is_subagent: bool = False
     parent_id: str | None = None
     parent_title: str = ""
@@ -461,6 +494,31 @@ class SessionInfo:
     models: set[str] = field(default_factory=set)
     first_time: dt.datetime | None = None
     last_time: dt.datetime | None = None
+
+    @property
+    def active_duration_secs(self) -> int:
+        times = sorted(t.timestamp for t in self.turns if t.timestamp is not None)
+        if not times:
+            return 0
+        if len(times) == 1:
+            return 15
+        secs = 0
+        for a, b in zip(times, times[1:]):
+            d = int((b - a).total_seconds())
+            if d > 0:
+                secs += min(d, 600)
+        return max(secs, 15)
+
+    @property
+    def thinking_turns(self) -> int:
+        return sum(1 for t in self.turns if t.thinking_chars > 0)
+
+    def tool_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for t in self.turns:
+            for name in t.tool_names:
+                counts[name] += 1
+        return dict(counts)
 
     def add_turn(self, turn: TurnRecord) -> None:
         self.turns.append(turn)
@@ -485,6 +543,8 @@ class ScanReport:
     data_dir: pathlib.Path
     sessions: list[SessionInfo]
     warnings: list[str]
+    data_dirs: list[pathlib.Path] = field(default_factory=list)
+    archived_sessions_count: int = 0
     skipped_empty_sessions: int = 0
     skipped_lines: int = 0
     scan_ms: float = 0.0
@@ -818,6 +878,17 @@ def _parse_transcript_file(
                 step_key = fallback_order
                 fallback_order -= 1
 
+            raw_tools = obj.get("tool_calls")
+            tool_names: list[str] = []
+            if isinstance(raw_tools, list):
+                for item in raw_tools:
+                    if isinstance(item, dict):
+                        tname = str(item.get("name") or "").strip()
+                        if tname:
+                            tool_names.append(tname)
+            raw_thinking = obj.get("thinking")
+            thinking_chars = len(raw_thinking) if isinstance(raw_thinking, str) else 0
+
             turns_by_step[step_key] = TurnRecord(
                 conversation_id=cid,
                 step_index=step_key,
@@ -829,6 +900,8 @@ def _parse_transcript_file(
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
                 output_tokens=out_tok,
+                tool_names=tuple(tool_names),
+                thinking_chars=thinking_chars,
             )
 
     ordered = sorted(
@@ -844,42 +917,257 @@ def _parse_transcript_file(
     return ordered, first_user_preview, subagent_parent_id, subagent_preview, skipped_lines
 
 
+def _read_companion_json(path: pathlib.Path | None) -> dict[str, Any] | None:
+    if path is None or path.is_symlink() or not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_statusline_state(
+    path: pathlib.Path | None = DEFAULT_STATUSLINE_PATH,
+    now_utc: dt.datetime | None = None,
+) -> dict[str, Any] | None:
+    raw = _read_companion_json(path)
+    if not raw:
+        return None
+    now = now_utc or dt.datetime.now(dt.timezone.utc)
+    captured = _parse_iso_timestamp(raw.get("captured_at"), dt.timezone.utc) or now
+    payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+    quota_raw = payload.get("quota")
+    buckets: list[dict[str, Any]] = []
+    if isinstance(quota_raw, dict):
+        items = (
+            [
+                (
+                    f"{p.get('provider', 'quota')}-{p.get('window', '')}".rstrip("-"),
+                    p,
+                )
+                for p in quota_raw["pools"]
+                if isinstance(p, dict)
+            ]
+            if isinstance(quota_raw.get("pools"), list)
+            else [(k, v) for k, v in quota_raw.items() if isinstance(v, dict)]
+        )
+        for bid, bobj in items:
+            rf = bobj.get("remaining_fraction")
+            ra = bobj.get("remaining_amount")
+            disabled = bool(bobj.get("disabled"))
+            if rf is None and ra is None and not disabled:
+                continue
+            rt = _parse_iso_timestamp(bobj.get("reset_time"), dt.timezone.utc)
+            rs = bobj.get("reset_in_seconds")
+            live_rem: int | None = None
+            if rt is not None:
+                live_rem = max(0, int((rt - now).total_seconds()))
+            elif isinstance(rs, (int, float)) and not isinstance(rs, bool):
+                age = max(0, int((now - captured).total_seconds()))
+                live_rem = max(0, int(rs) - age)
+            rem_pct = round(max(0.0, min(1.0, float(rf))) * 100.0, 2) if isinstance(rf, (int, float)) and not isinstance(rf, bool) else None
+            buckets.append({
+                "id": bid,
+                "remaining_pct": rem_pct,
+                "remaining_amount": ra if isinstance(ra, (int, float)) and not isinstance(ra, bool) else None,
+                "reset_time": rt.isoformat() if rt else None,
+                "live_remaining_secs": live_rem,
+                "disabled": disabled,
+            })
+    buckets.sort(key=lambda b: (b["disabled"], b["remaining_pct"] if b["remaining_pct"] is not None else 999.0, b["id"]))
+    age_secs = max(0, int((now - captured).total_seconds()))
+    provenance = "local_estimate" if not buckets else ("official" if age_secs <= 600 else "official_cached")
+    model_obj = payload.get("model")
+    model_name = (
+        str(model_obj.get("display_name") or model_obj.get("id") or "")
+        if isinstance(model_obj, dict)
+        else (str(model_obj) if isinstance(model_obj, str) else "")
+    )
+    return {
+        "captured_at": captured.isoformat(),
+        "age_secs": age_secs,
+        "provenance": provenance,
+        "plan_tier": str(payload.get("plan_tier") or ""),
+        "model": model_name,
+        "agent_state": str(payload.get("agent_state") or ""),
+        "buckets": buckets,
+    }
+
+
+def load_budget_config(path: pathlib.Path | None = DEFAULT_BUDGET_PATH) -> dict[str, float]:
+    cfg = {
+        "block_5h_usd": 0.0,
+        "daily_usd": 0.0,
+        "weekly_usd": 0.0,
+        "warn_pct": 70.0,
+        "critical_pct": 90.0,
+        "quota_warn_rem_pct": 20.0,
+        "quota_crit_rem_pct": 10.0,
+    }
+    raw = _read_companion_json(path)
+    if not raw:
+        return cfg
+    for k in list(cfg.keys()):
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            cfg[k] = float(v)
+    return cfg
+
+
+def compute_billing_blocks(
+    sessions: Sequence[SessionInfo],
+    now_utc: dt.datetime | None = None,
+) -> list[dict[str, Any]]:
+    now = now_utc or dt.datetime.now(dt.timezone.utc)
+    flat: list[tuple[dt.datetime, str, TurnRecord]] = []
+    for s in sessions:
+        for t in s.turns:
+            if t.timestamp is not None:
+                flat.append((t.timestamp.astimezone(dt.timezone.utc), s.conversation_id, t))
+    if not flat:
+        return []
+    flat.sort(key=lambda item: item[0])
+
+    window = dt.timedelta(seconds=BLOCK_WINDOW_SECS)
+    blocks: list[dict[str, Any]] = []
+    cur_start: dt.datetime | None = None
+    cur_end: dt.datetime | None = None
+    cur_last: dt.datetime | None = None
+    cur_counts = TokenCounts()
+    cur_cids: set[str] = set()
+    cur_models: set[str] = set()
+
+    def _flush() -> None:
+        if cur_start is None or cur_end is None or cur_last is None:
+            return
+        is_active = cur_start <= now < cur_end
+        elapsed = (
+            max(0, min(BLOCK_WINDOW_SECS, int((now - cur_start).total_seconds())))
+            if is_active
+            else max(60, min(BLOCK_WINDOW_SECS, int((cur_last - cur_start).total_seconds())))
+        )
+        rem = max(0, int((cur_end - now).total_seconds())) if is_active else 0
+        denom = float(max(elapsed, 60))
+        tok_per_min = cur_counts.total_tokens / (denom / 60.0)
+        usd_per_hr = cur_counts.total_cost_usd / (denom / 3600.0)
+        if is_active and (elapsed >= 300 or cur_counts.calls >= 2):
+            proj_tok = cur_counts.total_tokens + int(round(tok_per_min * (rem / 60.0)))
+            proj_usd = cur_counts.total_cost_usd + usd_per_hr * (rem / 3600.0)
+        else:
+            proj_tok = cur_counts.total_tokens
+            proj_usd = cur_counts.total_cost_usd
+        blocks.append({
+            "start_utc": cur_start,
+            "end_utc": cur_end,
+            "last_turn_utc": cur_last,
+            "is_active": is_active,
+            "elapsed_secs": elapsed,
+            "remaining_secs": rem,
+            "time_progress_pct": round((elapsed / BLOCK_WINDOW_SECS) * 100.0, 1),
+            "tokens_per_min": round(tok_per_min, 1),
+            "usd_per_hour": round(usd_per_hr, 4),
+            "projected_tokens": proj_tok,
+            "projected_usd": round(proj_usd, 4),
+            "sessions": len(cur_cids),
+            "models": sorted(cur_models),
+            "counts": cur_counts,
+        })
+
+    for ts, cid, turn in flat:
+        if cur_end is None or ts >= cur_end:
+            _flush()
+            cur_start = ts
+            cur_end = ts + window
+            cur_last = ts
+            cur_counts = TokenCounts()
+            cur_cids = set()
+            cur_models = set()
+        cur_last = ts
+        cur_counts.add_call(
+            turn.input_tokens,
+            turn.cache_read_tokens,
+            turn.cache_write_tokens,
+            turn.output_tokens,
+            turn.cost,
+        )
+        cur_cids.add(cid)
+        if turn.model not in ("compaction", "unknown"):
+            cur_models.add(turn.model)
+    _flush()
+    return blocks
+
+
+def _fmt_countdown(secs: int) -> str:
+    s = max(0, int(secs))
+    if s >= 86400:
+        return f"{s // 86400}d{(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m"
+    return f"{s}s"
+
+
+def _fmt_duration(secs: int) -> str:
+    s = max(0, int(secs))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{(s + 30) // 60}m"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 class IncrementalScanner:
     """In-memory mtime/size cached read-only scanner for low-CPU live polling.
 
     Never writes to disk; caches parsed immutable per-file results in RAM only.
+    Supports multi-directory Antigravity scanning (CLI / 2.0 App / IDE) and read-only
+    backfill from an optional local `archive.json`.
     """
 
     def __init__(
         self,
         data_dir: pathlib.Path = DEFAULT_DATA_DIR,
         pricing_path: pathlib.Path | None = DEFAULT_PRICING_PATH,
+        extra_dirs: Sequence[pathlib.Path] | None = None,
+        archive_path: pathlib.Path | None = None,
     ) -> None:
         self.data_dir = data_dir.expanduser()
+        dirs: list[pathlib.Path] = [self.data_dir]
+        if extra_dirs:
+            for d in extra_dirs:
+                ep = d.expanduser()
+                if ep not in dirs:
+                    dirs.append(ep)
+        self.data_dirs = dirs
         self.pricing = PricingCatalog(pricing_path)
+        self.archive_path = archive_path
         self._transcript_cache: dict[str, tuple[int, int, list[TurnRecord], str, str | None, str, int]] = {}
         self._ann_cache: dict[str, tuple[int, int, str]] = {}
-        self._meta_sig: tuple[int, int] | None = None
-        self._meta_cache: dict[str, dict[str, Any]] = {}
+        self._meta_sigs: dict[str, tuple[int, int]] = {}
+        self._meta_caches: dict[str, dict[str, dict[str, Any]]] = {}
 
-    def _get_metadata_cache(self) -> dict[str, dict[str, Any]]:
-        meta_path = self.data_dir / "cache" / "conversation_metadata.json"
+    def _get_metadata_cache(self, root_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
+        rk = str(root_dir)
+        meta_path = root_dir / "cache" / "conversation_metadata.json"
         if meta_path.is_symlink() or not meta_path.is_file():
-            self._meta_sig = None
-            self._meta_cache = {}
-            return self._meta_cache
+            self._meta_sigs.pop(rk, None)
+            self._meta_caches[rk] = {}
+            return self._meta_caches[rk]
         try:
             st = meta_path.stat()
             sig = (st.st_mtime_ns, st.st_size)
         except OSError:
-            return self._meta_cache
-        if sig != self._meta_sig:
-            self._meta_cache = _load_metadata_cache(self.data_dir)
-            self._meta_sig = sig
-        return self._meta_cache
+            return self._meta_caches.get(rk, {})
+        if sig != self._meta_sigs.get(rk):
+            self._meta_caches[rk] = _load_metadata_cache(root_dir)
+            self._meta_sigs[rk] = sig
+        return self._meta_caches[rk]
 
-    def _get_annotation_title(self, cid: str) -> str:
-        ann_path = self.data_dir / "annotations" / f"{cid}.pbtxt"
+    def _get_annotation_title(self, root_dir: pathlib.Path, cid: str) -> str:
+        ann_path = root_dir / "annotations" / f"{cid}.pbtxt"
         key = str(ann_path)
         if ann_path.is_symlink() or not ann_path.is_file():
             self._ann_cache.pop(key, None)
@@ -892,9 +1180,120 @@ class IncrementalScanner:
         cached = self._ann_cache.get(key)
         if cached is not None and cached[0] == mtime_ns and cached[1] == size:
             return cached[2]
-        title = _parse_annotation_title(ann_path, self.data_dir)
+        title = _parse_annotation_title(ann_path, root_dir)
         self._ann_cache[key] = (mtime_ns, size, title)
         return title
+
+    def _load_archived_backfill(
+        self,
+        live_ids: set[str],
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+        session_needle: str | None,
+    ) -> list[SessionInfo]:
+        raw = _read_companion_json(self.archive_path)
+        if not raw or not isinstance(raw.get("sessions"), dict):
+            return []
+        out: list[SessionInfo] = []
+        for cid, s_obj in raw["sessions"].items():
+            if cid in live_ids or not isinstance(s_obj, dict):
+                continue
+            if session_needle and not cid.lower().startswith(session_needle):
+                continue
+            raw_turns = s_obj.get("turns")
+            if not isinstance(raw_turns, list) or not raw_turns:
+                continue
+            parsed_turns: list[TurnRecord] = []
+            for t_obj in raw_turns:
+                if not isinstance(t_obj, dict):
+                    continue
+                ts = _parse_iso_timestamp(t_obj.get("ts"), dt.timezone.utc)
+                is_cp = bool(t_obj.get("cp"))
+                model = str(t_obj.get("m") or ("compaction" if is_cp else "unknown"))
+                tools_raw = t_obj.get("tools")
+                tools = tuple(str(x) for x in tools_raw if isinstance(x, str)) if isinstance(tools_raw, list) else ()
+                parsed_turns.append(
+                    TurnRecord(
+                        conversation_id=cid,
+                        step_index=int(t_obj.get("step", -1)),
+                        timestamp=ts,
+                        model=model,
+                        step_type="CHECKPOINT" if is_cp else "PLANNER_RESPONSE",
+                        status="DONE",
+                        input_tokens=_to_non_neg_int(t_obj.get("in")),
+                        cache_read_tokens=_to_non_neg_int(t_obj.get("cr")),
+                        cache_write_tokens=_to_non_neg_int(t_obj.get("cw")),
+                        output_tokens=_to_non_neg_int(t_obj.get("out")),
+                        tool_names=tools,
+                        thinking_chars=_to_non_neg_int(t_obj.get("th")),
+                    )
+                )
+            real_totals: dict[str, int] = defaultdict(int)
+            for t in parsed_turns:
+                if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
+                    real_totals[t.model] += t.total_tokens
+            fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
+            last_real = ""
+            filtered_turns: list[TurnRecord] = []
+            for turn in parsed_turns:
+                is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
+                if not is_cp and turn.model not in ("compaction", "unknown"):
+                    last_real = turn.model
+                    eff_model = turn.model
+                elif turn.model not in ("compaction", "unknown"):
+                    eff_model = turn.model
+                else:
+                    eff_model = last_real or fallback_model or turn.model
+                local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
+                if since is not None and (local_ts is None or local_ts.date() < since):
+                    continue
+                if until is not None and (local_ts is None or local_ts.date() > until):
+                    continue
+                if model_needle and model_needle not in turn.model.lower():
+                    continue
+                turn_cost = self.pricing.price_turn(
+                    eff_model,
+                    turn.input_tokens,
+                    turn.cache_read_tokens,
+                    turn.cache_write_tokens,
+                    turn.output_tokens,
+                    local_ts.date() if local_ts is not None else None,
+                )
+                filtered_turns.append(
+                    TurnRecord(
+                        conversation_id=cid,
+                        step_index=turn.step_index,
+                        timestamp=local_ts,
+                        model=turn.model,
+                        step_type=turn.step_type,
+                        status=turn.status,
+                        input_tokens=turn.input_tokens,
+                        cache_read_tokens=turn.cache_read_tokens,
+                        cache_write_tokens=turn.cache_write_tokens,
+                        output_tokens=turn.output_tokens,
+                        tool_names=turn.tool_names,
+                        thinking_chars=turn.thinking_chars,
+                        cost=turn_cost,
+                    )
+                )
+            if not filtered_turns:
+                continue
+            sess = SessionInfo(
+                conversation_id=cid,
+                title=str(s_obj.get("title") or "(archived)"),
+                workspace=str(s_obj.get("workspace") or "(unknown)"),
+                source=str(s_obj.get("source") or "cli"),
+                is_archived=True,
+                is_subagent=bool(s_obj.get("is_subagent")),
+                parent_id=str(s_obj["parent_id"]) if s_obj.get("parent_id") else None,
+                parent_title=str(s_obj.get("parent_title") or ""),
+            )
+            for t in filtered_turns:
+                sess.add_turn(t)
+            out.append(sess)
+        return out
 
     def scan(
         self,
@@ -908,179 +1307,184 @@ class IncrementalScanner:
         t0 = time.perf_counter()
         self.pricing.refresh()
         warnings: list[str] = []
-        sessions: list[SessionInfo] = []
+        sessions_by_id: dict[str, SessionInfo] = {}
         skipped_empty = 0
         skipped_lines = 0
         files_cached = 0
         files_reparsed = 0
+        found_any_brain = False
 
-        if not self.data_dir.exists() or not self.data_dir.is_dir():
-            warnings.append(f"Data directory not found: {self.data_dir}")
-            return ScanReport(data_dir=self.data_dir, sessions=[], warnings=warnings)
-
-        brain_dir = self.data_dir / "brain"
-        if not brain_dir.exists() or not brain_dir.is_dir():
-            warnings.append(f"Brain directory not found: {brain_dir}")
-            return ScanReport(data_dir=self.data_dir, sessions=[], warnings=warnings)
-
-        meta_cache = self._get_metadata_cache()
         model_needle = model_filter.lower().strip() if model_filter else None
         session_needle = session_filter.lower().strip() if session_filter else None
         workspace_needle = workspace_filter.lower().strip() if workspace_filter else None
-
-        try:
-            conv_dirs = sorted(brain_dir.iterdir(), key=lambda p: p.name)
-        except OSError as exc:
-            warnings.append(f"Failed to list {brain_dir}: {exc}")
-            return ScanReport(data_dir=self.data_dir, sessions=[], warnings=warnings)
-
         seen_keys: set[str] = set()
 
-        for conv_dir in conv_dirs:
-            if conv_dir.is_symlink() or not conv_dir.is_dir():
+        for root_dir in self.data_dirs:
+            if not root_dir.exists() or not root_dir.is_dir():
                 continue
-            cid = conv_dir.name
-            if session_needle and not cid.lower().startswith(session_needle):
+            brain_dir = root_dir / "brain"
+            if not brain_dir.exists() or not brain_dir.is_dir():
+                continue
+            found_any_brain = True
+            source_name = _infer_source_name(root_dir)
+            meta_cache = self._get_metadata_cache(root_dir)
+
+            try:
+                conv_dirs = sorted(brain_dir.iterdir(), key=lambda p: p.name)
+            except OSError as exc:
+                warnings.append(f"Failed to list {brain_dir}: {exc}")
                 continue
 
-            logs_dir = conv_dir / ".system_generated" / "logs"
-            transcript_path = logs_dir / "transcript.jsonl"
-            if not transcript_path.is_file() or transcript_path.is_symlink():
-                fallback = logs_dir / "transcript_full.jsonl"
-                if fallback.is_file() and not fallback.is_symlink():
-                    transcript_path = fallback
+            for conv_dir in conv_dirs:
+                if conv_dir.is_symlink() or not conv_dir.is_dir():
+                    continue
+                cid = conv_dir.name
+                if session_needle and not cid.lower().startswith(session_needle):
+                    continue
+
+                logs_dir = conv_dir / ".system_generated" / "logs"
+                transcript_path = logs_dir / "transcript.jsonl"
+                if not transcript_path.is_file() or transcript_path.is_symlink():
+                    fallback = logs_dir / "transcript_full.jsonl"
+                    if fallback.is_file() and not fallback.is_symlink():
+                        transcript_path = fallback
+                    else:
+                        skipped_empty += 1
+                        continue
+
+                if not _is_within_dir(transcript_path, root_dir):
+                    continue
+
+                cache_key = str(transcript_path)
+                seen_keys.add(cache_key)
+                try:
+                    st = transcript_path.stat()
+                    mtime_ns, size = st.st_mtime_ns, st.st_size
+                except OSError as exc:
+                    warnings.append(f"Could not stat {transcript_path}: {exc}")
+                    continue
+
+                cached = self._transcript_cache.get(cache_key)
+                if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                    raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                        cached[2],
+                        cached[3],
+                        cached[4],
+                        cached[5],
+                        cached[6],
+                    )
+                    files_cached += 1
                 else:
+                    try:
+                        raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                            _parse_transcript_file(transcript_path, cid)
+                        )
+                    except OSError as exc:
+                        warnings.append(f"Could not read {transcript_path}: {exc}")
+                        continue
+                    self._transcript_cache[cache_key] = (
+                        mtime_ns,
+                        size,
+                        raw_turns,
+                        first_user_preview,
+                        subagent_parent_id,
+                        subagent_preview,
+                        file_skipped,
+                    )
+                    files_reparsed += 1
+
+                skipped_lines += file_skipped
+
+                real_totals: dict[str, int] = defaultdict(int)
+                for t in raw_turns:
+                    if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
+                        real_totals[t.model] += t.total_tokens
+                fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
+                last_real_model = ""
+
+                filtered_turns: list[TurnRecord] = []
+                for turn in raw_turns:
+                    is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
+                    if not is_cp and turn.model not in ("compaction", "unknown"):
+                        last_real_model = turn.model
+                        eff_model = turn.model
+                    elif turn.model not in ("compaction", "unknown"):
+                        eff_model = turn.model
+                    else:
+                        eff_model = last_real_model or fallback_model or turn.model
+
+                    local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
+                    if since is not None and (local_ts is None or local_ts.date() < since):
+                        continue
+                    if until is not None and (local_ts is None or local_ts.date() > until):
+                        continue
+                    if model_needle and model_needle not in turn.model.lower():
+                        continue
+                    turn_cost = self.pricing.price_turn(
+                        eff_model,
+                        turn.input_tokens,
+                        turn.cache_read_tokens,
+                        turn.cache_write_tokens,
+                        turn.output_tokens,
+                        local_ts.date() if local_ts is not None else None,
+                    )
+                    filtered_turns.append(
+                        TurnRecord(
+                            conversation_id=turn.conversation_id,
+                            step_index=turn.step_index,
+                            timestamp=local_ts,
+                            model=turn.model,
+                            step_type=turn.step_type,
+                            status=turn.status,
+                            input_tokens=turn.input_tokens,
+                            cache_read_tokens=turn.cache_read_tokens,
+                            cache_write_tokens=turn.cache_write_tokens,
+                            output_tokens=turn.output_tokens,
+                            tool_names=turn.tool_names,
+                            thinking_chars=turn.thinking_chars,
+                            cost=turn_cost,
+                        )
+                    )
+
+                if not filtered_turns:
                     skipped_empty += 1
                     continue
 
-            if not _is_within_dir(transcript_path, self.data_dir):
-                continue
-
-            cache_key = str(transcript_path)
-            seen_keys.add(cache_key)
-            try:
-                st = transcript_path.stat()
-                mtime_ns, size = st.st_mtime_ns, st.st_size
-            except OSError as exc:
-                warnings.append(f"Could not stat {transcript_path}: {exc}")
-                continue
-
-            cached = self._transcript_cache.get(cache_key)
-            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
-                raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
-                    cached[2],
-                    cached[3],
-                    cached[4],
-                    cached[5],
-                    cached[6],
-                )
-                files_cached += 1
-            else:
-                try:
-                    raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
-                        _parse_transcript_file(transcript_path, cid)
-                    )
-                except OSError as exc:
-                    warnings.append(f"Could not read {transcript_path}: {exc}")
-                    continue
-                self._transcript_cache[cache_key] = (
-                    mtime_ns,
-                    size,
-                    raw_turns,
-                    first_user_preview,
-                    subagent_parent_id,
-                    subagent_preview,
-                    file_skipped,
-                )
-                files_reparsed += 1
-
-            skipped_lines += file_skipped
-
-            # Determine dominant real model so compaction checkpoints inherit their session model's rate
-            real_totals: dict[str, int] = defaultdict(int)
-            for t in raw_turns:
-                if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
-                    real_totals[t.model] += t.total_tokens
-            fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
-            last_real_model = ""
-
-            filtered_turns: list[TurnRecord] = []
-            for turn in raw_turns:
-                is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
-                if not is_cp and turn.model not in ("compaction", "unknown"):
-                    last_real_model = turn.model
-                    eff_model = turn.model
-                elif turn.model not in ("compaction", "unknown"):
-                    eff_model = turn.model
+                ann_title = self._get_annotation_title(root_dir, cid)
+                meta = meta_cache.get(cid)
+                if meta is not None:
+                    is_subagent = bool(meta.get("is_internal"))
                 else:
-                    eff_model = last_real_model or fallback_model or turn.model
-
-                local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
-                if since is not None:
-                    if local_ts is None or local_ts.date() < since:
-                        continue
-                if until is not None:
-                    if local_ts is None or local_ts.date() > until:
-                        continue
-                if model_needle and model_needle not in turn.model.lower():
-                    continue
-                turn_cost = self.pricing.price_turn(
-                    eff_model,
-                    turn.input_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_write_tokens,
-                    turn.output_tokens,
-                    local_ts.date() if local_ts is not None else None,
+                    is_subagent = subagent_parent_id is not None
+                parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
+                meta_dict = meta or {}
+                title = (
+                    ann_title
+                    or str(meta_dict.get("title") or "")
+                    or str(meta_dict.get("preview") or "")
+                    or first_user_preview
+                    or (subagent_preview if is_subagent else "")
+                    or ("(subagent)" if is_subagent else "(untitled)")
                 )
-                filtered_turns.append(
-                    TurnRecord(
-                        conversation_id=turn.conversation_id,
-                        step_index=turn.step_index,
-                        timestamp=local_ts,
-                        model=turn.model,
-                        step_type=turn.step_type,
-                        status=turn.status,
-                        input_tokens=turn.input_tokens,
-                        cache_read_tokens=turn.cache_read_tokens,
-                        cache_write_tokens=turn.cache_write_tokens,
-                        output_tokens=turn.output_tokens,
-                        cost=turn_cost,
-                    )
+                workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
+
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=title,
+                    workspace=workspace,
+                    transcript_path=cache_key,
+                    source=source_name,
+                    is_subagent=is_subagent,
+                    parent_id=parent_id,
                 )
+                for t in filtered_turns:
+                    session.add_turn(t)
 
-            if not filtered_turns:
-                skipped_empty += 1
-                continue
+                prev = sessions_by_id.get(cid)
+                if prev is None or len(session.turns) > len(prev.turns):
+                    sessions_by_id[cid] = session
 
-            ann_title = self._get_annotation_title(cid)
-            meta = meta_cache.get(cid)
-            if meta is not None:
-                is_subagent = bool(meta.get("is_internal"))
-            else:
-                is_subagent = subagent_parent_id is not None
-            parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
-            meta_dict = meta or {}
-            title = (
-                ann_title
-                or str(meta_dict.get("title") or "")
-                or str(meta_dict.get("preview") or "")
-                or first_user_preview
-                or (subagent_preview if is_subagent else "")
-                or ("(subagent)" if is_subagent else "(untitled)")
-            )
-            workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
-
-            session = SessionInfo(
-                conversation_id=cid,
-                title=title,
-                workspace=workspace,
-                transcript_path=cache_key,
-                is_subagent=is_subagent,
-                parent_id=parent_id,
-            )
-            for t in filtered_turns:
-                session.add_turn(t)
-            sessions.append(session)
+        sessions = list(sessions_by_id.values())
 
         # Link subagent sessions to their parent so they inherit workspace and parent title.
         parent_lookup: dict[str, tuple[str, str]] = {
@@ -1092,12 +1496,14 @@ class IncrementalScanner:
             pid = s.parent_id
             resolved = parent_lookup.get(pid)
             if resolved is None:
-                p_ann = self._get_annotation_title(pid)
-                p_meta = meta_cache.get(pid, {})
-                ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
-                pws = str(p_meta.get("workspace") or "")
-                if ptitle or pws:
-                    resolved = (ptitle, pws)
+                for root_dir in self.data_dirs:
+                    p_ann = self._get_annotation_title(root_dir, pid)
+                    p_meta = self._meta_caches.get(str(root_dir), {}).get(pid, {})
+                    ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
+                    pws = str(p_meta.get("workspace") or "")
+                    if ptitle or pws:
+                        resolved = (ptitle, pws)
+                        break
             if resolved is not None:
                 ptitle, pws = resolved
                 if ptitle:
@@ -1107,10 +1513,22 @@ class IncrementalScanner:
                 if s.title in ("(subagent)", "(untitled)") and ptitle:
                     s.title = f"subtask · {ptitle}"
 
+        archived_backfill = self._load_archived_backfill(
+            set(sessions_by_id.keys()),
+            tz,
+            since,
+            until,
+            model_needle,
+            session_needle,
+        )
+        sessions.extend(archived_backfill)
+
         if workspace_needle:
             sessions = [s for s in sessions if workspace_needle in s.workspace.lower()]
 
-        # Prune deleted transcript entries when scanning unfiltered sessions
+        if not found_any_brain and not archived_backfill:
+            warnings.append(f"Data directory not found: {self.data_dir}")
+
         if not session_needle:
             for stale_key in list(self._transcript_cache.keys()):
                 if stale_key not in seen_keys:
@@ -1125,8 +1543,10 @@ class IncrementalScanner:
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return ScanReport(
             data_dir=self.data_dir,
+            data_dirs=list(self.data_dirs),
             sessions=sessions,
             warnings=warnings,
+            archived_sessions_count=len(archived_backfill),
             skipped_empty_sessions=skipped_empty,
             skipped_lines=skipped_lines,
             scan_ms=elapsed_ms,
@@ -1144,8 +1564,15 @@ def scan_usage(
     session_filter: str | None = None,
     workspace_filter: str | None = None,
     pricing_path: pathlib.Path | None = DEFAULT_PRICING_PATH,
+    extra_dirs: Sequence[pathlib.Path] | None = None,
+    archive_path: pathlib.Path | None = None,
 ) -> ScanReport:
-    return IncrementalScanner(data_dir, pricing_path=pricing_path).scan(
+    return IncrementalScanner(
+        data_dir,
+        pricing_path=pricing_path,
+        extra_dirs=extra_dirs,
+        archive_path=archive_path,
+    ).scan(
         tz=tz,
         since=since,
         until=until,
@@ -1312,12 +1739,24 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
     by_hour: dict[int, TokenCounts] = {h: TokenCounts() for h in range(24)}
     by_workspace: dict[str, TokenCounts] = defaultdict(TokenCounts)
     workspace_sessions: dict[str, int] = defaultdict(int)
+    by_tool: dict[str, int] = defaultdict(int)
+    by_source: dict[str, TokenCounts] = defaultdict(TokenCounts)
+    source_sessions: dict[str, int] = defaultdict(int)
+    total_thinking_turns = 0
+    total_active_secs = 0
 
     for s in sessions:
         total.merge(s.counts)
+        total_active_secs += s.active_duration_secs
         by_workspace[s.workspace].merge(s.counts)
         workspace_sessions[s.workspace] += 1
+        by_source[s.source].merge(s.counts)
+        source_sessions[s.source] += 1
         for t in s.turns:
+            if t.thinking_chars > 0:
+                total_thinking_turns += 1
+            for tool_name in t.tool_names:
+                by_tool[tool_name] += 1
             by_model[t.model].add_call(
                 t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
             )
@@ -1353,6 +1792,11 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
         "by_hour": by_hour,
         "by_workspace": by_workspace,
         "workspace_sessions": workspace_sessions,
+        "by_tool": dict(by_tool),
+        "by_source": by_source,
+        "source_sessions": source_sessions,
+        "total_thinking_turns": total_thinking_turns,
+        "total_active_secs": total_active_secs,
     }
 
 
@@ -1448,8 +1892,9 @@ def _alpha_label(idx: int) -> str:
 def _redact_data_dir(path: pathlib.Path) -> str:
     norm = str(path).replace("\\", "/").rstrip("/")
     lower = norm.lower()
-    if lower == ".gemini/antigravity-cli" or lower.endswith("/.gemini/antigravity-cli"):
-        return "~/.gemini/antigravity-cli"
+    for suffix in ("antigravity-cli", "antigravity", "antigravity-ide"):
+        if lower == f".gemini/{suffix}" or lower.endswith(f"/.gemini/{suffix}"):
+            return f"~/.gemini/{suffix}"
     return "<redacted>"
 
 
@@ -1618,6 +2063,8 @@ def render_text(
     color: bool,
     show_subagents: bool = False,
     redact: bool = False,
+    statusline: dict[str, Any] | None = None,
+    blocks: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     total: TokenCounts = agg["total"]
     include_cw = total.cache_write_tokens > 0
@@ -1625,9 +2072,10 @@ def render_text(
     out: list[str] = []
 
     hdr_tag = "Read-Only, Redacted" if redact else "Read-Only"
-    header = _style(f"Antigravity CLI (agy) Token Usage [{hdr_tag}]", "1;36", color)
+    header = _style(f"Antigravity (agy-gauge) Quota & Token Usage [{hdr_tag}]", "1;36", color)
     out.append(header)
-    data_dir_disp = _redact_data_dir(report.data_dir) if redact else str(report.data_dir)
+    dirs_list = report.data_dirs or [report.data_dir]
+    data_dir_disp = ", ".join(_redact_data_dir(d) if redact else str(d) for d in dirs_list)
     out.append(f"Data Dir : {data_dir_disp}")
 
     filters: list[str] = [f"TZ={tz_label}"]
@@ -1637,6 +2085,8 @@ def render_text(
         filters.append(f"Model~={model_filter}")
     if session_filter:
         filters.append("Session=<redacted>" if redact else f"Session={session_filter}*")
+    if report.archived_sessions_count > 0:
+        filters.append(f"Archived={report.archived_sessions_count}")
     out.append(f"Scope    : {', '.join(filters)}")
     out.append("")
 
@@ -1675,6 +2125,36 @@ def render_text(
             ),
         ]
     )
+    if agg.get("total_active_secs", 0) > 0:
+        think_turns = agg.get("total_thinking_turns", 0)
+        tool_total = sum(agg.get("by_tool", {}).values())
+        overview_lines.append(
+            f"  Activity         : Active ~{_fmt_duration(agg['total_active_secs'])}"
+            f" | Thinking Turns: {think_turns}/{total.calls} | Tool Calls: {tool_total:,}"
+        )
+    all_blocks = list(blocks) if blocks is not None else compute_billing_blocks(report.sessions)
+    active_blk = next((b for b in reversed(all_blocks) if b["is_active"]), None)
+    if active_blk is not None:
+        bc: TokenCounts = active_blk["counts"]
+        overview_lines.append(
+            f"  Active 5h Block  : {_fmt_num(bc.total_tokens, human)} tok / {_fmt_cost(bc.cost, bc.calls, human)}"
+            f" | Rate {_fmt_usd(active_blk['usd_per_hour'], True)}/h ({_fmt_num(int(active_blk['tokens_per_min']), True)}/m)"
+            f" | Proj {_fmt_usd(active_blk['projected_usd'], True)}"
+            f" | Left {_fmt_countdown(active_blk['remaining_secs'])} ({active_blk['time_progress_pct']:.0f}% elapsed)"
+        )
+    if statusline and statusline.get("buckets"):
+        prov = statusline.get("provenance", "official")
+        b_strs = []
+        for b in statusline["buckets"][:3]:
+            if b.get("disabled"):
+                continue
+            rp = b.get("remaining_pct")
+            if rp is not None:
+                rem = f" ({_fmt_countdown(b['live_remaining_secs'])})" if b.get("live_remaining_secs") is not None else ""
+                b_strs.append(f"{b['id']}={rp:.0f}%{rem}")
+        if b_strs:
+            tier = f" [{statusline['plan_tier']}]" if statusline.get("plan_tier") else ""
+            overview_lines.append(f"  Official Quota   : {', '.join(b_strs)} ({prov}{tier})")
     out.extend(overview_lines)
 
     # Single-session detailed turn-by-turn view
@@ -1766,6 +2246,42 @@ def render_text(
     show_hourly = view in ("all", "hourly")
     show_workspace = view in ("all", "workspace")
     show_sessions = view in ("summary", "all", "session")
+    show_blocks = view in ("all", "blocks")
+    show_tools = view in ("all", "tools")
+
+    if show_blocks and all_blocks:
+        out.append("")
+        out.append(_style("5-Hour Rolling Blocks", "1;33", color))
+        b_headers = ["Window (Local)", "Status", "Calls", "Tokens", "Cost($)", "Rate($/h)", "Proj($)", "Remaining"]
+        b_aligns = ["left", "left", "right", "right", "right", "right", "right", "right"]
+        shown_b = list(reversed(all_blocks))
+        if limit > 0 and view != "blocks":
+            shown_b = shown_b[:limit]
+        b_rows = []
+        for b in shown_b:
+            bc = b["counts"]
+            s_local = b["start_utc"].astimezone()
+            e_local = b["end_utc"].astimezone()
+            win_lbl = f"{s_local.strftime('%m-%d %H:%M')}..{e_local.strftime('%H:%M')}"
+            b_rows.append([
+                win_lbl,
+                "ACTIVE" if b["is_active"] else "closed",
+                str(bc.calls),
+                _fmt_num(bc.total_tokens, human),
+                _fmt_cost(bc.cost, bc.calls, human),
+                _fmt_usd(b["usd_per_hour"], human),
+                _fmt_usd(b["projected_usd"], human) if b["is_active"] else "-",
+                _fmt_countdown(b["remaining_secs"]) if b["is_active"] else "-",
+            ])
+        out.append(_render_table(b_headers, b_rows, b_aligns))
+
+    if show_tools and agg.get("by_tool"):
+        out.append("")
+        out.append(_style("By Tool Calls", "1;33", color))
+        t_items = sorted(agg["by_tool"].items(), key=lambda kv: (-kv[1], kv[0]))
+        total_tc = max(1, sum(v for _, v in t_items))
+        t_rows = [[name, str(cnt), f"{(cnt / total_tc) * 100.0:5.1f}%"] for name, cnt in t_items[:25]]
+        out.append(_render_table(["Tool", "Calls", "Share%"], t_rows, ["left", "right", "right"]))
 
     if show_model:
         out.append("")
@@ -1917,6 +2433,67 @@ def render_text(
     return "\n".join(out)
 
 
+def render_compact(
+    report: ScanReport,
+    agg: dict[str, Any],
+    *,
+    tz: dt.tzinfo,
+    statusline: dict[str, Any] | None = None,
+    blocks: Sequence[dict[str, Any]] | None = None,
+) -> str:
+    today_key = dt.datetime.now(tz).strftime("%Y-%m-%d")
+    tc: TokenCounts = agg["by_day"].get(today_key, TokenCounts())
+    parts = [f"AGY today={_fmt_num(tc.total_tokens, True)} ({_fmt_cost(tc.cost, tc.calls, True)})"]
+    all_blocks = list(blocks) if blocks is not None else compute_billing_blocks(report.sessions)
+    active = next((b for b in reversed(all_blocks) if b["is_active"]), None)
+    if active is not None:
+        bc: TokenCounts = active["counts"]
+        parts.append(
+            f"5h={_fmt_num(bc.total_tokens, True)} ({_fmt_cost(bc.cost, bc.calls, True)}, "
+            f"{_fmt_countdown(active['remaining_secs'])} left)"
+        )
+    if statusline and statusline.get("buckets"):
+        b0 = next((b for b in statusline["buckets"] if not b.get("disabled") and b.get("remaining_pct") is not None), None)
+        if b0 is not None:
+            parts.append(f"quota={b0['id']}:{b0['remaining_pct']:.0f}%")
+    return " · ".join(parts)
+
+
+def evaluate_budget_exit_code(
+    agg: dict[str, Any],
+    blocks: Sequence[dict[str, Any]],
+    *,
+    tz: dt.tzinfo,
+    daily_usd: float = 0.0,
+    block_5h_usd: float = 0.0,
+    warn_pct: float = 70.0,
+    crit_pct: float = 90.0,
+) -> tuple[int, list[str]]:
+    code = 0
+    notes: list[str] = []
+    today_key = dt.datetime.now(tz).strftime("%Y-%m-%d")
+    today_cost = agg["by_day"].get(today_key, TokenCounts()).total_cost_usd
+    if daily_usd > 0:
+        pct = (today_cost / daily_usd) * 100.0
+        if pct >= crit_pct:
+            code = max(code, 20)
+            notes.append(f"CRITICAL: daily ${today_cost:.2f} / ${daily_usd:.2f} ({pct:.0f}%)")
+        elif pct >= warn_pct:
+            code = max(code, 10)
+            notes.append(f"WARN: daily ${today_cost:.2f} / ${daily_usd:.2f} ({pct:.0f}%)")
+    active = next((b for b in reversed(blocks) if b["is_active"]), None)
+    if block_5h_usd > 0 and active is not None:
+        b_cost = active["counts"].total_cost_usd
+        pct = (b_cost / block_5h_usd) * 100.0
+        if pct >= crit_pct:
+            code = max(code, 20)
+            notes.append(f"CRITICAL: 5h block ${b_cost:.2f} / ${block_5h_usd:.2f} ({pct:.0f}%)")
+        elif pct >= warn_pct:
+            code = max(code, 10)
+            notes.append(f"WARN: 5h block ${b_cost:.2f} / ${block_5h_usd:.2f} ({pct:.0f}%)")
+    return code, notes
+
+
 def render_json(
     report: ScanReport,
     agg: dict[str, Any],
@@ -1925,6 +2502,8 @@ def render_json(
     tz_label: str,
     include_turns: bool,
     redact: bool = False,
+    statusline: dict[str, Any] | None = None,
+    blocks: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     redactor = Redactor(report.sessions, agg) if redact else None
     ordered = _sort_sessions(report.sessions, sort_by)
@@ -1946,9 +2525,14 @@ def render_json(
             "conversation_id": cid_val,
             "title": title_val,
             "workspace": ws_val,
+            "source": s.source,
+            "is_archived": s.is_archived,
             "is_subagent": s.is_subagent,
             "parent_id": pid_val,
             "parent_title": ptitle_val,
+            "active_duration_secs": s.active_duration_secs,
+            "thinking_turns": s.thinking_turns,
+            "tool_counts": s.tool_counts(),
             "models": sorted(s.models),
             "first_time": s.first_time.isoformat() if s.first_time else None,
             "last_time": s.last_time.isoformat() if s.last_time else None,
@@ -1980,12 +2564,45 @@ def render_json(
         ws_key = redactor.workspace(k) if redactor else k
         by_ws_json[ws_key] = {"sessions": agg["workspace_sessions"][k], **v.to_dict()}
 
+    all_blocks = list(blocks) if blocks is not None else compute_billing_blocks(report.sessions)
+    blocks_json = [
+        {
+            "start_utc": b["start_utc"].isoformat(),
+            "end_utc": b["end_utc"].isoformat(),
+            "is_active": b["is_active"],
+            "elapsed_secs": b["elapsed_secs"],
+            "remaining_secs": b["remaining_secs"],
+            "time_progress_pct": b["time_progress_pct"],
+            "tokens_per_min": b["tokens_per_min"],
+            "usd_per_hour": b["usd_per_hour"],
+            "projected_tokens": b["projected_tokens"],
+            "projected_usd": b["projected_usd"],
+            "sessions": b["sessions"],
+            "models": b["models"],
+            **b["counts"].to_dict(),
+        }
+        for b in all_blocks[-24:]
+    ]
+
     payload: dict[str, Any] = {
         "data_dir": _redact_data_dir(report.data_dir) if redact else str(report.data_dir),
+        "data_dirs": [_redact_data_dir(d) if redact else str(d) for d in (report.data_dirs or [report.data_dir])],
         "timezone": tz_label,
         "redacted": redact,
         "session_count": len(report.sessions),
+        "archived_sessions_count": report.archived_sessions_count,
         "overview": agg["total"].to_dict(),
+        "activity": {
+            "active_duration_secs": agg.get("total_active_secs", 0),
+            "thinking_turns": agg.get("total_thinking_turns", 0),
+        },
+        "official_quota": statusline,
+        "blocks_5h": blocks_json,
+        "by_tool": dict(sorted(agg.get("by_tool", {}).items(), key=lambda kv: (-kv[1], kv[0]))),
+        "by_source": {
+            k: {"sessions": agg["source_sessions"][k], **v.to_dict()}
+            for k, v in sorted(agg.get("by_source", {}).items())
+        },
         "by_model": {k: v.to_dict() for k, v in sorted(agg["by_model"].items())},
         "by_date": {k: v.to_dict() for k, v in sorted(agg["by_day"].items())},
         "by_week": {
@@ -2140,12 +2757,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-dir",
         type=pathlib.Path,
-        default=DEFAULT_DATA_DIR,
-        help=f"Antigravity CLI data directory (default: {DEFAULT_DATA_DIR})",
+        default=None,
+        help=f"Single Antigravity data directory (default: auto-discover CLI/App/IDE under ~/.gemini)",
+    )
+    parser.add_argument(
+        "--single-source",
+        action="store_true",
+        help="Scan only ~/.gemini/antigravity-cli instead of all Antigravity surfaces",
     )
     parser.add_argument(
         "--view",
-        choices=("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace", "pricing"),
+        choices=("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace", "blocks", "tools", "pricing"),
         default="summary",
         help="Report sections to display (default: summary)",
     )
@@ -2154,6 +2776,51 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("table", "json", "csv"),
         default="table",
         help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Print a single-line prompt-ready summary (today + active 5h block + official quota)",
+    )
+    parser.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Do not read local archive.json backfill",
+    )
+    parser.add_argument(
+        "--statusline-state",
+        type=pathlib.Path,
+        default=DEFAULT_STATUSLINE_PATH,
+        help="Optional read-only statusline_state.json written by agy-statusline",
+    )
+    parser.add_argument(
+        "--budget-daily",
+        type=float,
+        default=None,
+        help="Daily USD budget threshold for --check-budget (overrides budget.json)",
+    )
+    parser.add_argument(
+        "--budget-5h",
+        type=float,
+        default=None,
+        help="5-hour rolling block USD budget threshold for --check-budget (overrides budget.json)",
+    )
+    parser.add_argument(
+        "--warn-pct",
+        type=float,
+        default=None,
+        help="Warning threshold percentage of budget (default: 70)",
+    )
+    parser.add_argument(
+        "--crit-pct",
+        type=float,
+        default=None,
+        help="Critical threshold percentage of budget (default: 90)",
+    )
+    parser.add_argument(
+        "--check-budget",
+        action="store_true",
+        help="Exit with code 10 (warn) or 20 (critical) when budget thresholds are exceeded",
     )
     parser.add_argument(
         "--today",
@@ -2275,8 +2942,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"--since ({since}) cannot be after --until ({until}).")
 
     pricing_path = args.pricing.expanduser() if args.pricing else None
+    if args.data_dir is not None:
+        primary_dir = args.data_dir.expanduser()
+        extra_dirs: list[pathlib.Path] = []
+    elif args.single_source:
+        primary_dir = DEFAULT_DATA_DIR
+        extra_dirs = []
+    else:
+        discovered = default_data_dirs()
+        primary_dir = discovered[0]
+        extra_dirs = discovered[1:]
+
+    archive_path = None if args.no_archive else DEFAULT_ARCHIVE_PATH
     report = scan_usage(
-        data_dir=args.data_dir.expanduser(),
+        data_dir=primary_dir,
         tz=tz,
         since=since,
         until=until,
@@ -2284,10 +2963,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_filter=args.session,
         workspace_filter=args.workspace,
         pricing_path=pricing_path,
+        extra_dirs=extra_dirs,
+        archive_path=archive_path,
     )
     agg = _aggregate(report.sessions)
+    blocks = compute_billing_blocks(report.sessions)
+    sl_path = args.statusline_state.expanduser() if args.statusline_state else None
+    statusline = load_statusline_state(sl_path)
 
-    if args.view == "pricing" and args.format == "table":
+    if args.view == "pricing" and args.format == "table" and not args.compact:
         observed = [
             k
             for k, _ in sorted(
@@ -2307,7 +2991,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    if args.format == "json":
+    if args.compact:
+        print(render_compact(report, agg, tz=tz, statusline=statusline, blocks=blocks))
+    elif args.format == "json":
         include_turns = bool(args.session)
         print(
             render_json(
@@ -2317,6 +3003,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tz_label=tz_label,
                 include_turns=include_turns,
                 redact=args.redact,
+                statusline=statusline,
+                blocks=blocks,
             )
         )
     elif args.format == "csv":
@@ -2338,12 +3026,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 color=_use_color(args.no_color),
                 show_subagents=args.show_subagents,
                 redact=args.redact,
+                statusline=statusline,
+                blocks=blocks,
             )
         )
 
     for warn in report.warnings:
         w_out = _redact_warning(warn, report.data_dir) if args.redact else warn
         print(f"Note: {w_out}", file=sys.stderr)
+
+    if args.check_budget or args.budget_daily is not None or args.budget_5h is not None:
+        bcfg = load_budget_config(DEFAULT_BUDGET_PATH)
+        daily_lim = args.budget_daily if args.budget_daily is not None else bcfg["daily_usd"]
+        b5h_lim = args.budget_5h if args.budget_5h is not None else bcfg["block_5h_usd"]
+        warn_p = args.warn_pct if args.warn_pct is not None else bcfg["warn_pct"]
+        crit_p = args.crit_pct if args.crit_pct is not None else bcfg["critical_pct"]
+        exit_code, notes = evaluate_budget_exit_code(
+            agg,
+            blocks,
+            tz=tz,
+            daily_usd=daily_lim,
+            block_5h_usd=b5h_lim,
+            warn_pct=warn_p,
+            crit_pct=crit_p,
+        )
+        for n in notes:
+            print(f"Budget: {n}", file=sys.stderr)
+        if args.check_budget:
+            return exit_code
 
     return 0
 

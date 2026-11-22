@@ -658,6 +658,157 @@ class AgyTokenStatsTests(unittest.TestCase):
             # 5. Custom non-standard data_dir does not leak folder name
             self.assertEqual(mod._redact_data_dir(pathlib.Path(r"D:\PrivateClient\agy-data")), "<redacted>")
 
+    def test_blocks_tools_multi_source_statusline_archive_and_budget(self) -> None:
+        tz_utc = dt.timezone.utc
+        now = dt.datetime.now(tz_utc).replace(microsecond=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_dir = pathlib.Path(tmp) / "antigravity-cli"
+            app_dir = pathlib.Path(tmp) / "antigravity"
+            s1_logs = cli_dir / "brain" / "aaa00001-0000-0000-0000-000000000001" / ".system_generated" / "logs"
+            s2_logs = app_dir / "brain" / "bbb00002-0000-0000-0000-000000000002" / ".system_generated" / "logs"
+            s1_logs.mkdir(parents=True)
+            s2_logs.mkdir(parents=True)
+
+            t1 = (now - dt.timedelta(minutes=40)).isoformat()
+            t2 = (now - dt.timedelta(minutes=10)).isoformat()
+            (s1_logs / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": t1,
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 500_000,
+                        "cache_read_tokens": 1_000_000,
+                        "output_tokens": 10_000,
+                        "thinking": "analyze architecture",
+                        "tool_calls": [{"name": "read_file", "args": {}}, {"name": "edit_file", "args": {}}],
+                    }),
+                    json.dumps({
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": t2,
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 200_000,
+                        "cache_read_tokens": 1_500_000,
+                        "output_tokens": 5_000,
+                        "tool_calls": [{"name": "read_file", "args": {}}],
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            (s2_logs / "transcript.jsonl").write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": (now - dt.timedelta(hours=8)).isoformat(),
+                    "model": "claude-opus-5-5",
+                    "input_tokens": 100_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 2_000,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # Local archive backfill for a deleted session
+            arch_path = pathlib.Path(tmp) / "archive.json"
+            arch_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "sessions": {
+                        "ccc00003-0000-0000-0000-000000000003": {
+                            "title": "Pruned Session",
+                            "workspace": "C:/old",
+                            "source": "ide",
+                            "turns": [{
+                                "step": 1,
+                                "ts": (now - dt.timedelta(days=2)).isoformat(),
+                                "m": "gemini-4-hydrogen",
+                                "in": 50_000,
+                                "cr": 100_000,
+                                "out": 1_000,
+                                "tools": ["run_command"],
+                                "th": 40,
+                            }],
+                        }
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            # Official statusline state snapshot
+            sl_path = pathlib.Path(tmp) / "statusline_state.json"
+            sl_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "captured_at": now.isoformat(),
+                    "payload": {
+                        "plan_tier": "Pro",
+                        "model": {"display_name": "Gemini 4 Neon"},
+                        "quota": {
+                            "gemini-weekly": {
+                                "remaining_fraction": 0.91,
+                                "reset_time": (now + dt.timedelta(days=3)).isoformat(),
+                            }
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            rep = mod.scan_usage(
+                cli_dir,
+                tz=tz_utc,
+                pricing_path=None,
+                extra_dirs=[app_dir],
+                archive_path=arch_path,
+            )
+            self.assertEqual(len(rep.sessions), 3)
+            self.assertEqual(rep.archived_sessions_count, 1)
+            agg = mod.aggregate_sessions(rep.sessions)
+            self.assertEqual(agg["by_tool"]["read_file"], 2)
+            self.assertEqual(agg["by_tool"]["run_command"], 1)
+            self.assertEqual(agg["total_thinking_turns"], 2)
+            self.assertIn("cli", agg["by_source"])
+            self.assertIn("app", agg["by_source"])
+            self.assertIn("ide", agg["by_source"])
+
+            blocks = mod.compute_billing_blocks(rep.sessions, now_utc=now)
+            self.assertGreaterEqual(len(blocks), 2)
+            self.assertTrue(blocks[-1]["is_active"])
+            self.assertGreater(blocks[-1]["usd_per_hour"], 0.0)
+
+            sl = mod.load_statusline_state(sl_path, now_utc=now)
+            self.assertIsNotNone(sl)
+            assert sl is not None
+            self.assertEqual(sl["provenance"], "official")
+            self.assertAlmostEqual(sl["buckets"][0]["remaining_pct"], 91.0, places=1)
+
+            txt = mod.render_text(
+                rep, agg, view="all", sort_by="time", limit=10, human=True,
+                tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                color=False, statusline=sl, blocks=blocks,
+            )
+            self.assertIn("Active 5h Block", txt)
+            self.assertIn("Official Quota", txt)
+            self.assertIn("5-Hour Rolling Blocks", txt)
+            self.assertIn("By Tool Calls", txt)
+
+            compact = mod.render_compact(rep, agg, tz=tz_utc, statusline=sl, blocks=blocks)
+            self.assertIn("AGY today=", compact)
+            self.assertIn("5h=", compact)
+            self.assertIn("quota=gemini-weekly:91%", compact)
+
+            # Budget check exit codes: warn (10) & critical (20)
+            code_crit, notes_crit = mod.evaluate_budget_exit_code(
+                agg, blocks, tz=tz_utc, block_5h_usd=1.0, warn_pct=70.0, crit_pct=90.0
+            )
+            self.assertEqual(code_crit, 20)
+            self.assertTrue(any("CRITICAL" in n for n in notes_crit))
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}

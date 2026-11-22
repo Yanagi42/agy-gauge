@@ -1007,3 +1007,196 @@ pub fn draw_editorial_bars(
     }
     slot_rects
 }
+
+/// Tactile quota / budget horizontal bar with an optional pace tick mark showing elapsed time fraction.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_pace_bar(
+    rt: &ID2D1RenderTarget,
+    theme: &Theme,
+    track: D2D_RECT_F,
+    fill_pct: f32,
+    pace_pct: Option<f32>,
+    fill_col: D2D1_COLOR_F,
+) {
+    let h = (track.bottom - track.top).max(4.0);
+    let w = (track.right - track.left).max(8.0);
+    let r = h * 0.5;
+    fill_round_rect(rt, track, r, theme.grid);
+    let clamped = fill_pct.clamp(0.0, 100.0);
+    if clamped > 0.3 {
+        let fw = ((clamped / 100.0) * w).max(h.min(w));
+        fill_round_rect(rt, rect_f(track.left, track.top, fw, h), r, fill_col);
+    }
+    if let Some(p) = pace_pct {
+        let px = track.left + (p.clamp(0.0, 100.0) / 100.0) * w;
+        let cy = track.top + h * 0.5;
+        draw_line(rt, px, track.top - 2.0, px, track.bottom + 2.0, theme.text, 1.4);
+        fill_circle(rt, px, cy, (h * 0.32).clamp(1.6, 2.6), theme.surface);
+        stroke_circle(rt, px, cy, (h * 0.32).clamp(1.6, 2.6), theme.text, 1.1);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeatmapDay {
+    pub date_key: String,
+    pub weekday_idx: usize, // 0 = Mon .. 6 = Sun
+    pub week_col: usize,    // 0 .. n_weeks-1
+    pub month_label: Option<String>,
+    pub value: f64,
+    pub calls: u64,
+    pub tooltip: Vec<String>,
+}
+
+/// Editorial GitHub-style 7-row (Mon..Sun) activity calendar heatmap in restrained terracotta tones.
+/// Returns `(cell_rect, date_key)` for every non-empty day cell so callers can wire drill-down clicks.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_activity_heatmap(
+    rt: &ID2D1RenderTarget,
+    fonts: &Fonts,
+    theme: &Theme,
+    bounds: D2D_RECT_F,
+    n_weeks: usize,
+    days: &[HeatmapDay],
+    mouse_pos: Option<(f32, f32)>,
+) -> Vec<(D2D_RECT_F, String)> {
+    if n_weeks == 0 || days.is_empty() {
+        draw_text(rt, "暂无活跃记录", &fonts.ui_reg_center, bounds, theme.muted);
+        return Vec::new();
+    }
+
+    let left_lbl_w = 24.0;
+    let top_lbl_h = 18.0;
+    let bot_leg_h = 20.0;
+    let avail_w = (bounds.right - bounds.left - left_lbl_w - 8.0).max(80.0);
+    let avail_h = (bounds.bottom - bounds.top - top_lbl_h - bot_leg_h - 4.0).max(56.0);
+
+    let gap = 3.5_f32;
+    let cell_w = ((avail_w - gap * (n_weeks as f32 - 1.0)) / n_weeks as f32).floor();
+    let cell_h = ((avail_h - gap * 6.0) / 7.0).floor();
+    let cell = cell_w.min(cell_h).clamp(8.0, 22.0);
+    let grid_w = n_weeks as f32 * cell + (n_weeks as f32 - 1.0) * gap;
+    let grid_h = 7.0 * cell + 6.0 * gap;
+    let gx0 = bounds.left + left_lbl_w + ((avail_w - grid_w) * 0.5).max(0.0);
+    let gy0 = bounds.top + top_lbl_h + ((avail_h - grid_h) * 0.5).max(0.0);
+
+    // Weekday row labels (Mon / Wed / Fri / Sun)
+    for (row, lbl) in [(0usize, "一"), (2, "三"), (4, "五"), (6, "日")] {
+        let ry = gy0 + row as f32 * (cell + gap);
+        draw_text(
+            rt,
+            lbl,
+            &fonts.ui_micro,
+            rect_f(gx0 - 20.0, ry, 16.0, cell),
+            theme.muted,
+        );
+    }
+
+    // Positive quantile scale (log-softened so one mega-day doesn't wash out normal days)
+    let max_val = days.iter().map(|d| d.value).fold(0.0_f64, f64::max);
+    let log_max = (max_val + 1.0).ln().max(1e-6);
+    let level_color = |val: f64| -> D2D1_COLOR_F {
+        if val <= 0.0 {
+            return if theme.is_dark {
+                rgba(255, 255, 255, 0.045)
+            } else {
+                rgba(24, 24, 27, 0.055)
+            };
+        }
+        let ratio = ((val + 1.0).ln() / log_max).clamp(0.0, 1.0);
+        let alpha = if ratio < 0.28 {
+            0.24
+        } else if ratio < 0.54 {
+            0.46
+        } else if ratio < 0.80 {
+            0.72
+        } else {
+            0.96
+        };
+        with_alpha(theme.accent, alpha)
+    };
+
+    let mut drawn_month_x: f32 = -100.0;
+    let mut click_cells = Vec::new();
+    let mut hovered: Option<(D2D_RECT_F, &HeatmapDay)> = None;
+    let rad = (cell * 0.22).clamp(2.0, 4.0);
+
+    for d in days {
+        let cx = gx0 + d.week_col as f32 * (cell + gap);
+        let cy = gy0 + d.weekday_idx as f32 * (cell + gap);
+        if let Some(ref ml) = d.month_label {
+            if cx - drawn_month_x >= 34.0 {
+                draw_text(rt, ml, &fonts.mono_small, rect_f(cx, gy0 - 16.0, 38.0, 14.0), theme.muted);
+                drawn_month_x = cx;
+            }
+        }
+        let cr = rect_f(cx, cy, cell, cell);
+        let is_hov = mouse_pos.map(|(mx, my)| hit_rect(&cr, mx, my)).unwrap_or(false);
+        fill_round_rect(rt, cr, rad, level_color(d.value));
+        if is_hov {
+            stroke_round_rect(rt, cr, rad, theme.text, 1.2);
+            hovered = Some((cr, d));
+        }
+        if d.calls > 0 {
+            click_cells.push((cr, d.date_key.clone()));
+        }
+    }
+
+    // Bottom quiet intensity legend
+    let leg_y = gy0 + grid_h + 6.0;
+    let sq = 9.0;
+    let leg_r = gx0 + grid_w;
+    draw_text(rt, "多", &fonts.ui_micro, rect_f(leg_r - 14.0, leg_y - 1.0, 14.0, 13.0), theme.muted);
+    let mut lx = leg_r - 18.0 - sq;
+    for a in [0.96_f32, 0.72, 0.46, 0.24, 0.0] {
+        let col = if a <= 0.01 {
+            if theme.is_dark { rgba(255, 255, 255, 0.05) } else { rgba(24, 24, 27, 0.06) }
+        } else {
+            with_alpha(theme.accent, a)
+        };
+        fill_round_rect(rt, rect_f(lx, leg_y + 1.0, sq, sq), 2.0, col);
+        lx -= sq + 3.0;
+    }
+    draw_text(rt, "少", &fonts.ui_micro, rect_f(lx - 14.0, leg_y - 1.0, 14.0, 13.0), theme.muted);
+    draw_text(
+        rt,
+        "点击任意有数据方格可筛选当天会话",
+        &fonts.ui_micro,
+        rect_f(gx0, leg_y - 1.0, (lx - 24.0 - gx0).max(80.0), 13.0),
+        theme.muted,
+    );
+
+    // Floating editorial tooltip
+    if let Some((cr, d)) = hovered {
+        let lines = &d.tooltip;
+        if !lines.is_empty() {
+            let line_h = 15.5;
+            let max_units: f32 = lines
+                .iter()
+                .map(|s| s.chars().map(|c| if c.is_ascii() { 1.0_f32 } else { 1.82_f32 }).sum::<f32>())
+                .fold(0.0, f32::max);
+            let box_w = (max_units * 6.5 + 24.0).clamp(210.0, 320.0);
+            let box_h = lines.len() as f32 * line_h + 14.0;
+            let tx = if cr.right + 10.0 + box_w <= bounds.right - 4.0 {
+                cr.right + 10.0
+            } else {
+                (cr.left - box_w - 10.0).max(bounds.left + 4.0)
+            };
+            let ty = (cr.top - 4.0).clamp(bounds.top + 2.0, (bounds.bottom - box_h - 4.0).max(bounds.top + 2.0));
+            let tr = rect_f(tx, ty, box_w, box_h);
+            fill_round_rect(rt, rect_f(tx + 2.0, ty + 3.0, box_w, box_h), 8.0, rgba(0, 0, 0, 0.28 * theme.shadow_alpha));
+            fill_round_rect(rt, tr, 8.0, theme.tooltip_bg);
+            stroke_round_rect(rt, tr, 8.0, theme.border, 1.0);
+            for (i, line) in lines.iter().enumerate() {
+                draw_text(
+                    rt,
+                    line,
+                    if i == 0 { &fonts.ui_section } else { &fonts.mono_small },
+                    rect_f(tx + 10.0, ty + 7.0 + i as f32 * line_h, box_w - 20.0, line_h),
+                    if i == 0 { theme.text } else { theme.sub },
+                );
+            }
+        }
+    }
+
+    click_cells
+}

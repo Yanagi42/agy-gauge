@@ -7,7 +7,7 @@
 //!   - Restrained Obsidian Charcoal or Warm Paper theme (zero AI neon cyan/purple/mint!).
 //!   - No redundant hover popup: hovering smoothly illuminates the rim; left-click opens dashboard.
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use windows::core::{w, Result};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
@@ -24,24 +24,29 @@ use crate::d2d::{
     D2DFactories, Fonts, LayeredSurface, Theme,
 };
 use crate::pricing::fmt_cost_compact;
-use crate::stats::{fmt_compact, ScanSnapshot, TokenCounts};
+use crate::quota::{fmt_countdown, AlertSeverity, QuotaProvenance};
+use crate::stats::{fmt_compact, iso_week_key, ScanSnapshot, TokenCounts};
 use crate::telemetry::{
     clamp_pos_to_work_area, get_monitors, get_work_area, monitor_index_for_point, to_wide_null,
     wide_pcwstr, SystemTelemetry, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX,
-    PILL_ITEM_CACHE_HIT, PILL_ITEM_COST, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED, PILL_ITEM_RAM,
-    PILL_ITEM_TOTAL,
+    PILL_ITEM_BLOCK_5H, PILL_ITEM_CACHE_HIT, PILL_ITEM_COST, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED,
+    PILL_ITEM_QUOTA, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
 };
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
 pub const CMD_REFRESH: u32 = 1002;
+pub const CMD_TOGGLE_PILL_VISIBLE: u32 = 1003;
 pub const CMD_TOGGLE_LIGHT: u32 = 1004;
 pub const CMD_TOGGLE_TOPMOST: u32 = 1005;
 pub const CMD_TOGGLE_HUMAN: u32 = 1006;
 pub const CMD_REDOCK: u32 = 1007;
 pub const CMD_QUIT: u32 = 1008;
 pub const CMD_TOGGLE_PRIVACY: u32 = 1009;
+pub const CMD_TOGGLE_NOTIFICATIONS: u32 = 1010;
+pub const CMD_TOGGLE_HIDE_FULLSCREEN: u32 = 1011;
+pub const CMD_TOGGLE_AUTOSTART: u32 = 1012;
 pub const CMD_MONITOR_BASE: u32 = 1100;
-pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1206 -> bit 0..6
+pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1208 -> bit 0..8
 pub const CMD_PILL_ITEMS_RESET: u32 = 1210;
 
 const SHADOW_PAD: f32 = 10.0;
@@ -120,15 +125,40 @@ impl PillRenderer {
             if m != 0 { m } else { PILL_ITEMS_DEFAULT }
         };
 
-        let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let today_date = Local::now().date_naive();
+        let today_key = today_date.format("%Y-%m-%d").to_string();
+        let week_key = iso_week_key(today_date);
         let today_c: TokenCounts = snapshot
             .agg
             .by_day
             .get(&today_key)
             .copied()
             .unwrap_or_default();
+        let week_c: TokenCounts = snapshot
+            .agg
+            .by_week
+            .get(&week_key)
+            .copied()
+            .unwrap_or_default();
+        let now_utc = Utc::now();
 
-        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(5);
+        let alerts = crate::quota::evaluate_alerts(
+            &snapshot.budget,
+            snapshot.active_block.as_ref(),
+            &today_key,
+            today_c.cost.total_usd(),
+            &week_key,
+            week_c.cost.total_usd(),
+            snapshot.statusline.as_ref(),
+            now_utc,
+        );
+        let max_severity = alerts
+            .iter()
+            .map(|a| a.severity)
+            .max()
+            .unwrap_or(AlertSeverity::Normal);
+
+        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(7);
         let mut ctx_warn = false;
 
         if (items & PILL_ITEM_TOTAL) != 0 {
@@ -143,7 +173,75 @@ impl PillRenderer {
         if (items & PILL_ITEM_COST) != 0 {
             let text = fmt_cost_compact(&today_c.cost, today_c.calls);
             let width = factories.measure_text_width(&text, &fonts.pill_tok).max(24.0) + 2.0;
-            let color = if segs.is_empty() { theme.text } else { theme.output };
+            let day_sev = if snapshot.budget.daily_usd > 0.0 {
+                snapshot
+                    .budget
+                    .classify_usage_pct((today_c.cost.total_usd() / snapshot.budget.daily_usd) * 100.0)
+            } else {
+                AlertSeverity::Normal
+            };
+            let color = match day_sev {
+                AlertSeverity::Critical => theme.danger,
+                AlertSeverity::Warn => theme.warn,
+                AlertSeverity::Normal => {
+                    if segs.is_empty() { theme.text } else { theme.output }
+                }
+            };
+            segs.push(PillTokenSeg { text, width, color });
+        }
+        if (items & PILL_ITEM_QUOTA) != 0 {
+            let (text, color) = if let Some(sl) = snapshot
+                .statusline
+                .as_ref()
+                .filter(|s| s.provenance(now_utc) != QuotaProvenance::LocalEstimate)
+            {
+                if let Some(b) = sl.tightest_bucket() {
+                    if let Some(rem_pct) = b.remaining_pct() {
+                        let sev = snapshot.budget.classify_quota_remaining(rem_pct);
+                        let c = match sev {
+                            AlertSeverity::Critical => theme.danger,
+                            AlertSeverity::Warn => theme.warn,
+                            AlertSeverity::Normal => theme.sage,
+                        };
+                        (format!("Q {:.0}%", rem_pct), c)
+                    } else {
+                        ("Q --".to_string(), theme.muted)
+                    }
+                } else {
+                    ("Q --".to_string(), theme.muted)
+                }
+            } else if let Some(blk) = snapshot.active_block.as_ref() {
+                (format!("5h {}", fmt_countdown(blk.remaining_secs)), theme.sub)
+            } else {
+                ("Q --".to_string(), theme.muted)
+            };
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(28.0) + 2.0;
+            segs.push(PillTokenSeg { text, width, color });
+        }
+        if (items & PILL_ITEM_BLOCK_5H) != 0 {
+            let (text, color) = if let Some(blk) = snapshot.active_block.as_ref() {
+                let b_sev = if snapshot.budget.block_5h_usd > 0.0 {
+                    snapshot
+                        .budget
+                        .classify_usage_pct((blk.counts.cost.total_usd() / snapshot.budget.block_5h_usd) * 100.0)
+                } else {
+                    AlertSeverity::Normal
+                };
+                let c = match b_sev {
+                    AlertSeverity::Critical => theme.danger,
+                    AlertSeverity::Warn => theme.warn,
+                    AlertSeverity::Normal => if segs.is_empty() { theme.text } else { theme.output },
+                };
+                let txt = if blk.counts.cost.total_usd() > 0.0 {
+                    format!("5h {}", fmt_cost_compact(&blk.counts.cost, blk.counts.calls))
+                } else {
+                    format!("5h {}", fmt_compact(blk.counts.total_tokens()))
+                };
+                (txt, c)
+            } else {
+                ("5h 空闲".to_string(), theme.muted)
+            };
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(32.0) + 2.0;
             segs.push(PillTokenSeg { text, width, color });
         }
         if (items & PILL_ITEM_NON_CACHED) != 0 {
@@ -264,6 +362,7 @@ impl PillRenderer {
                     dash_open,
                     recent_activity,
                     ctx_warn,
+                    max_severity,
                     &segs,
                     show_cpu,
                     show_ram,
@@ -287,6 +386,7 @@ fn draw_pill_capsule(
     dash_open: bool,
     recent_activity: bool,
     ctx_warn: bool,
+    alert_severity: AlertSeverity,
     segs: &[PillTokenSeg],
     show_cpu: bool,
     show_ram: bool,
@@ -336,15 +436,17 @@ fn draw_pill_capsule(
 
     let cy = y + ph * 0.5;
     let dot_x = x + 13.0;
-    let dot_col = if recent_activity {
-        theme.accent
-    } else if ctx_warn {
+    let dot_col = if alert_severity == AlertSeverity::Critical {
+        theme.danger
+    } else if alert_severity == AlertSeverity::Warn || ctx_warn {
         theme.warn
+    } else if recent_activity {
+        theme.accent
     } else {
         theme.sage
     };
-    if recent_activity || ctx_warn || hovered || dash_open {
-        fill_circle(rt, dot_x, cy, 5.0, with_alpha(dot_col, 0.22));
+    if alert_severity != AlertSeverity::Normal || recent_activity || ctx_warn || hovered || dash_open {
+        fill_circle(rt, dot_x, cy, 5.0, with_alpha(dot_col, 0.24));
     }
     fill_circle(rt, dot_x, cy, 2.6, dot_col);
 
@@ -449,10 +551,14 @@ fn draw_pill_capsule(
 pub fn show_context_menu(
     hwnd: HWND,
     dash_open: bool,
+    pill_visible: bool,
     light_theme: bool,
     topmost: bool,
     human: bool,
     privacy_mode: bool,
+    notifications_enabled: bool,
+    hide_on_fullscreen: bool,
+    autostart_enabled: bool,
     current_monitor: usize,
     pill_items: u32,
 ) -> Option<u32> {
@@ -464,6 +570,12 @@ pub fn show_context_menu(
             CMD_OPEN_DETAIL as usize,
             if dash_open { w!("关闭详细统计") } else { w!("打开详细统计") },
         );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            CMD_TOGGLE_PILL_VISIBLE as usize,
+            if pill_visible { w!("隐藏悬浮胶囊 (托盘保活)") } else { w!("显示悬浮胶囊") },
+        );
         let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH as usize, w!("立即刷新"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
 
@@ -472,6 +584,8 @@ pub fn show_context_menu(
             for (bit_idx, bit, lbl) in [
                 (0usize, PILL_ITEM_TOTAL, w!("今日总 Token")),
                 (6usize, PILL_ITEM_COST, w!("今日估算费用 ($)")),
+                (8usize, PILL_ITEM_QUOTA, w!("官方配额 / 5h 倒计时 (Q)")),
+                (7usize, PILL_ITEM_BLOCK_5H, w!("5h 滚动窗口用量 (5h)")),
                 (1usize, PILL_ITEM_NON_CACHED, w!("今日非缓存增量 (Δ)")),
                 (2usize, PILL_ITEM_CACHE_HIT, w!("今日缓存命中率 (%)")),
                 (3usize, PILL_ITEM_ACTIVE_CTX, w!("活跃会话上下文 (Ctx)")),
@@ -507,6 +621,18 @@ pub fn show_context_menu(
         );
         let _ = AppendMenuW(
             menu,
+            MF_STRING | if hide_on_fullscreen { MF_CHECKED } else { MF_UNCHECKED },
+            CMD_TOGGLE_HIDE_FULLSCREEN as usize,
+            w!("全屏应用自动隐藏胶囊"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | if notifications_enabled { MF_CHECKED } else { MF_UNCHECKED },
+            CMD_TOGGLE_NOTIFICATIONS as usize,
+            w!("预算与配额系统通知"),
+        );
+        let _ = AppendMenuW(
+            menu,
             MF_STRING | if human { MF_CHECKED } else { MF_UNCHECKED },
             CMD_TOGGLE_HUMAN as usize,
             w!("简写数字 (K/M)"),
@@ -516,6 +642,12 @@ pub fn show_context_menu(
             MF_STRING | if privacy_mode { MF_CHECKED } else { MF_UNCHECKED },
             CMD_TOGGLE_PRIVACY as usize,
             w!("脱敏模式 (隐藏隐私)"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | if autostart_enabled { MF_CHECKED } else { MF_UNCHECKED },
+            CMD_TOGGLE_AUTOSTART as usize,
+            w!("开机自动启动"),
         );
 
         let monitors = get_monitors();

@@ -19,23 +19,33 @@ use windows::Win32::System::ProcessStatus::{
     K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::SystemInformation::{GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetSystemTimes};
+use windows::Win32::UI::Controls::Dialogs::{
+    GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Shell::{
+    SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP,
+    NIIF_ERROR, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SetWindowPos, SystemParametersInfoW, GWL_EXSTYLE, GW_HWNDPREV,
-    HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SPI_GETWORKAREA, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WINDOWPOS, WM_APP, WS_EX_TOPMOST,
+    IsWindowVisible, PostMessageW, RegisterWindowMessageW, SetWindowPos, SystemParametersInfoW,
+    GWL_EXSTYLE, GW_HWNDPREV, HICON, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOWPOS, WM_APP, WS_EX_TOPMOST,
 };
 
 pub const WM_APP_SYNC_PREFS: u32 = WM_APP + 1;
+pub const WM_APP_TRAY: u32 = WM_APP + 2;
 
 pub const PILL_ITEM_TOTAL: u32 = 1 << 0;
 pub const PILL_ITEM_NON_CACHED: u32 = 1 << 1;
@@ -44,13 +54,17 @@ pub const PILL_ITEM_ACTIVE_CTX: u32 = 1 << 3;
 pub const PILL_ITEM_CPU: u32 = 1 << 4;
 pub const PILL_ITEM_RAM: u32 = 1 << 5;
 pub const PILL_ITEM_COST: u32 = 1 << 6;
+pub const PILL_ITEM_BLOCK_5H: u32 = 1 << 7;
+pub const PILL_ITEM_QUOTA: u32 = 1 << 8;
 pub const PILL_ITEMS_ALL_MASK: u32 = PILL_ITEM_TOTAL
     | PILL_ITEM_NON_CACHED
     | PILL_ITEM_CACHE_HIT
     | PILL_ITEM_ACTIVE_CTX
     | PILL_ITEM_CPU
     | PILL_ITEM_RAM
-    | PILL_ITEM_COST;
+    | PILL_ITEM_COST
+    | PILL_ITEM_BLOCK_5H
+    | PILL_ITEM_QUOTA;
 pub const PILL_ITEMS_DEFAULT: u32 = PILL_ITEM_TOTAL | PILL_ITEM_CPU | PILL_ITEM_RAM;
 
 pub fn migrate_legacy_pill_items(mini: bool, pill_metric: u8) -> u32 {
@@ -75,6 +89,9 @@ pub struct UserPrefs {
     pub cost_mode: bool,
     pub group_subagents: bool,
     pub privacy_mode: bool,
+    pub pill_visible: bool,
+    pub notifications_enabled: bool,
+    pub hide_on_fullscreen: bool,
     pub monitor_index: usize,
     pub fresh_only: bool,
     pub date_scope: u8,
@@ -93,6 +110,9 @@ impl Default for UserPrefs {
             cost_mode: false,
             group_subagents: true,
             privacy_mode: false,
+            pill_visible: true,
+            notifications_enabled: true,
+            hide_on_fullscreen: true,
             monitor_index: 0,
             fresh_only: false,
             date_scope: 0, // Default to Today (matches corner pill)
@@ -149,6 +169,15 @@ pub fn load_user_prefs() -> UserPrefs {
     if let Some(v) = reg_read_u32(w!("privacy_mode")) {
         p.privacy_mode = v != 0;
     }
+    if let Some(v) = reg_read_u32(w!("pill_visible")) {
+        p.pill_visible = v != 0;
+    }
+    if let Some(v) = reg_read_u32(w!("notifications_enabled")) {
+        p.notifications_enabled = v != 0;
+    }
+    if let Some(v) = reg_read_u32(w!("hide_on_fullscreen")) {
+        p.hide_on_fullscreen = v != 0;
+    }
     if let Some(v) = reg_read_u32(w!("monitor_index")) {
         p.monitor_index = v as usize;
     }
@@ -156,7 +185,7 @@ pub fn load_user_prefs() -> UserPrefs {
         p.fresh_only = v != 0;
     }
     if let Some(v) = reg_read_u32(w!("date_scope")) {
-        p.date_scope = v.min(3) as u8;
+        p.date_scope = v.min(4) as u8;
     }
     if let Some(v) = reg_read_u32(w!("pill_metric")) {
         p.pill_metric = v.min(2) as u8;
@@ -203,7 +232,7 @@ pub fn save_user_prefs(p: &UserPrefs) {
             if m != 0 { m } else { PILL_ITEMS_DEFAULT }
         };
         let derived_mini = (pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
-        let entries: [(PCWSTR, u32); 15] = [
+        let entries: [(PCWSTR, u32); 18] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(derived_mini)),
             (w!("topmost"), u32::from(p.topmost)),
@@ -211,6 +240,9 @@ pub fn save_user_prefs(p: &UserPrefs) {
             (w!("cost_mode"), u32::from(p.cost_mode)),
             (w!("group_subagents"), u32::from(p.group_subagents)),
             (w!("privacy_mode"), u32::from(p.privacy_mode)),
+            (w!("pill_visible"), u32::from(p.pill_visible)),
+            (w!("notifications_enabled"), u32::from(p.notifications_enabled)),
+            (w!("hide_on_fullscreen"), u32::from(p.hide_on_fullscreen)),
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
             (w!("date_scope"), p.date_scope as u32),
@@ -751,6 +783,217 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
 
 pub fn wide_pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())
+}
+
+// ---------- Windows System Tray, Balloon Alerts, Autostart, Fullscreen & File Dialog ----------
+
+const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const AUTOSTART_NAME: PCWSTR = w!("AgyGauge");
+
+pub fn is_autostart_enabled() -> bool {
+    unsafe {
+        let mut sz: u32 = 0;
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_SUBKEY,
+            AUTOSTART_NAME,
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut sz),
+        )
+        .is_ok()
+            && sz > 2
+    }
+}
+
+pub fn set_autostart_enabled(enable: bool) -> bool {
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_SUBKEY, 0, KEY_READ | KEY_WRITE, &mut hkey).is_err() {
+            return false;
+        }
+        let ok = if enable {
+            if let Ok(exe) = std::env::current_exe() {
+                let cmd = format!("\"{}\"", exe.display());
+                let wide = to_wide_null(&cmd);
+                let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
+                RegSetValueExW(hkey, AUTOSTART_NAME, 0, REG_SZ, Some(bytes)).is_ok()
+            } else {
+                false
+            }
+        } else {
+            RegDeleteValueW(hkey, AUTOSTART_NAME).is_ok()
+        };
+        let _ = RegCloseKey(hkey);
+        ok
+    }
+}
+
+pub fn is_other_app_fullscreen() -> bool {
+    unsafe {
+        match SHQueryUserNotificationState() {
+            Ok(state) => matches!(
+                state,
+                QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE
+            ),
+            Err(_) => false,
+        }
+    }
+}
+
+pub fn register_taskbar_created_msg() -> u32 {
+    unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }
+}
+
+fn copy_utf16_fixed<const N: usize>(dst: &mut [u16; N], src: &str) {
+    dst.fill(0);
+    let mut i = 0usize;
+    for u in src.encode_utf16() {
+        if i + 1 >= N {
+            break;
+        }
+        dst[i] = u;
+        i += 1;
+    }
+}
+
+pub struct TrayIcon {
+    hwnd: HWND,
+    icon: HICON,
+    active: bool,
+}
+
+impl TrayIcon {
+    pub fn new(hwnd: HWND, icon: HICON, tip: &str) -> Self {
+        let mut t = Self {
+            hwnd,
+            icon,
+            active: false,
+        };
+        t.add(tip);
+        t
+    }
+
+    pub fn add(&mut self, tip: &str) {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            nid.uCallbackMessage = WM_APP_TRAY;
+            nid.hIcon = self.icon;
+            copy_utf16_fixed(&mut nid.szTip, tip);
+            if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+                self.active = true;
+            }
+        }
+    }
+
+    pub fn update_tooltip(&self, tip: &str) {
+        if !self.active || self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_TIP;
+            copy_utf16_fixed(&mut nid.szTip, tip);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    pub fn show_balloon(&self, title: &str, message: &str, is_critical: bool, is_warn: bool) {
+        if !self.active || self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_INFO;
+            nid.dwInfoFlags = if is_critical {
+                NIIF_ERROR
+            } else if is_warn {
+                NIIF_WARNING | NIIF_NOSOUND
+            } else {
+                NIIF_INFO | NIIF_NOSOUND
+            };
+            copy_utf16_fixed(&mut nid.szInfoTitle, title);
+            copy_utf16_fixed(&mut nid.szInfo, message);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    pub fn remove(&mut self) {
+        if !self.active || self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.hwnd;
+            nid.uID = 1;
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for TrayIcon {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+pub fn prompt_save_file(
+    owner: HWND,
+    default_filename: &str,
+    filter_label: &str,
+    filter_pattern: &str,
+    def_ext: &str,
+) -> Option<std::path::PathBuf> {
+    let mut file_buf = vec![0u16; 1024];
+    for (i, u) in default_filename.encode_utf16().take(file_buf.len() - 1).enumerate() {
+        file_buf[i] = u;
+    }
+    let mut filter_wide: Vec<u16> = Vec::new();
+    filter_wide.extend(filter_label.encode_utf16());
+    filter_wide.push(0);
+    filter_wide.extend(filter_pattern.encode_utf16());
+    filter_wide.push(0);
+    filter_wide.extend("All Files (*.*)".encode_utf16());
+    filter_wide.push(0);
+    filter_wide.extend("*.*".encode_utf16());
+    filter_wide.push(0);
+    filter_wide.push(0);
+
+    let ext_wide = to_wide_null(def_ext);
+
+    unsafe {
+        let mut ofn: OPENFILENAMEW = zeroed();
+        ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = owner;
+        ofn.lpstrFilter = PCWSTR(filter_wide.as_ptr());
+        ofn.lpstrFile = windows::core::PWSTR(file_buf.as_mut_ptr());
+        ofn.nMaxFile = file_buf.len() as u32;
+        ofn.lpstrDefExt = PCWSTR(ext_wide.as_ptr());
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if GetSaveFileNameW(&mut ofn).as_bool() {
+            let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+            if len > 0 {
+                return Some(std::path::PathBuf::from(String::from_utf16_lossy(&file_buf[..len])));
+            }
+        }
+    }
+    None
 }
 
 // ---------- Robust Topmost Z-Order Diagnostics & Recovery ----------
