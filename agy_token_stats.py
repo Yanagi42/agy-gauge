@@ -36,10 +36,303 @@ from typing import Any, Sequence
 
 
 DEFAULT_DATA_DIR = pathlib.Path.home() / ".gemini" / "antigravity-cli"
+DEFAULT_PRICING_PATH = pathlib.Path(__file__).resolve().parent / "pricing.json"
 
 _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 _PBTXT_TITLE_RE = re.compile(r'(?m)^\s*title\s*:\s*"((?:\\.|[^"\\])*)"')
 _PBTXT_ESCAPE_RE = re.compile(r"\\([0-7]{1,3}|x[0-9a-fA-F]{2}|[abfnrtv\\\"'?])")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+_EFFORT_SUFFIXES = ("-xhigh", "-high", "-medium", "-med", "-low", "-minimal", "-max", "-none")
+_CARBON_STD_DATE = dt.date(2026, 12, 1)
+_FLASH38_STD_DATE = dt.date(2027, 1, 1)
+
+
+@dataclass(frozen=True)
+class ModelRate:
+    """USD per 1,000,000 tokens."""
+
+    input: float
+    cache_read: float
+    cache_write: float
+    output: float
+
+    def calculate(
+        self,
+        input_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        output_tokens: int,
+    ) -> "CostBreakdown":
+        per_m = 1_000_000.0
+        in_usd = (input_tokens / per_m) * self.input
+        cr_usd = (cache_read_tokens / per_m) * self.cache_read
+        cw_usd = (cache_write_tokens / per_m) * self.cache_write
+        out_usd = (output_tokens / per_m) * self.output
+        saved_usd = (
+            (cache_read_tokens / per_m) * (self.input - self.cache_read)
+            if self.input > self.cache_read
+            else 0.0
+        )
+        return CostBreakdown(
+            input_usd=in_usd,
+            cache_read_usd=cr_usd,
+            cache_write_usd=cw_usd,
+            output_usd=out_usd,
+            cache_saved_usd=saved_usd,
+            unpriced_calls=0,
+        )
+
+
+@dataclass
+class CostBreakdown:
+    input_usd: float = 0.0
+    cache_read_usd: float = 0.0
+    cache_write_usd: float = 0.0
+    output_usd: float = 0.0
+    cache_saved_usd: float = 0.0
+    unpriced_calls: int = 0
+
+    @property
+    def total_usd(self) -> float:
+        return self.input_usd + self.cache_read_usd + self.cache_write_usd + self.output_usd
+
+    @property
+    def non_cached_usd(self) -> float:
+        return self.input_usd + self.cache_write_usd + self.output_usd
+
+    @property
+    def input_plus_write_usd(self) -> float:
+        return self.input_usd + self.cache_write_usd
+
+    def merge(self, other: "CostBreakdown") -> None:
+        self.input_usd += other.input_usd
+        self.cache_read_usd += other.cache_read_usd
+        self.cache_write_usd += other.cache_write_usd
+        self.output_usd += other.output_usd
+        self.cache_saved_usd += other.cache_saved_usd
+        self.unpriced_calls += other.unpriced_calls
+
+    def is_fully_unpriced(self, calls: int) -> bool:
+        return calls > 0 and self.unpriced_calls >= calls
+
+
+def canonical_exact_key(raw: str) -> str:
+    s = raw.strip().lower()
+    if "/" in s:
+        s = s.rsplit("/", 1)[1]
+    return s.replace(".", "-").replace("_", "-")
+
+
+def normalize_model_key(raw: str) -> str:
+    s = canonical_exact_key(raw)
+    for suffix in _EFFORT_SUFFIXES:
+        if s.endswith(suffix) and len(s) > len(suffix):
+            s = s[: -len(suffix)]
+            break
+    return s
+
+
+def _matches_model_prefix(norm: str, prefix: str) -> bool:
+    return norm == prefix or norm.startswith(prefix + "-")
+
+
+_BUILTIN_SPECS: tuple[tuple[str, tuple[str, ...], ModelRate, int | None, ModelRate | None, dt.date | None, ModelRate | None, str], ...] = (
+    ("gemini-4-neon", ("gemini-4-neon",), ModelRate(3.00, 0.15, 3.00, 15.00), None, None, None, None, "1M flat"),
+    ("gemini-4-hydrogen", ("gemini-4-hydrogen",), ModelRate(1.50, 0.075, 1.50, 7.50), None, None, None, None, ""),
+    ("gemini-4-carbon", ("gemini-4-carbon", "gemini-4-argon"), ModelRate(4.00, 0.20, 4.00, 20.00), None, None, _CARBON_STD_DATE, ModelRate(2.00, 0.10, 2.00, 10.00), "intro $2/$10 before 2026-12-01"),
+    ("gemini-3.8-flash", ("gemini-3-8-flash",), ModelRate(1.50, 0.15, 1.50, 7.50), None, None, _FLASH38_STD_DATE, ModelRate(0.75, 0.075, 0.75, 3.75), "intro $0.75/$3.75 in 2026"),
+    ("gemini-3.5-flash-lite", ("gemini-3-5-flash-lite", "gemini-2-5-flash-lite"), ModelRate(0.10, 0.025, 0.10, 0.40), None, None, None, None, ""),
+    ("gemini-3.1-pro", ("gemini-3-1-pro", "gemini-3-0-pro", "gemini-3-pro"), ModelRate(2.00, 0.20, 2.00, 12.00), 200_000, ModelRate(4.00, 0.40, 4.00, 18.00), None, None, ">200K $4/$18"),
+    ("gemini-3-flash", ("gemini-3-flash", "gemini-3-0-flash"), ModelRate(0.50, 0.05, 0.50, 3.00), None, None, None, None, ""),
+    ("gemini-2.5-pro", ("gemini-2-5-pro",), ModelRate(1.25, 0.125, 1.25, 10.00), 200_000, ModelRate(2.50, 0.25, 2.50, 15.00), None, None, ">200K $2.5/$15"),
+    ("gemini-2.5-flash", ("gemini-2-5-flash",), ModelRate(0.30, 0.03, 0.30, 2.50), None, None, None, None, ""),
+    ("claude-opus-5-5", ("claude-opus-5-5",), ModelRate(4.00, 0.20, 5.00, 20.00), None, None, None, None, "1M flat"),
+    ("claude-sonnet-5-5", ("claude-sonnet-5-5",), ModelRate(2.00, 0.10, 2.50, 10.00), None, None, None, None, ""),
+    ("claude-haiku-5-5", ("claude-haiku-5-5",), ModelRate(0.10, 0.01, 0.125, 0.50), 100_000, ModelRate(0.50, 0.05, 0.625, 2.50), None, None, ">100K $0.5/$2.5"),
+    ("claude-fable-5-2", ("claude-fable-5-2", "claude-mythos-5-2"), ModelRate(8.00, 0.20, 10.00, 40.00), None, None, None, None, ""),
+    ("claude-opus-5", ("claude-opus-5",), ModelRate(5.00, 0.50, 6.25, 25.00), None, None, None, None, ""),
+    ("claude-sonnet-5", ("claude-sonnet-5",), ModelRate(2.00, 0.20, 2.50, 10.00), None, None, None, None, ""),
+    ("claude-opus-4-6", ("claude-opus-4-6", "claude-opus-4-5"), ModelRate(5.00, 0.50, 6.25, 25.00), None, None, None, None, ""),
+    ("claude-opus-4", ("claude-opus-4",), ModelRate(15.00, 1.50, 18.75, 75.00), None, None, None, None, ""),
+    ("claude-sonnet-4", ("claude-sonnet-4", "claude-3-7-sonnet", "claude-3-5-sonnet"), ModelRate(3.00, 0.30, 3.75, 15.00), None, None, None, None, ""),
+    ("claude-haiku-4-5", ("claude-haiku-4-5",), ModelRate(1.00, 0.10, 1.25, 5.00), None, None, None, None, ""),
+    ("claude-3-5-haiku", ("claude-3-5-haiku",), ModelRate(0.80, 0.08, 1.00, 4.00), None, None, None, None, ""),
+    ("gpt-5-mini", ("gpt-5-mini",), ModelRate(0.25, 0.025, 0.25, 2.00), None, None, None, None, ""),
+    ("gpt-5", ("gpt-5",), ModelRate(1.25, 0.125, 1.25, 10.00), None, None, None, None, ""),
+    ("gpt-4o-mini", ("gpt-4o-mini",), ModelRate(0.15, 0.075, 0.15, 0.60), None, None, None, None, ""),
+    ("gpt-4o", ("gpt-4o",), ModelRate(2.50, 1.25, 2.50, 10.00), None, None, None, None, ""),
+    ("o3-mini", ("o3-mini", "o4-mini"), ModelRate(1.10, 0.55, 1.10, 4.40), None, None, None, None, ""),
+    ("o3", ("o3",), ModelRate(2.00, 0.50, 2.00, 8.00), None, None, None, None, ""),
+)
+
+
+def _builtin_detail(norm: str, ctx: int, date_obj: dt.date | None) -> tuple[ModelRate, str, str] | None:
+    for display, prefixes, base, th, lr, intro_before, intro_rate, note in _BUILTIN_SPECS:
+        if any(_matches_model_prefix(norm, p) for p in prefixes):
+            if intro_before is not None and intro_rate is not None and date_obj is not None and date_obj < intro_before:
+                return intro_rate, display, note
+            if th is not None and lr is not None and ctx > th:
+                return lr, display, note
+            return base, display, note
+    return None
+
+
+def _parse_rate_dict(obj: dict[str, Any]) -> ModelRate | None:
+    raw_in = obj.get("input")
+    raw_out = obj.get("output")
+    if isinstance(raw_in, bool) or isinstance(raw_out, bool):
+        return None
+    if not isinstance(raw_in, (int, float)) or not isinstance(raw_out, (int, float)):
+        return None
+    if raw_in < 0 or raw_out < 0:
+        return None
+    raw_cr = obj.get("cache_read", 0.0)
+    raw_cw = obj.get("cache_write", raw_in)
+    cr = float(raw_cr) if isinstance(raw_cr, (int, float)) and not isinstance(raw_cr, bool) and raw_cr >= 0 else 0.0
+    cw = float(raw_cw) if isinstance(raw_cw, (int, float)) and not isinstance(raw_cw, bool) and raw_cw >= 0 else float(raw_in)
+    return ModelRate(float(raw_in), cr, cw, float(raw_out))
+
+
+class PricingCatalog:
+    """Strictly read-only pricing catalog with optional local pricing.json overrides."""
+
+    def __init__(self, override_path: pathlib.Path | None = DEFAULT_PRICING_PATH) -> None:
+        self.override_path = override_path
+        self._override_sig: tuple[int, int] | None = None
+        # (raw_key, exact_key, prefix, has_effort, base, long_th, long_rate)
+        self._custom_rules: list[tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None]] = []
+        self.refresh()
+
+    def refresh(self) -> bool:
+        path = self.override_path
+        if path is None or path.is_symlink() or not path.is_file():
+            changed = self._override_sig is not None or bool(self._custom_rules)
+            self._override_sig = None
+            self._custom_rules = []
+            return changed
+        try:
+            st = path.stat()
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return False
+        if sig == self._override_sig:
+            return False
+        self._override_sig = sig
+        self._custom_rules = self._load_rules(path)
+        return True
+
+    @staticmethod
+    def _load_rules(path: pathlib.Path) -> list[tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None]]:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        models = payload.get("models") if isinstance(payload.get("models"), dict) else payload
+        rules: list[tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None]] = []
+        for k, v in models.items():
+            if not isinstance(v, dict):
+                continue
+            base = _parse_rate_dict(v)
+            if base is None:
+                continue
+            raw_key = str(k).strip()
+            exact_key = canonical_exact_key(raw_key)
+            prefix = normalize_model_key(raw_key)
+            if not prefix:
+                continue
+            has_effort = exact_key != prefix
+            raw_th = v.get("long_context_threshold")
+            th = int(raw_th) if isinstance(raw_th, int) and not isinstance(raw_th, bool) and raw_th > 0 else None
+            lc = v.get("long_context")
+            lr = _parse_rate_dict(lc) if isinstance(lc, dict) else None
+            rules.append((raw_key, exact_key, prefix, has_effort, base, th, lr))
+        return rules
+
+    def resolve_detail(
+        self, model: str, total_input_tokens: int, date_obj: dt.date | None
+    ) -> tuple[ModelRate, str, str] | None:
+        exact = canonical_exact_key(model)
+        norm = normalize_model_key(model)
+        if not norm or norm in ("unknown", "compaction") or model == "(上下文压缩)":
+            return None
+        for raw_key, exact_key, _, _, base, th, lr in self._custom_rules:
+            if exact_key == exact:
+                r = lr if (th is not None and lr is not None and total_input_tokens > th) else base
+                return r, "custom(exact)", raw_key
+        best: tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None] | None = None
+        for rule in self._custom_rules:
+            if rule[3]:  # effort-specific custom rule does not match other effort levels
+                continue
+            if _matches_model_prefix(norm, rule[2]):
+                if best is None or len(rule[2]) > len(best[2]):
+                    best = rule
+        if best is not None:
+            raw_key, _, _, _, base, th, lr = best
+            r = lr if (th is not None and lr is not None and total_input_tokens > th) else base
+            return r, "custom(prefix)", raw_key
+        bi = _builtin_detail(norm, total_input_tokens, date_obj)
+        if bi is not None:
+            return bi[0], "builtin", bi[1]
+        return None
+
+    def resolve_rate(self, model: str, total_input_tokens: int, date_obj: dt.date | None) -> ModelRate | None:
+        det = self.resolve_detail(model, total_input_tokens, date_obj)
+        return det[0] if det is not None else None
+
+    def build_table(self, observed_models: Sequence[str], date_obj: dt.date) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for m in observed_models:
+            ex = canonical_exact_key(m)
+            if not ex or ex in ("unknown", "compaction") or ex in seen:
+                continue
+            seen.add(ex)
+            det = self.resolve_detail(m, 0, date_obj)
+            if det is not None:
+                r, src, rule = det
+                rows.append({"model": m, "source": src, "rule": rule, "rate": r, "reference": False})
+            else:
+                rows.append({"model": m, "source": "unpriced", "rule": "-", "rate": None, "reference": False})
+        for raw_key, exact_key, _, has_eff, base, _, _ in sorted(self._custom_rules, key=lambda x: x[0]):
+            if exact_key not in seen:
+                seen.add(exact_key)
+                rows.append({
+                    "model": raw_key,
+                    "source": "custom(exact)" if has_eff else "custom(prefix)",
+                    "rule": raw_key,
+                    "rate": base,
+                    "reference": False,
+                })
+        for display, _, _, _, _, _, _, _ in _BUILTIN_SPECS:
+            ex = canonical_exact_key(display)
+            if ex in seen:
+                continue
+            seen.add(ex)
+            det = self.resolve_detail(display, 0, date_obj)
+            r = det[0] if det else None
+            src = det[1] if det else "builtin"
+            rule = det[2] if det else display
+            rows.append({"model": display, "source": src, "rule": rule, "rate": r, "reference": True})
+        return rows
+
+    def price_turn(
+        self,
+        model: str,
+        input_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        output_tokens: int,
+        date_obj: dt.date | None,
+    ) -> CostBreakdown:
+        ctx = input_tokens + cache_read_tokens + cache_write_tokens
+        rate = self.resolve_rate(model, ctx, date_obj)
+        if rate is None:
+            return CostBreakdown(unpriced_calls=1)
+        return rate.calculate(input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
 
 
 @dataclass
@@ -50,6 +343,7 @@ class TokenCounts:
     cache_write_tokens: int = 0  # Prompt cache creation tokens (if reported)
     output_tokens: int = 0  # Output tokens (thinking + response + tool calls)
     peak_context: int = 0  # Max single-call total input tokens
+    cost: CostBreakdown = field(default_factory=CostBreakdown)
 
     @property
     def total_input_tokens(self) -> int:
@@ -70,18 +364,25 @@ class TokenCounts:
             return 0.0
         return (self.cache_read_tokens / denom) * 100.0
 
+    @property
+    def total_cost_usd(self) -> float:
+        return self.cost.total_usd
+
     def add_call(
         self,
         input_tokens: int,
         cache_read_tokens: int,
         cache_write_tokens: int,
         output_tokens: int,
+        cost: CostBreakdown | None = None,
     ) -> None:
         self.calls += 1
         self.input_tokens += input_tokens
         self.cache_read_tokens += cache_read_tokens
         self.cache_write_tokens += cache_write_tokens
         self.output_tokens += output_tokens
+        if cost is not None:
+            self.cost.merge(cost)
         ctx = input_tokens + cache_read_tokens + cache_write_tokens
         if ctx > self.peak_context:
             self.peak_context = ctx
@@ -92,6 +393,7 @@ class TokenCounts:
         self.cache_read_tokens += other.cache_read_tokens
         self.cache_write_tokens += other.cache_write_tokens
         self.output_tokens += other.output_tokens
+        self.cost.merge(other.cost)
         if other.peak_context > self.peak_context:
             self.peak_context = other.peak_context
 
@@ -107,6 +409,13 @@ class TokenCounts:
             "non_cached_tokens": self.non_cached_tokens,
             "cache_hit_rate_pct": round(self.cache_hit_rate, 2),
             "peak_context": self.peak_context,
+            "cost_usd": round(self.cost.total_usd, 6),
+            "cost_input_usd": round(self.cost.input_usd, 6),
+            "cost_cache_read_usd": round(self.cost.cache_read_usd, 6),
+            "cost_cache_write_usd": round(self.cost.cache_write_usd, 6),
+            "cost_output_usd": round(self.cost.output_usd, 6),
+            "cache_saved_usd": round(self.cost.cache_saved_usd, 6),
+            "unpriced_calls": self.cost.unpriced_calls,
         }
 
 
@@ -122,6 +431,7 @@ class TurnRecord:
     cache_read_tokens: int
     cache_write_tokens: int
     output_tokens: int
+    cost: CostBreakdown = field(default_factory=CostBreakdown)
 
     @property
     def total_input_tokens(self) -> int:
@@ -143,6 +453,9 @@ class SessionInfo:
     title: str = ""
     workspace: str = ""
     transcript_path: str = ""
+    is_subagent: bool = False
+    parent_id: str | None = None
+    parent_title: str = ""
     turns: list[TurnRecord] = field(default_factory=list)
     counts: TokenCounts = field(default_factory=TokenCounts)
     models: set[str] = field(default_factory=set)
@@ -156,6 +469,7 @@ class SessionInfo:
             turn.cache_read_tokens,
             turn.cache_write_tokens,
             turn.output_tokens,
+            turn.cost,
         )
         if turn.model:
             self.models.add(turn.model)
@@ -307,6 +621,32 @@ def _extract_user_preview(content: str) -> str:
     return _clean_single_line(snippet, max_len=80)
 
 
+def _extract_subagent_meta(content: str) -> tuple[str | None, str]:
+    """Parse subagent launcher SYSTEM_MESSAGE for sender=<parent-uuid> and task preview."""
+    if not content:
+        return None, ""
+    parent_id: str | None = None
+    pos = content.find("sender=")
+    if pos >= 0:
+        rest = content[pos + len("sender=") :]
+        tok = rest.split(None, 1)[0] if rest.split(None, 1) else ""
+        if _UUID_RE.match(tok):
+            parent_id = tok
+    preview = ""
+    cpos = content.find("content=")
+    if cpos >= 0:
+        body = content[cpos + len("content=") :]
+        for raw_line in body.splitlines():
+            trimmed = raw_line.strip().lstrip("#").strip()
+            if not trimmed or trimmed.startswith("</SYSTEM_MESSAGE>"):
+                continue
+            cleaned_md = trimmed.replace("**", "").replace("`", "")
+            preview = _clean_single_line(cleaned_md, max_len=72)
+            if preview:
+                break
+    return parent_id, preview
+
+
 def _parse_iso_timestamp(value: Any, tz: dt.tzinfo) -> dt.datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -339,7 +679,7 @@ def _to_non_neg_int(value: Any) -> int:
     return 0
 
 
-def _load_metadata_cache(data_dir: pathlib.Path) -> dict[str, dict[str, str]]:
+def _load_metadata_cache(data_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
     meta_path = data_dir / "cache" / "conversation_metadata.json"
     text = _safe_read_text(meta_path, data_dir)
     if not text:
@@ -351,24 +691,32 @@ def _load_metadata_cache(data_dir: pathlib.Path) -> dict[str, dict[str, str]]:
     conversations = payload.get("conversations")
     if not isinstance(conversations, dict):
         return {}
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for cid, entry in conversations.items():
         if not isinstance(entry, dict):
             continue
+        is_internal = bool(entry.get("is_internal"))
         summary = entry.get("summary")
-        if not isinstance(summary, dict):
-            continue
-        title = _clean_single_line(str(summary.get("Title") or ""))
-        preview = _clean_single_line(str(summary.get("Preview") or ""))
-        ws_uris = summary.get("WorkspaceURIs")
-        workspace = ""
-        if isinstance(ws_uris, list) and ws_uris:
-            workspace = _decode_workspace_uri(str(ws_uris[0]))
-        result[str(cid)] = {
-            "title": title,
-            "preview": preview,
-            "workspace": workspace,
-        }
+        if isinstance(summary, dict):
+            title = _clean_single_line(str(summary.get("Title") or ""))
+            preview = _clean_single_line(str(summary.get("Preview") or ""))
+            ws_uris = summary.get("WorkspaceURIs")
+            workspace = ""
+            if isinstance(ws_uris, list) and ws_uris:
+                workspace = _decode_workspace_uri(str(ws_uris[0]))
+            result[str(cid)] = {
+                "title": title,
+                "preview": preview,
+                "workspace": workspace,
+                "is_internal": is_internal,
+            }
+        elif is_internal:
+            result[str(cid)] = {
+                "title": "",
+                "preview": "",
+                "workspace": "",
+                "is_internal": True,
+            }
     return result
 
 
@@ -387,11 +735,14 @@ def _has_token_metrics(record: dict[str, Any]) -> bool:
 def _parse_transcript_file(
     transcript_path: pathlib.Path,
     cid: str,
-) -> tuple[list[TurnRecord], str, int]:
+) -> tuple[list[TurnRecord], str, str | None, str, int]:
     """Parse a single transcript JSONL file in UTC (tz conversion happens later)."""
     turns_by_step: dict[int, TurnRecord] = {}
     fallback_order = -1
+    seen_user_input = False
     first_user_preview = ""
+    subagent_parent_id: str | None = None
+    subagent_preview = ""
     skipped_lines = 0
 
     with transcript_path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -399,11 +750,18 @@ def _parse_transcript_file(
             stripped = line.strip()
             if not stripped:
                 continue
-            need_preview = (not first_user_preview) and ("USER_INPUT" in stripped)
+            need_preview = (not seen_user_input) and ("USER_INPUT" in stripped)
+            need_subagent_meta = (
+                (not seen_user_input)
+                and subagent_parent_id is None
+                and (not subagent_preview)
+                and ("SYSTEM_MESSAGE" in stripped)
+            )
             if (
                 stripped.startswith("{")
                 and stripped.endswith("}")
                 and not need_preview
+                and not need_subagent_meta
                 and "_tokens" not in stripped
             ):
                 continue
@@ -415,12 +773,19 @@ def _parse_transcript_file(
             if not isinstance(obj, dict):
                 continue
 
-            if (
-                not first_user_preview
-                and obj.get("type") == "USER_INPUT"
+            step_type_peek = obj.get("type")
+            if step_type_peek == "USER_INPUT":
+                seen_user_input = True
+                if not first_user_preview and isinstance(obj.get("content"), str):
+                    first_user_preview = _extract_user_preview(obj["content"])
+            elif (
+                not seen_user_input
+                and subagent_parent_id is None
+                and not subagent_preview
+                and step_type_peek == "SYSTEM_MESSAGE"
                 and isinstance(obj.get("content"), str)
             ):
-                first_user_preview = _extract_user_preview(obj["content"])
+                subagent_parent_id, subagent_preview = _extract_subagent_meta(obj["content"])
 
             if not _has_token_metrics(obj):
                 continue
@@ -473,7 +838,10 @@ def _parse_transcript_file(
             t.timestamp or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
         ),
     )
-    return ordered, first_user_preview, skipped_lines
+    if seen_user_input:
+        subagent_parent_id = None
+        subagent_preview = ""
+    return ordered, first_user_preview, subagent_parent_id, subagent_preview, skipped_lines
 
 
 class IncrementalScanner:
@@ -482,14 +850,19 @@ class IncrementalScanner:
     Never writes to disk; caches parsed immutable per-file results in RAM only.
     """
 
-    def __init__(self, data_dir: pathlib.Path = DEFAULT_DATA_DIR) -> None:
+    def __init__(
+        self,
+        data_dir: pathlib.Path = DEFAULT_DATA_DIR,
+        pricing_path: pathlib.Path | None = DEFAULT_PRICING_PATH,
+    ) -> None:
         self.data_dir = data_dir.expanduser()
-        self._transcript_cache: dict[str, tuple[int, int, list[TurnRecord], str, int]] = {}
+        self.pricing = PricingCatalog(pricing_path)
+        self._transcript_cache: dict[str, tuple[int, int, list[TurnRecord], str, str | None, str, int]] = {}
         self._ann_cache: dict[str, tuple[int, int, str]] = {}
         self._meta_sig: tuple[int, int] | None = None
-        self._meta_cache: dict[str, dict[str, str]] = {}
+        self._meta_cache: dict[str, dict[str, Any]] = {}
 
-    def _get_metadata_cache(self) -> dict[str, dict[str, str]]:
+    def _get_metadata_cache(self) -> dict[str, dict[str, Any]]:
         meta_path = self.data_dir / "cache" / "conversation_metadata.json"
         if meta_path.is_symlink() or not meta_path.is_file():
             self._meta_sig = None
@@ -533,6 +906,7 @@ class IncrementalScanner:
         workspace_filter: str | None = None,
     ) -> ScanReport:
         t0 = time.perf_counter()
+        self.pricing.refresh()
         warnings: list[str] = []
         sessions: list[SessionInfo] = []
         skipped_empty = 0
@@ -593,12 +967,18 @@ class IncrementalScanner:
 
             cached = self._transcript_cache.get(cache_key)
             if cached is not None and cached[0] == mtime_ns and cached[1] == size:
-                raw_turns, first_user_preview, file_skipped = cached[2], cached[3], cached[4]
+                raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                    cached[2],
+                    cached[3],
+                    cached[4],
+                    cached[5],
+                    cached[6],
+                )
                 files_cached += 1
             else:
                 try:
-                    raw_turns, first_user_preview, file_skipped = _parse_transcript_file(
-                        transcript_path, cid
+                    raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                        _parse_transcript_file(transcript_path, cid)
                     )
                 except OSError as exc:
                     warnings.append(f"Could not read {transcript_path}: {exc}")
@@ -608,14 +988,33 @@ class IncrementalScanner:
                     size,
                     raw_turns,
                     first_user_preview,
+                    subagent_parent_id,
+                    subagent_preview,
                     file_skipped,
                 )
                 files_reparsed += 1
 
             skipped_lines += file_skipped
 
+            # Determine dominant real model so compaction checkpoints inherit their session model's rate
+            real_totals: dict[str, int] = defaultdict(int)
+            for t in raw_turns:
+                if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
+                    real_totals[t.model] += t.total_tokens
+            fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
+            last_real_model = ""
+
             filtered_turns: list[TurnRecord] = []
             for turn in raw_turns:
+                is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
+                if not is_cp and turn.model not in ("compaction", "unknown"):
+                    last_real_model = turn.model
+                    eff_model = turn.model
+                elif turn.model not in ("compaction", "unknown"):
+                    eff_model = turn.model
+                else:
+                    eff_model = last_real_model or fallback_model or turn.model
+
                 local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
                 if since is not None:
                     if local_ts is None or local_ts.date() < since:
@@ -625,6 +1024,14 @@ class IncrementalScanner:
                         continue
                 if model_needle and model_needle not in turn.model.lower():
                     continue
+                turn_cost = self.pricing.price_turn(
+                    eff_model,
+                    turn.input_tokens,
+                    turn.cache_read_tokens,
+                    turn.cache_write_tokens,
+                    turn.output_tokens,
+                    local_ts.date() if local_ts is not None else None,
+                )
                 filtered_turns.append(
                     TurnRecord(
                         conversation_id=turn.conversation_id,
@@ -637,6 +1044,7 @@ class IncrementalScanner:
                         cache_read_tokens=turn.cache_read_tokens,
                         cache_write_tokens=turn.cache_write_tokens,
                         output_tokens=turn.output_tokens,
+                        cost=turn_cost,
                     )
                 )
 
@@ -645,21 +1053,62 @@ class IncrementalScanner:
                 continue
 
             ann_title = self._get_annotation_title(cid)
-            meta = meta_cache.get(cid, {})
-            title = ann_title or meta.get("title") or meta.get("preview") or first_user_preview or "(untitled)"
-            workspace = meta.get("workspace") or "(unknown)"
-            if workspace_needle and workspace_needle not in workspace.lower():
-                continue
+            meta = meta_cache.get(cid)
+            if meta is not None:
+                is_subagent = bool(meta.get("is_internal"))
+            else:
+                is_subagent = subagent_parent_id is not None
+            parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
+            meta_dict = meta or {}
+            title = (
+                ann_title
+                or str(meta_dict.get("title") or "")
+                or str(meta_dict.get("preview") or "")
+                or first_user_preview
+                or (subagent_preview if is_subagent else "")
+                or ("(subagent)" if is_subagent else "(untitled)")
+            )
+            workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
 
             session = SessionInfo(
                 conversation_id=cid,
                 title=title,
                 workspace=workspace,
                 transcript_path=cache_key,
+                is_subagent=is_subagent,
+                parent_id=parent_id,
             )
             for t in filtered_turns:
                 session.add_turn(t)
             sessions.append(session)
+
+        # Link subagent sessions to their parent so they inherit workspace and parent title.
+        parent_lookup: dict[str, tuple[str, str]] = {
+            s.conversation_id: (s.title, s.workspace) for s in sessions
+        }
+        for s in sessions:
+            if not s.is_subagent or not s.parent_id:
+                continue
+            pid = s.parent_id
+            resolved = parent_lookup.get(pid)
+            if resolved is None:
+                p_ann = self._get_annotation_title(pid)
+                p_meta = meta_cache.get(pid, {})
+                ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
+                pws = str(p_meta.get("workspace") or "")
+                if ptitle or pws:
+                    resolved = (ptitle, pws)
+            if resolved is not None:
+                ptitle, pws = resolved
+                if ptitle:
+                    s.parent_title = ptitle
+                if (not s.workspace or s.workspace == "(unknown)") and pws and pws != "(unknown)":
+                    s.workspace = pws
+                if s.title in ("(subagent)", "(untitled)") and ptitle:
+                    s.title = f"subtask · {ptitle}"
+
+        if workspace_needle:
+            sessions = [s for s in sessions if workspace_needle in s.workspace.lower()]
 
         # Prune deleted transcript entries when scanning unfiltered sessions
         if not session_needle:
@@ -694,8 +1143,9 @@ def scan_usage(
     model_filter: str | None = None,
     session_filter: str | None = None,
     workspace_filter: str | None = None,
+    pricing_path: pathlib.Path | None = DEFAULT_PRICING_PATH,
 ) -> ScanReport:
-    return IncrementalScanner(data_dir).scan(
+    return IncrementalScanner(data_dir, pricing_path=pricing_path).scan(
         tz=tz,
         since=since,
         until=until,
@@ -760,6 +1210,39 @@ def _fmt_num(value: int, human: bool = False) -> str:
 
 def _fmt_pct(value: float) -> str:
     return f"{value:5.1f}%"
+
+
+def _fmt_usd(value: float, human: bool = False) -> str:
+    if value <= 0.0:
+        return "$0.00"
+    if human:
+        if value >= 10_000.0:
+            return f"${value / 1_000.0:.1f}K"
+        if value >= 1_000.0:
+            return f"${value / 1_000.0:.2f}K"
+        if value >= 0.01:
+            return f"${value:.2f}"
+        if value >= 0.001:
+            return f"${value:.3f}"
+        return "<$0.001"
+    if value >= 1_000.0:
+        return f"${value:,.2f}"
+    if value >= 0.01:
+        return f"${value:.2f}"
+    if value >= 0.0001:
+        return f"${value:.4f}"
+    return "<$0.0001"
+
+
+def _fmt_cost(cost: CostBreakdown, calls: int, human: bool = False) -> str:
+    if calls == 0:
+        return "$0.00"
+    if cost.is_fully_unpriced(calls):
+        return "-"
+    s = _fmt_usd(cost.total_usd, human)
+    if cost.unpriced_calls > 0:
+        s += "*"
+    return s
 
 
 def _fmt_time(ts: dt.datetime | None) -> str:
@@ -836,14 +1319,14 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
         workspace_sessions[s.workspace] += 1
         for t in s.turns:
             by_model[t.model].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens
+                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
             )
             if t.timestamp is not None:
                 day_key = t.timestamp.strftime("%Y-%m-%d")
                 week_key = iso_week_key(t.timestamp.date())
                 month_key = t.timestamp.strftime("%Y-%m")
                 by_hour[t.timestamp.hour].add_call(
-                    t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens
+                    t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
                 )
                 week_days[week_key].add(day_key)
             else:
@@ -851,13 +1334,13 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
                 week_key = "unknown"
                 month_key = "unknown"
             by_day[day_key].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens
+                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
             )
             by_week[week_key].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens
+                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
             )
             by_month[month_key].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens
+                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
             )
 
     return {
@@ -878,6 +1361,8 @@ _aggregate = aggregate_sessions
 
 def _sort_sessions(sessions: Sequence[SessionInfo], sort_by: str) -> list[SessionInfo]:
     min_dt = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    if sort_by == "cost":
+        return sorted(sessions, key=lambda s: (s.counts.total_cost_usd, s.counts.total_tokens), reverse=True)
     if sort_by == "total":
         return sorted(sessions, key=lambda s: s.counts.total_tokens, reverse=True)
     if sort_by == "non-cached":
@@ -922,6 +1407,7 @@ def _format_counts_row(label: str, c: TokenCounts, human: bool, include_cache_wr
         [
             _fmt_num(c.output_tokens, human),
             _fmt_num(c.total_tokens, human),
+            _fmt_cost(c.cost, c.calls, human),
             _fmt_pct(c.cache_hit_rate),
             _fmt_num(c.peak_context, human),
         ]
@@ -935,12 +1421,57 @@ def _counts_headers(label_header: str, include_cache_write: bool) -> tuple[list[
     if include_cache_write:
         headers.append("CacheWrite")
         aligns.append("right")
-    headers.extend(["Output", "Total", "Hit%", "PeakCtx"])
-    aligns.extend(["right", "right", "right", "right"])
+    headers.extend(["Output", "Total", "Cost($)", "Hit%", "PeakCtx"])
+    aligns.extend(["right", "right", "right", "right", "right"])
     return headers, aligns
 
 
 # ---------- Output formatters ----------
+
+
+def _group_sessions_for_display(
+    sessions: Sequence[SessionInfo],
+    *,
+    group_subagents: bool,
+) -> list[tuple[SessionInfo, TokenCounts, dt.datetime | None, set[str], str, int]]:
+    """Build display rows: (session, agg_counts, last_time, models, primary_model, subagent_count)."""
+    if not group_subagents:
+        rows = []
+        for s in sessions:
+            rows.append((s, s.counts, s.last_time, set(s.models), _primary_model(s), 0))
+        return rows
+
+    present_ids = {s.conversation_id for s in sessions}
+    children_by_parent: dict[str, list[SessionInfo]] = defaultdict(list)
+    roots: list[SessionInfo] = []
+    for s in sessions:
+        if s.is_subagent and s.parent_id and s.parent_id in present_ids:
+            children_by_parent[s.parent_id].append(s)
+        else:
+            roots.append(s)
+
+    rows = []
+    for s in roots:
+        counts = TokenCounts()
+        counts.merge(s.counts)
+        last_time = s.last_time
+        models = set(s.models)
+        kids = children_by_parent.get(s.conversation_id, [])
+        for k in kids:
+            counts.merge(k.counts)
+            models.update(k.models)
+            if k.last_time is not None and (last_time is None or k.last_time > last_time):
+                last_time = k.last_time
+        # Compute primary model across root + grouped children
+        by_m: dict[str, tuple[bool, int]] = {}
+        for src in (s, *kids):
+            for t in src.turns:
+                is_cp = t.step_type == "CHECKPOINT"
+                prev_cp, prev_tok = by_m.get(t.model, (is_cp, 0))
+                by_m[t.model] = (prev_cp and is_cp, prev_tok + t.total_tokens)
+        primary = max(by_m.items(), key=lambda kv: (not kv[1][0], kv[1][1]))[0] if by_m else "-"
+        rows.append((s, counts, last_time, models, primary, len(kids)))
+    return rows
 
 
 def render_text(
@@ -957,6 +1488,7 @@ def render_text(
     model_filter: str | None,
     session_filter: str | None,
     color: bool,
+    show_subagents: bool = False,
 ) -> str:
     total: TokenCounts = agg["total"]
     include_cw = total.cache_write_tokens > 0
@@ -982,8 +1514,15 @@ def render_text(
 
     # Overview block
     out.append(_style("Overview", "1;33", color))
+    sub_cnt = sum(1 for s in report.sessions if s.is_subagent)
+    root_cnt = len(report.sessions) - sub_cnt
+    sess_str = (
+        f"{root_cnt} (+{sub_cnt} subagents)"
+        if sub_cnt > 0
+        else str(len(report.sessions))
+    )
     overview_lines = [
-        f"  Sessions         : {len(report.sessions)} (LLM calls: {total.calls:,})",
+        f"  Sessions         : {sess_str} (LLM calls: {total.calls:,})",
         f"  Input (uncached) : {_fmt_num(total.input_tokens, human)}",
         f"  Cache Read       : {_fmt_num(total.cache_read_tokens, human)} (Hit Rate: {total.cache_hit_rate:.1f}%)",
     ]
@@ -995,6 +1534,13 @@ def render_text(
             f"  Output           : {_fmt_num(total.output_tokens, human)}",
             f"  Total Tokens     : {_fmt_num(total.total_tokens, human)} (Non-cached: {_fmt_num(total.non_cached_tokens, human)})",
             f"  Peak Context     : {_fmt_num(total.peak_context, human)}",
+            (
+                f"  Estimated Cost   : {_fmt_cost(total.cost, total.calls, human)}"
+                f" (Input {_fmt_usd(total.cost.input_plus_write_usd, human)}"
+                f" / Cache {_fmt_usd(total.cost.cache_read_usd, human)}"
+                f" / Output {_fmt_usd(total.cost.output_usd, human)};"
+                f" Cache Saved: {_fmt_usd(total.cost.cache_saved_usd, human)})"
+            ),
         ]
     )
     out.extend(overview_lines)
@@ -1012,8 +1558,15 @@ def render_text(
         out.append("")
         out.append(_style(f"Session Detail: {s.conversation_id}", "1;33", color))
         out.append(f"  Title     : {s.title}")
+        if s.is_subagent and s.parent_id:
+            p_lbl = f"{s.parent_id[:8]} ({s.parent_title})" if s.parent_title else s.parent_id[:8]
+            out.append(f"  Parent    : {p_lbl}")
         out.append(f"  Workspace : {s.workspace}")
         out.append(f"  Range     : {_fmt_time_sec(s.first_time)} -> {_fmt_time_sec(s.last_time)}")
+        out.append(
+            f"  Est. Cost : {_fmt_cost(s.counts.cost, s.counts.calls, human)}"
+            f" (Cache Saved: {_fmt_usd(s.counts.cost.cache_saved_usd, human)})"
+        )
         if compactions or miss_cnt:
             parts = []
             if compactions:
@@ -1027,8 +1580,8 @@ def render_text(
         if include_cw:
             t_headers.append("CacheWrite")
             t_aligns.append("right")
-        t_headers.extend(["Output", "CtxSize", "Hit%"])
-        t_aligns.extend(["right", "right", "right"])
+        t_headers.extend(["Output", "CtxSize", "Cost($)", "Hit%"])
+        t_aligns.extend(["right", "right", "right", "right"])
         t_rows = []
         prev_ts: dt.datetime | None = None
         for t in s.turns:
@@ -1058,6 +1611,7 @@ def render_text(
                 [
                     _fmt_num(t.output_tokens, human),
                     _fmt_num(t.total_input_tokens, human),
+                    _fmt_cost(t.cost, 1, human),
                     _fmt_pct(t.cache_hit_rate),
                 ]
             )
@@ -1130,8 +1684,8 @@ def render_text(
     if show_workspace:
         out.append("")
         out.append(_style("By Workspace", "1;33", color))
-        headers = ["Workspace", "Sessions", "Calls", "Input(new)", "CacheRead", "Output", "Total", "Hit%"]
-        aligns = ["left", "right", "right", "right", "right", "right", "right", "right"]
+        headers = ["Workspace", "Sessions", "Calls", "Input(new)", "CacheRead", "Output", "Total", "Cost($)", "Hit%"]
+        aligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"]
         items = sorted(
             agg["by_workspace"].items(),
             key=lambda kv: kv[1].total_tokens,
@@ -1146,39 +1700,68 @@ def render_text(
                 _fmt_num(c.cache_read_tokens, human),
                 _fmt_num(c.output_tokens, human),
                 _fmt_num(c.total_tokens, human),
+                _fmt_cost(c.cost, c.calls, human),
                 _fmt_pct(c.cache_hit_rate),
             ]
             for ws, c in items
         ]
-        out.append(_render_table(headers, rows, aligns, max_widths=[44, None, None, None, None, None, None, None]))
+        out.append(_render_table(headers, rows, aligns, max_widths=[44, None, None, None, None, None, None, None, None]))
 
     if show_sessions:
-        ordered = _sort_sessions(report.sessions, sort_by)
-        total_cnt = len(ordered)
-        shown = ordered if (view == "session" or limit <= 0) else ordered[:limit]
+        should_group = (not show_subagents) and (not model_filter) and (not session_filter)
+        grouped = _group_sessions_for_display(report.sessions, group_subagents=should_group)
+        min_dt = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        if sort_by == "cost":
+            grouped.sort(key=lambda r: (r[1].total_cost_usd, r[1].total_tokens), reverse=True)
+        elif sort_by == "total":
+            grouped.sort(key=lambda r: r[1].total_tokens, reverse=True)
+        elif sort_by == "non-cached":
+            grouped.sort(key=lambda r: r[1].non_cached_tokens, reverse=True)
+        elif sort_by == "hit":
+            grouped.sort(key=lambda r: (r[1].calls <= 1, r[1].cache_hit_rate, -r[1].total_tokens))
+        elif sort_by == "output":
+            grouped.sort(key=lambda r: r[1].output_tokens, reverse=True)
+        elif sort_by == "input":
+            grouped.sort(key=lambda r: r[1].input_tokens, reverse=True)
+        elif sort_by == "calls":
+            grouped.sort(key=lambda r: r[1].calls, reverse=True)
+        elif sort_by == "peak":
+            grouped.sort(key=lambda r: r[1].peak_context, reverse=True)
+        else:
+            grouped.sort(key=lambda r: r[2] or min_dt, reverse=True)
+
+        total_cnt = len(grouped)
+        shown = grouped if (view == "session" or limit <= 0) else grouped[:limit]
         out.append("")
         title_suffix = f" (showing {len(shown)}/{total_cnt}, sort={sort_by})" if len(shown) < total_cnt else f" ({total_cnt}, sort={sort_by})"
         out.append(_style(f"Sessions{title_suffix}", "1;33", color))
-        s_headers = ["ID", "Last Active", "Calls", "Model", "Hit%", "Input(new)", "CacheRead", "Output", "Total", "PeakCtx", "Title"]
-        s_aligns = ["left", "left", "right", "left", "right", "right", "right", "right", "right", "right", "left"]
+        s_headers = ["ID", "Last Active", "Calls", "Model", "Hit%", "Input(new)", "CacheRead", "Output", "Total", "Cost($)", "PeakCtx", "Title"]
+        s_aligns = ["left", "left", "right", "left", "right", "right", "right", "right", "right", "right", "right", "left"]
         s_rows = []
-        for s in shown:
-            real_models = [m for m in sorted(s.models) if m != "compaction"]
-            primary = _primary_model(s)
+        for s, counts, last_time, models, primary, sub_count in shown:
+            real_models = [m for m in sorted(models) if m != "compaction"]
             models_str = primary if len(real_models) <= 1 else f"{primary}+{len(real_models)-1}"
+            if sub_count > 0:
+                suffix = f" (+{sub_count} sub)"
+                title_cell = _truncate_display(s.title, max(8, 42 - _display_width(suffix))) + suffix
+            elif s.is_subagent:
+                title_cell = f"↳ {s.title}"
+            else:
+                title_cell = s.title
             s_rows.append(
                 [
                     s.conversation_id[:8],
-                    _fmt_time(s.last_time),
-                    str(s.counts.calls),
+                    _fmt_time(last_time),
+                    str(counts.calls),
                     models_str,
-                    _fmt_pct(s.counts.cache_hit_rate),
-                    _fmt_num(s.counts.input_tokens, human),
-                    _fmt_num(s.counts.cache_read_tokens, human),
-                    _fmt_num(s.counts.output_tokens, human),
-                    _fmt_num(s.counts.total_tokens, human),
-                    _fmt_num(s.counts.peak_context, human),
-                    s.title,
+                    _fmt_pct(counts.cache_hit_rate),
+                    _fmt_num(counts.input_tokens, human),
+                    _fmt_num(counts.cache_read_tokens, human),
+                    _fmt_num(counts.output_tokens, human),
+                    _fmt_num(counts.total_tokens, human),
+                    _fmt_cost(counts.cost, counts.calls, human),
+                    _fmt_num(counts.peak_context, human),
+                    title_cell,
                 ]
             )
         out.append(
@@ -1186,7 +1769,7 @@ def render_text(
                 s_headers,
                 s_rows,
                 s_aligns,
-                max_widths=[8, 16, None, 22, None, None, None, None, None, None, 34],
+                max_widths=[8, 16, None, None, None, None, None, None, None, None, None, 42],
             )
         )
 
@@ -1208,6 +1791,9 @@ def render_json(
             "conversation_id": s.conversation_id,
             "title": s.title,
             "workspace": s.workspace,
+            "is_subagent": s.is_subagent,
+            "parent_id": s.parent_id,
+            "parent_title": s.parent_title or None,
             "models": sorted(s.models),
             "first_time": s.first_time.isoformat() if s.first_time else None,
             "last_time": s.last_time.isoformat() if s.last_time else None,
@@ -1228,6 +1814,7 @@ def render_json(
                     "output_tokens": t.output_tokens,
                     "total_tokens": t.total_tokens,
                     "cache_hit_rate_pct": round(t.cache_hit_rate, 2),
+                    "cost_usd": round(t.cost.total_usd, 6),
                 }
                 for t in s.turns
             ]
@@ -1265,9 +1852,9 @@ def render_csv(report: ScanReport, agg: dict[str, Any], *, view: str, sort_by: s
     writer = csv.writer(buf, lineterminator="\n")
 
     if view == "model":
-        writer.writerow(["model", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context"])
+        writer.writerow(["model", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
         for k, c in sorted(agg["by_model"].items(), key=lambda kv: kv[1].total_tokens, reverse=True):
-            writer.writerow([k, c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context])
+            writer.writerow([k, c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
     elif view in ("daily", "weekly", "monthly", "hourly"):
         if view == "daily":
             source, key_col = agg["by_day"], "date"
@@ -1281,15 +1868,15 @@ def render_csv(report: ScanReport, agg: dict[str, Any], *, view: str, sort_by: s
         else:
             source, key_col = agg["by_hour"], "hour"
             items = [(f"{h:02d}:00", c) for h, c in sorted(source.items()) if c.calls > 0]
-        writer.writerow([key_col, "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context"])
+        writer.writerow([key_col, "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
         for k, c in items:
-            writer.writerow([k, c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context])
+            writer.writerow([k, c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
     elif view == "workspace":
-        writer.writerow(["workspace", "sessions", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context"])
+        writer.writerow(["workspace", "sessions", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
         for k, c in sorted(agg["by_workspace"].items(), key=lambda kv: kv[1].total_tokens, reverse=True):
-            writer.writerow([k, agg["workspace_sessions"][k], c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context])
+            writer.writerow([k, agg["workspace_sessions"][k], c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
     else:
-        writer.writerow(["conversation_id", "first_time", "last_time", "models", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "workspace", "title"])
+        writer.writerow(["conversation_id", "first_time", "last_time", "models", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd", "workspace", "title"])
         for s in _sort_sessions(report.sessions, sort_by):
             c = s.counts
             writer.writerow([
@@ -1307,6 +1894,8 @@ def render_csv(report: ScanReport, agg: dict[str, Any], *, view: str, sort_by: s
                 c.non_cached_tokens,
                 round(c.cache_hit_rate, 2),
                 c.peak_context,
+                round(c.cost.total_usd, 6),
+                round(c.cost.cache_saved_usd, 6),
                 s.workspace,
                 s.title,
             ])
@@ -1321,6 +1910,47 @@ def _parse_date_arg(value: str) -> dt.date:
         return dt.date.fromisoformat(value.strip())
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"Invalid date '{value}', expected YYYY-MM-DD.") from exc
+
+
+def _fmt_rate_cell(v: float) -> str:
+    s = f"{round(v, 4):.4f}".rstrip("0").rstrip(".")
+    if "." in s:
+        dec = len(s.split(".", 1)[1])
+        return f"${v:.2f}" if dec < 2 else f"${s}"
+    return f"${v:.2f}"
+
+
+def render_pricing_table(
+    pricing: PricingCatalog,
+    observed_models: Sequence[str],
+    date_obj: dt.date,
+    color: bool,
+) -> str:
+    rows_data = pricing.build_table(observed_models, date_obj)
+    out = [_style("API Pricing Table (USD / 1M tokens)", "1;33", color)]
+    if pricing.override_path is not None:
+        exists = pricing.override_path.is_file() and not pricing.override_path.is_symlink()
+        out.append(f"Override : {pricing.override_path} ({'loaded' if exists else 'not created yet'})")
+    out.append("")
+    headers = ["Model / Rule", "Source", "Matched", "Input", "CacheRead", "CacheWrite", "Output"]
+    aligns = ["left", "left", "left", "right", "right", "right", "right"]
+    t_rows = []
+    for item in rows_data:
+        r: ModelRate | None = item["rate"]
+        if r is not None:
+            t_rows.append([
+                item["model"],
+                item["source"],
+                item["rule"],
+                _fmt_rate_cell(r.input),
+                _fmt_rate_cell(r.cache_read),
+                _fmt_rate_cell(r.cache_write),
+                _fmt_rate_cell(r.output),
+            ])
+        else:
+            t_rows.append([item["model"], item["source"], item["rule"], "-", "-", "-", "-"])
+    out.append(_render_table(headers, t_rows, aligns))
+    return "\n".join(out)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1346,7 +1976,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--view",
-        choices=("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace"),
+        choices=("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace", "pricing"),
         default="summary",
         help="Report sections to display (default: summary)",
     )
@@ -1403,8 +2033,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Case-insensitive substring filter on workspace path (e.g. agent-home)",
     )
     parser.add_argument(
+        "--pricing",
+        type=pathlib.Path,
+        default=DEFAULT_PRICING_PATH,
+        help=f"Optional local pricing.json override (read-only; default: {DEFAULT_PRICING_PATH})",
+    )
+    parser.add_argument(
         "--sort",
-        choices=("time", "total", "non-cached", "hit", "output", "input", "calls", "peak"),
+        choices=("time", "cost", "total", "non-cached", "hit", "output", "input", "calls", "peak"),
         default="time",
         help="Session sort order (default: time)",
     )
@@ -1418,6 +2054,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--human",
         action="store_true",
         help="Format large token numbers with K/M/B suffixes",
+    )
+    parser.add_argument(
+        "--show-subagents",
+        action="store_true",
+        help="List internal subagent sessions individually instead of grouping under their parent session",
     )
     parser.add_argument(
         "--no-color",
@@ -1457,6 +2098,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if since and until and since > until:
         parser.error(f"--since ({since}) cannot be after --until ({until}).")
 
+    pricing_path = args.pricing.expanduser() if args.pricing else None
     report = scan_usage(
         data_dir=args.data_dir.expanduser(),
         tz=tz,
@@ -1465,8 +2107,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_filter=args.model,
         session_filter=args.session,
         workspace_filter=args.workspace,
+        pricing_path=pricing_path,
     )
     agg = _aggregate(report.sessions)
+
+    if args.view == "pricing" and args.format == "table":
+        observed = [
+            k
+            for k, _ in sorted(
+                ((k, v) for k, v in agg["by_model"].items() if k not in ("compaction", "unknown")),
+                key=lambda kv: kv[1].total_tokens,
+                reverse=True,
+            )
+        ]
+        print(render_pricing_table(PricingCatalog(pricing_path), observed, today, _use_color(args.no_color)))
+        return 0
 
     if args.format == "json":
         include_turns = bool(args.session)
@@ -1496,6 +2151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model_filter=args.model,
                 session_filter=args.session,
                 color=_use_color(args.no_color),
+                show_subagents=args.show_subagents,
             )
         )
 

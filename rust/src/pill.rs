@@ -23,11 +23,13 @@ use crate::d2d::{
     linear_v_brush, load_color, rect_f, rgba, stroke_round_rect, theme_for, with_alpha,
     D2DFactories, Fonts, LayeredSurface, Theme,
 };
+use crate::pricing::fmt_cost_compact;
 use crate::stats::{fmt_compact, ScanSnapshot, TokenCounts};
 use crate::telemetry::{
     clamp_pos_to_work_area, get_monitors, get_work_area, monitor_index_for_point, to_wide_null,
     wide_pcwstr, SystemTelemetry, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX,
-    PILL_ITEM_CACHE_HIT, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
+    PILL_ITEM_CACHE_HIT, PILL_ITEM_COST, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED, PILL_ITEM_RAM,
+    PILL_ITEM_TOTAL,
 };
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
@@ -38,7 +40,7 @@ pub const CMD_TOGGLE_HUMAN: u32 = 1006;
 pub const CMD_REDOCK: u32 = 1007;
 pub const CMD_QUIT: u32 = 1008;
 pub const CMD_MONITOR_BASE: u32 = 1100;
-pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1205 -> bit 0..5
+pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1206 -> bit 0..6
 pub const CMD_PILL_ITEMS_RESET: u32 = 1210;
 
 const SHADOW_PAD: f32 = 10.0;
@@ -125,7 +127,7 @@ impl PillRenderer {
             .copied()
             .unwrap_or_default();
 
-        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(4);
+        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(5);
         let mut ctx_warn = false;
 
         if (items & PILL_ITEM_TOTAL) != 0 {
@@ -136,6 +138,12 @@ impl PillRenderer {
                 width,
                 color: theme.text,
             });
+        }
+        if (items & PILL_ITEM_COST) != 0 {
+            let text = fmt_cost_compact(&today_c.cost, today_c.calls);
+            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(24.0) + 2.0;
+            let color = if segs.is_empty() { theme.text } else { theme.output };
+            segs.push(PillTokenSeg { text, width, color });
         }
         if (items & PILL_ITEM_NON_CACHED) != 0 {
             let text = format!("Δ{}", fmt_compact(today_c.non_cached_tokens()));
@@ -461,6 +469,7 @@ pub fn show_context_menu(
         if let Ok(im) = CreatePopupMenu() {
             for (bit_idx, bit, lbl) in [
                 (0usize, PILL_ITEM_TOTAL, w!("今日总 Token")),
+                (6usize, PILL_ITEM_COST, w!("今日估算费用 ($)")),
                 (1usize, PILL_ITEM_NON_CACHED, w!("今日非缓存增量 (Δ)")),
                 (2usize, PILL_ITEM_CACHE_HIT, w!("今日缓存命中率 (%)")),
                 (3usize, PILL_ITEM_ACTIVE_CTX, w!("活跃会话上下文 (Ctx)")),

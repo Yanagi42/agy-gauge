@@ -12,6 +12,7 @@
 mod d2d;
 mod dashboard;
 mod pill;
+mod pricing;
 mod stats;
 mod telemetry;
 
@@ -20,25 +21,35 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, UpdateWindow, HDC, PAINTSTRUCT};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint,
+    InvalidateRect, SetBkColor, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, FF_MODERN, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_UP,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+    TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_RETURN, VK_SHIFT, VK_TAB,
+    VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
-    GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW, LoadImageW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, HWND_NOTOPMOST, HWND_TOPMOST,
-    IDC_ARROW, IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW,
+    LoadImageW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HICON, HMENU, HWND_NOTOPMOST,
+    HWND_TOPMOST, IDC_ARROW, IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR, MINMAXINFO, MSG,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNOACTIVATE, WINDOWPOS, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WM_SETCURSOR, WM_SETFONT, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 const WM_SETTINGCHANGE: u32 = 0x001A;
@@ -49,25 +60,294 @@ const SC_MINIMIZE: usize = 0xF020;
 const SIZE_MINIMIZED: usize = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
+const EM_SETSEL: u32 = 0x00B1;
+const EN_SETFOCUS: u16 = 0x0100;
+const EN_KILLFOCUS: u16 = 0x0200;
+const IDC_PRICING_EDIT_BASE: usize = 5000;
 
 use d2d::{theme_for, D2DFactories, Fonts};
-use dashboard::{BreakdownMode, ClickAction, DashboardView, Tab, WeeklyMode};
+use dashboard::{BreakdownMode, ClickAction, DashboardView, ModelViewMode, Tab, WeeklyMode};
 use pill::{
     show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_PILL_ITEMS_RESET,
     CMD_PILL_ITEM_BASE, CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT,
     CMD_TOGGLE_TOPMOST,
 };
+use pricing::ModelRate;
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
 use telemetry::{
-    apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors, clamp_pos_to_work_area,
-    enable_dpi_awareness, get_work_area, load_user_prefs, monitor_index_for_point,
-    read_self_private_mb, read_self_working_set_mb, save_user_prefs, trim_self_working_set,
-    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, UserPrefs, PILL_ITEMS_ALL_MASK,
-    PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM, PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS,
+    apply_pill_topmost, apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors,
+    clamp_pos_to_work_area, enable_dpi_awareness, get_work_area, guard_topmost_windowpos,
+    inspect_pill_topmost_health, load_user_prefs, monitor_index_for_point, read_self_private_mb,
+    read_self_working_set_mb, save_user_prefs, to_wide_null, trim_self_working_set, wide_pcwstr,
+    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, TopmostHealth, UserPrefs,
+    PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
+    WM_APP_SYNC_PREFS,
 };
 
 const TIMER_TELEMETRY: usize = 1;
 const TIMER_TOKENS: usize = 2;
+
+struct PricingEditControls {
+    edits: [HWND; 5],
+    font: HFONT,
+    font_dpi: i32,
+    bg_brush: HBRUSH,
+    brush_light: bool,
+    visible: bool,
+    initialized_values: bool,
+    last_rects_px: [(i32, i32, i32, i32); 5],
+}
+
+impl Default for PricingEditControls {
+    fn default() -> Self {
+        Self {
+            edits: [HWND::default(); 5],
+            font: HFONT::default(),
+            font_dpi: 0,
+            bg_brush: HBRUSH::default(),
+            brush_light: false,
+            visible: false,
+            initialized_values: false,
+            last_rects_px: [(0, 0, 0, 0); 5],
+        }
+    }
+}
+
+impl Drop for PricingEditControls {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+            if !self.bg_brush.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.bg_brush.0));
+            }
+        }
+    }
+}
+
+impl PricingEditControls {
+    fn input_colors(light: bool) -> (COLORREF, COLORREF) {
+        if light {
+            // bg #F6F4F1, text #1A1A1C (COLORREF is 0x00BBGGRR)
+            (COLORREF(0x00F1F4F6), COLORREF(0x001C1A1A))
+        } else {
+            // bg #141416, text #EDEDEF
+            (COLORREF(0x00161414), COLORREF(0x00EFEDED))
+        }
+    }
+
+    fn ensure_brush(&mut self, light: bool) {
+        if !self.bg_brush.0.is_null() && self.brush_light == light {
+            return;
+        }
+        unsafe {
+            if !self.bg_brush.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.bg_brush.0));
+            }
+            let (bg, _) = Self::input_colors(light);
+            self.bg_brush = CreateSolidBrush(bg);
+            self.brush_light = light;
+            for h in self.edits {
+                if !h.0.is_null() {
+                    let _ = InvalidateRect(h, None, true);
+                }
+            }
+        }
+    }
+
+    fn ensure_font(&mut self, dpi: f32) {
+        let dpi_i = dpi.round() as i32;
+        if !self.font.0.is_null() && self.font_dpi == dpi_i {
+            return;
+        }
+        unsafe {
+            if !self.font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+            let height = -((13.5 * dpi / 96.0).round() as i32).max(11);
+            self.font = CreateFontW(
+                height,
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                CLEARTYPE_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_MODERN.0) as u32,
+                w!("Consolas"),
+            );
+            self.font_dpi = dpi_i;
+            for h in self.edits {
+                if !h.0.is_null() {
+                    let _ = SendMessageW(h, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(1));
+                }
+            }
+        }
+    }
+
+    fn ensure_created(&mut self, parent: HWND, dpi: f32, light: bool) {
+        self.ensure_brush(light);
+        self.ensure_font(dpi);
+        if !self.edits[0].0.is_null() {
+            return;
+        }
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap_or_default();
+            for i in 0..5 {
+                let style = WS_CHILD | WS_TABSTOP | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(ES_AUTOHSCROLL as u32);
+                if let Ok(h) = CreateWindowExW(
+                    Default::default(),
+                    w!("EDIT"),
+                    w!(""),
+                    style,
+                    0,
+                    0,
+                    10,
+                    10,
+                    parent,
+                    HMENU((IDC_PRICING_EDIT_BASE + i) as *mut core::ffi::c_void),
+                    hinst,
+                    None,
+                ) {
+                    if !self.font.0.is_null() {
+                        let _ = SendMessageW(h, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(0));
+                    }
+                    self.edits[i] = h;
+                }
+            }
+            let _ = WS_VISIBLE;
+        }
+    }
+
+    fn sync_layout(
+        &mut self,
+        parent: HWND,
+        dpi: f32,
+        light: bool,
+        rects_dip: Option<[D2D_RECT_F; 5]>,
+    ) {
+        let Some(rects) = rects_dip else {
+            self.hide_all(parent);
+            return;
+        };
+        self.ensure_created(parent, dpi, light);
+        let scale = dpi / 96.0;
+        for (i, r) in rects.iter().enumerate() {
+            let h = self.edits[i];
+            if h.0.is_null() {
+                continue;
+            }
+            let x = (r.left * scale).round() as i32;
+            let y = (r.top * scale).round() as i32;
+            let w = ((r.right - r.left) * scale).round().max(12.0) as i32;
+            let hh = ((r.bottom - r.top) * scale).round().max(12.0) as i32;
+            let tuple = (x, y, w, hh);
+            if !self.visible || self.last_rects_px[i] != tuple {
+                unsafe {
+                    let _ = MoveWindow(h, x, y, w, hh, true);
+                }
+                self.last_rects_px[i] = tuple;
+            }
+            if !self.visible {
+                unsafe {
+                    let _ = ShowWindow(h, SW_SHOW);
+                }
+            }
+        }
+        self.visible = true;
+    }
+
+    fn hide_all(&mut self, parent: HWND) {
+        if !self.visible {
+            return;
+        }
+        unsafe {
+            let foc = GetFocus();
+            let had_focus = self.index_of(foc).is_some();
+            for h in self.edits {
+                if !h.0.is_null() {
+                    let _ = ShowWindow(h, SW_HIDE);
+                }
+            }
+            if had_focus && !parent.0.is_null() {
+                let _ = SetFocus(parent);
+            }
+        }
+        self.visible = false;
+    }
+
+    fn reset_handles(&mut self) {
+        self.edits = [HWND::default(); 5];
+        self.visible = false;
+        self.initialized_values = false;
+        self.last_rects_px = [(0, 0, 0, 0); 5];
+    }
+
+    fn set_values(&mut self, vals: &[String; 5]) {
+        for (i, v) in vals.iter().enumerate() {
+            let h = self.edits[i];
+            if !h.0.is_null() {
+                let wide = to_wide_null(v);
+                unsafe {
+                    let _ = SetWindowTextW(h, wide_pcwstr(&wide));
+                }
+            }
+        }
+        self.initialized_values = true;
+    }
+
+    fn read_values(&self) -> [String; 5] {
+        std::array::from_fn(|i| {
+            let h = self.edits[i];
+            if h.0.is_null() {
+                return String::new();
+            }
+            unsafe {
+                let len = GetWindowTextLengthW(h);
+                if len <= 0 {
+                    return String::new();
+                }
+                let mut buf = vec![0u16; (len + 1) as usize];
+                let got = GetWindowTextW(h, &mut buf);
+                String::from_utf16_lossy(&buf[..got as usize])
+            }
+        })
+    }
+
+    fn focus_field(&self, idx: usize) {
+        if let Some(&h) = self.edits.get(idx) {
+            if !h.0.is_null() {
+                unsafe {
+                    let _ = SetFocus(h);
+                    let _ = SendMessageW(h, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                }
+            }
+        }
+    }
+
+    fn index_of(&self, hwnd: HWND) -> Option<usize> {
+        if hwnd.0.is_null() {
+            return None;
+        }
+        self.edits.iter().position(|&h| h == hwnd)
+    }
+
+    fn handle_ctlcolor(&mut self, hdc: HDC, light: bool) -> LRESULT {
+        self.ensure_brush(light);
+        let (bg, fg) = Self::input_colors(light);
+        unsafe {
+            SetTextColor(hdc, fg);
+            SetBkColor(hdc, bg);
+        }
+        LRESULT(self.bg_brush.0 as isize)
+    }
+}
 
 struct AppState {
     factories: D2DFactories,
@@ -86,9 +366,13 @@ struct AppState {
     drag_start_win: (i32, i32),
     pill_hovered: bool,
     pill_tracking: bool,
+    pill_menu_open: bool,
+    topmost_unyielding_blocker: Option<isize>,
     light_theme: bool,
     topmost: bool,
     human: bool,
+    cost_mode: bool,
+    group_subagents: bool,
     fresh_only: bool,
     date_scope: DateScope,
     pill_items: u32,
@@ -99,6 +383,7 @@ struct AppState {
     dash_owner_hwnd: Option<HWND>,
     dash_hwnd: Option<HWND>,
     dash_view: Option<DashboardView>,
+    pricing_edits: PricingEditControls,
     dash_visible: bool,
     dash_tracking: bool,
     dash_monitor_index: usize,
@@ -194,6 +479,7 @@ fn open_or_focus_dashboard_safe() {
             let _ = UpdateWindow(hwnd);
         }
         with_app(|app| app.redraw_pill());
+        ensure_pill_topmost_if_needed(false);
         return;
     }
 
@@ -222,6 +508,7 @@ fn create_dashboard_window_local() {
             let _ = UpdateWindow(hwnd);
         }
         with_app(|app| app.redraw_pill());
+        ensure_pill_topmost_if_needed(false);
         return;
     }
 
@@ -262,7 +549,7 @@ fn create_dashboard_window_local() {
             Default::default(),
             w!("AgyTokenDashboardClass"),
             w!("AGY 用量统计"),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             wx,
             wy,
             ww,
@@ -276,7 +563,12 @@ fn create_dashboard_window_local() {
             apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
             with_app(|app| {
                 app.dash_hwnd = Some(hwnd);
-                app.dash_view = Some(DashboardView::new(app.fresh_only, app.date_scope));
+                app.dash_view = Some(DashboardView::new(
+                    app.fresh_only,
+                    app.date_scope,
+                    app.cost_mode,
+                    app.group_subagents,
+                ));
                 app.dash_visible = true;
                 app.dash_monitor_index = mon_idx;
             });
@@ -285,6 +577,7 @@ fn create_dashboard_window_local() {
             let _ = InvalidateRect(hwnd, None, false);
             let _ = UpdateWindow(hwnd);
             with_app(|app| app.redraw_pill());
+            ensure_pill_topmost_if_needed(false);
         }
     }
 }
@@ -292,8 +585,12 @@ fn create_dashboard_window_local() {
 fn hide_dashboard_safe() {
     let (hwnd, dash_only) = with_app(|app| {
         app.dash_visible = false;
+        if let Some(dh) = app.dash_hwnd {
+            app.pricing_edits.hide_all(dh);
+        }
         if let Some(view) = &mut app.dash_view {
             view.mouse_dip = None;
+            view.pricing_focused_field = None;
             // Genuinely free the large offscreen DIB + D2D DCRenderTarget while hidden
             view.invalidate_surface();
         }
@@ -314,19 +611,7 @@ fn hide_dashboard_safe() {
             (app.pill_hwnd, app.topmost)
         });
         if let Some((ph, true)) = pill_top {
-            if !ph.0.is_null() {
-                unsafe {
-                    let _ = SetWindowPos(
-                        ph,
-                        HWND_TOPMOST,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
-            }
+            apply_pill_topmost(ph, true, false);
         }
         trim_self_working_set();
     }
@@ -336,6 +621,7 @@ fn destroy_dashboard_safe() {
     let (hwnd, owner_hwnd, dash_only) = with_app(|app| {
         app.dash_visible = false;
         app.dash_view = None;
+        app.pricing_edits.reset_handles();
         (app.dash_hwnd.take(), app.dash_owner_hwnd.take(), app.dashboard_only)
     })
     .unwrap_or((None, None, false));
@@ -367,22 +653,68 @@ fn destroy_dashboard_safe() {
 fn set_pill_topmost_safe(top: bool, persist: bool) {
     let hwnd = with_app(|app| {
         app.topmost = top;
+        app.topmost_unyielding_blocker = None;
         if persist {
             app.persist_and_sync(app.pill_hwnd);
         }
         app.pill_hwnd
     });
     if let Some(h) = hwnd {
-        unsafe {
-            let _ = SetWindowPos(
-                h,
-                if top { HWND_TOPMOST } else { HWND_NOTOPMOST },
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+        // Use hard_reset when explicitly enabling topmost so any ghost-topmost Z-order desync is broken.
+        apply_pill_topmost(h, top, top);
+    }
+}
+
+fn ensure_pill_topmost_if_needed(force_raise: bool) {
+    let info = with_app(|app| {
+        if app.dashboard_only || !app.topmost || app.pill_menu_open || app.drag_down {
+            None
+        } else {
+            Some((app.pill_hwnd, app.topmost_unyielding_blocker))
+        }
+    })
+    .flatten();
+    let Some((hwnd, unyielding)) = info else {
+        return;
+    };
+    if hwnd.0.is_null() {
+        return;
+    }
+    let health = inspect_pill_topmost_health(hwnd);
+    match health {
+        TopmostHealth::Healthy => {
+            if unyielding.is_some() {
+                with_app(|app| app.topmost_unyielding_blocker = None);
+            }
+            if force_raise {
+                apply_pill_topmost(hwnd, true, false);
+            }
+        }
+        TopmostHealth::NeedHardReset(blocker) => {
+            if !force_raise && blocker != 0 && unyielding == Some(blocker) {
+                return;
+            }
+            apply_pill_topmost(hwnd, true, true);
+            // Verify recovery: if the exact same elevated/exclusive-fullscreen window still sits above,
+            // pause retries for that blocker until it leaves or foreground changes.
+            let after = inspect_pill_topmost_health(hwnd);
+            let still_blocked = match after {
+                TopmostHealth::NeedHardReset(b) | TopmostHealth::NeedRaise(b) if b != 0 && b == blocker => Some(b),
+                _ => None,
+            };
+            with_app(|app| app.topmost_unyielding_blocker = still_blocked);
+        }
+        TopmostHealth::NeedRaise(blocker) => {
+            if !force_raise && blocker != 0 && unyielding == Some(blocker) {
+                return;
+            }
+            apply_pill_topmost(hwnd, true, false);
+            let after = inspect_pill_topmost_health(hwnd);
+            let still_blocked = match after {
+                TopmostHealth::NeedRaise(b) | TopmostHealth::NeedHardReset(b) if b != 0 && b == blocker => Some(b),
+                _ => None,
+            };
+            with_app(|app| app.topmost_unyielding_blocker = still_blocked);
         }
     }
 }
@@ -394,6 +726,12 @@ impl AppState {
             mini: (self.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0,
             topmost: self.topmost,
             human: self.human,
+            cost_mode: self.dash_view.as_ref().map(|v| v.cost_mode).unwrap_or(self.cost_mode),
+            group_subagents: self
+                .dash_view
+                .as_ref()
+                .map(|v| v.group_subagents)
+                .unwrap_or(self.group_subagents),
             monitor_index: self.monitor_index,
             fresh_only: self.dash_view.as_ref().map(|v| v.fresh_only).unwrap_or(self.fresh_only),
             date_scope: self.dash_view.as_ref().map(|v| v.scope).unwrap_or(self.date_scope).to_u8(),
@@ -405,6 +743,8 @@ impl AppState {
 
     fn persist_and_sync(&mut self, sender: HWND) {
         let p = self.to_prefs();
+        self.cost_mode = p.cost_mode;
+        self.group_subagents = p.group_subagents;
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
         self.pill_items = p.pill_items;
@@ -416,12 +756,16 @@ impl AppState {
         self.light_theme = p.light_theme;
         self.topmost = p.topmost;
         self.human = p.human;
+        self.cost_mode = p.cost_mode;
+        self.group_subagents = p.group_subagents;
         self.monitor_index = p.monitor_index;
         self.fresh_only = p.fresh_only;
         self.date_scope = DateScope::from_u8(p.date_scope);
         self.pill_items = p.pill_items;
         self.custom_pos = p.custom_pos;
         if let Some(view) = &mut self.dash_view {
+            view.cost_mode = p.cost_mode;
+            view.group_subagents = p.group_subagents;
             view.fresh_only = p.fresh_only;
             if view.scope != self.date_scope {
                 view.scope = self.date_scope;
@@ -471,6 +815,7 @@ impl AppState {
     fn refresh_tokens(&mut self, force: bool) {
         let fresh = self.scanner.scan();
         let changed = force
+            || fresh.pricing_changed
             || fresh.files_reparsed > 0
             || fresh.sessions.len() != self.snapshot.sessions.len();
         self.snapshot = fresh;
@@ -487,11 +832,227 @@ impl AppState {
             self.invalidate_dashboard();
         }
     }
+
+    fn load_pricing_row_into_editor(&mut self, idx: usize, focus_price: bool) {
+        let Some(row) = self.snapshot.pricing_rows.get(idx).cloned() else {
+            return;
+        };
+        let fields = DashboardView::format_row_fields(&row);
+        if let Some(dh) = self.dash_hwnd {
+            let dpi = window_dpi_scale(dh) * 96.0;
+            self.pricing_edits.ensure_created(dh, dpi, self.light_theme);
+        }
+        self.pricing_edits.set_values(&fields);
+        if let Some(view) = &mut self.dash_view {
+            view.pricing_selected_model = Some(row.model.clone());
+            view.pricing_editing_custom_key = row.custom_key.clone();
+        }
+        if focus_price {
+            self.pricing_edits.focus_field(1);
+        }
+    }
+
+    fn clear_pricing_editor_for_new(&mut self) {
+        if let Some(dh) = self.dash_hwnd {
+            let dpi = window_dpi_scale(dh) * 96.0;
+            self.pricing_edits.ensure_created(dh, dpi, self.light_theme);
+        }
+        self.pricing_edits
+            .set_values(&[String::new(), String::new(), "0.00".into(), String::new(), String::new()]);
+        if let Some(view) = &mut self.dash_view {
+            view.pricing_selected_model = None;
+            view.pricing_editing_custom_key = None;
+            view.set_pricing_status("输入模型名（或前缀）与单价，按 Enter 或点保存生效", false);
+        }
+        self.pricing_edits.focus_field(0);
+    }
+
+    fn save_pricing_from_editor(&mut self) {
+        let vals = self.pricing_edits.read_values();
+        let model = vals[0].trim().to_string();
+        if model.is_empty() {
+            if let Some(view) = &mut self.dash_view {
+                view.set_pricing_status("请输入模型名或前缀（如 gemini-4-neon）", true);
+            }
+            self.pricing_edits.focus_field(0);
+            self.invalidate_dashboard();
+            return;
+        }
+        let parse_price = |raw: &str| -> std::result::Result<f64, ()> {
+            let cleaned = raw.trim().trim_start_matches('$').trim();
+            let v: f64 = cleaned.parse().map_err(|_| ())?;
+            if v.is_finite() && v >= 0.0 {
+                Ok(v)
+            } else {
+                Err(())
+            }
+        };
+        let Ok(input) = parse_price(&vals[1]) else {
+            if let Some(view) = &mut self.dash_view {
+                view.set_pricing_status("「输入 $/1M」格式无效，请输入非负数字", true);
+            }
+            self.pricing_edits.focus_field(1);
+            self.invalidate_dashboard();
+            return;
+        };
+        let cache_read = if vals[2].trim().is_empty() {
+            0.0
+        } else {
+            match parse_price(&vals[2]) {
+                Ok(v) => v,
+                Err(_) => {
+                    if let Some(view) = &mut self.dash_view {
+                        view.set_pricing_status("「缓存读 $/1M」格式无效，请输入非负数字", true);
+                    }
+                    self.pricing_edits.focus_field(2);
+                    self.invalidate_dashboard();
+                    return;
+                }
+            }
+        };
+        let cache_write = if vals[3].trim().is_empty() {
+            input
+        } else {
+            match parse_price(&vals[3]) {
+                Ok(v) => v,
+                Err(_) => {
+                    if let Some(view) = &mut self.dash_view {
+                        view.set_pricing_status("「缓存写 $/1M」格式无效，请输入非负数字或留空", true);
+                    }
+                    self.pricing_edits.focus_field(3);
+                    self.invalidate_dashboard();
+                    return;
+                }
+            }
+        };
+        let Ok(output) = parse_price(&vals[4]) else {
+            if let Some(view) = &mut self.dash_view {
+                view.set_pricing_status("「输出 $/1M」格式无效，请输入非负数字", true);
+            }
+            self.pricing_edits.focus_field(4);
+            self.invalidate_dashboard();
+            return;
+        };
+
+        let rate = ModelRate::new(input, cache_read, cache_write, output);
+        match self.scanner.upsert_pricing_rule(&model, rate) {
+            Ok(()) => {
+                self.refresh_tokens(true);
+                let matched_idx = self
+                    .snapshot
+                    .pricing_rows
+                    .iter()
+                    .position(|r| r.model.eq_ignore_ascii_case(&model));
+                if let Some(idx) = matched_idx {
+                    self.load_pricing_row_into_editor(idx, false);
+                } else if let Some(view) = &mut self.dash_view {
+                    view.pricing_selected_model = Some(model.clone());
+                    view.pricing_editing_custom_key = Some(model.clone());
+                }
+                if let Some(view) = &mut self.dash_view {
+                    view.set_pricing_status(format!("已保存 {model}，全盘费用已实时重算"), false);
+                }
+                self.invalidate_dashboard();
+            }
+            Err(err) => {
+                if let Some(view) = &mut self.dash_view {
+                    view.set_pricing_status(err, true);
+                }
+                self.invalidate_dashboard();
+            }
+        }
+    }
+
+    fn reset_pricing_from_editor(&mut self) {
+        let target = self
+            .dash_view
+            .as_ref()
+            .and_then(|v| v.pricing_editing_custom_key.clone())
+            .or_else(|| {
+                let m = self.pricing_edits.read_values()[0].trim().to_string();
+                if m.is_empty() { None } else { Some(m) }
+            });
+        let Some(key) = target else {
+            return;
+        };
+        match self.scanner.remove_pricing_rule(&key) {
+            Ok(true) => {
+                let prev_sel = self
+                    .dash_view
+                    .as_ref()
+                    .and_then(|v| v.pricing_selected_model.clone());
+                self.refresh_tokens(true);
+                let next_idx = prev_sel
+                    .as_deref()
+                    .and_then(|s| {
+                        self.snapshot
+                            .pricing_rows
+                            .iter()
+                            .position(|r| r.model.eq_ignore_ascii_case(s))
+                    })
+                    .or_else(|| if self.snapshot.pricing_rows.is_empty() { None } else { Some(0) });
+                if let Some(idx) = next_idx {
+                    self.load_pricing_row_into_editor(idx, false);
+                } else {
+                    self.clear_pricing_editor_for_new();
+                }
+                if let Some(view) = &mut self.dash_view {
+                    view.set_pricing_status(format!("已移除自定义规则 {key}，恢复默认单价"), false);
+                }
+                self.invalidate_dashboard();
+            }
+            Ok(false) => {
+                if let Some(view) = &mut self.dash_view {
+                    view.set_pricing_status("当前模型使用内置单价，无需重置", false);
+                }
+                self.invalidate_dashboard();
+            }
+            Err(err) => {
+                if let Some(view) = &mut self.dash_view {
+                    view.set_pricing_status(err, true);
+                }
+                self.invalidate_dashboard();
+            }
+        }
+    }
+
+    fn sync_pricing_controls(&mut self, hwnd: HWND) {
+        let active = self
+            .dash_view
+            .as_ref()
+            .map(DashboardView::is_pricing_editor_active)
+            .unwrap_or(false);
+        if !active || !self.dash_visible {
+            self.pricing_edits.hide_all(hwnd);
+            return;
+        }
+        let rects = self.dash_view.as_ref().and_then(|v| v.pricing_field_rects);
+        let dpi = window_dpi_scale(hwnd) * 96.0;
+        self.pricing_edits.sync_layout(hwnd, dpi, self.light_theme, rects);
+        if !self.pricing_edits.initialized_values && !self.snapshot.pricing_rows.is_empty() {
+            self.load_pricing_row_into_editor(0, false);
+        }
+    }
 }
 
 unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => LRESULT(1),
+        WM_WINDOWPOSCHANGING => {
+            let guard_on = with_app(|app| app.topmost && !app.pill_menu_open).unwrap_or(false);
+            if guard_on && lparam.0 != 0 {
+                let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+                guard_topmost_windowpos(wp, true);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_ACTIVATEAPP => {
+            // Re-verify pill topmost whenever the app loses foreground activation (e.g. clicking another window).
+            if wparam.0 == 0 {
+                ensure_pill_topmost_if_needed(false);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_SETCURSOR => {
             if let Ok(hand) = LoadCursorW(None, IDC_HAND) {
                 SetCursor(hand);
@@ -582,7 +1143,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            with_app(|app| {
+            let keep_top = with_app(|app| {
                 if app.dragging {
                     let (pw, ph) = app.pill_renderer.size_px();
                     let sh = app.pill_renderer.shadow_px();
@@ -593,7 +1154,12 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 }
                 app.drag_down = false;
                 app.dragging = false;
-            });
+                app.topmost
+            })
+            .unwrap_or(false);
+            if keep_top {
+                ensure_pill_topmost_if_needed(true);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -638,6 +1204,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_RBUTTONUP => {
             let state = with_app(|app| {
+                app.pill_menu_open = true;
                 (app.light_theme, app.topmost, app.human, app.monitor_index, app.dash_visible, app.pill_items)
             });
             if let Some((light, topmost, human, mon, local_vis, items)) = state {
@@ -645,7 +1212,10 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     || FindWindowW(w!("AgyTokenDashboardClass"), None)
                         .map(|h| !h.0.is_null() && IsWindowVisible(h).as_bool())
                         .unwrap_or(false);
-                if let Some(cmd) = show_context_menu(hwnd, dash_open, light, topmost, human, mon, items) {
+                let chosen = show_context_menu(hwnd, dash_open, light, topmost, human, mon, items);
+                with_app(|app| app.pill_menu_open = false);
+                let mut handled_topmost = false;
+                if let Some(cmd) = chosen {
                     match cmd {
                         CMD_OPEN_DETAIL => toggle_dashboard_safe(),
                         CMD_REFRESH => {
@@ -664,7 +1234,10 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                                 apply_win11_frame(dh, th.is_dark, th.caption_colorref);
                             }
                         }
-                        CMD_TOGGLE_TOPMOST => set_pill_topmost_safe(!topmost, true),
+                        CMD_TOGGLE_TOPMOST => {
+                            set_pill_topmost_safe(!topmost, true);
+                            handled_topmost = true;
+                        }
                         CMD_TOGGLE_HUMAN => {
                             with_app(|app| {
                                 app.human = !app.human;
@@ -682,11 +1255,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             });
                             if topmost {
                                 set_pill_topmost_safe(true, false);
+                                handled_topmost = true;
                             }
                         }
                         CMD_QUIT => {
                             destroy_dashboard_safe();
                             PostQuitMessage(0);
+                            handled_topmost = true;
                         }
                         CMD_PILL_ITEMS_RESET => {
                             with_app(|app| {
@@ -696,7 +1271,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                                 app.persist_and_sync(hwnd);
                             });
                         }
-                        c if (CMD_PILL_ITEM_BASE..CMD_PILL_ITEM_BASE + 6).contains(&c) => {
+                        c if (CMD_PILL_ITEM_BASE..CMD_PILL_ITEM_BASE + 7).contains(&c) => {
                             let bit = 1u32 << (c - CMD_PILL_ITEM_BASE);
                             with_app(|app| {
                                 let next = (app.pill_items ^ bit) & PILL_ITEMS_ALL_MASK;
@@ -718,11 +1293,19 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             });
                             if topmost {
                                 set_pill_topmost_safe(true, false);
+                                handled_topmost = true;
                             }
                         }
                         _ => {}
                     }
                 }
+                if !handled_topmost {
+                    // Context menu TrackPopupMenu calls SetForegroundWindow(pill); once dismissed,
+                    // re-assert topmost so the pill never drops behind regular apps.
+                    ensure_pill_topmost_if_needed(true);
+                }
+            } else {
+                with_app(|app| app.pill_menu_open = false);
             }
             LRESULT(0)
         }
@@ -744,6 +1327,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         app.redraw_pill();
                         app.invalidate_dashboard();
                     });
+                    ensure_pill_topmost_if_needed(false);
                 }
                 TIMER_TOKENS => {
                     with_app(|app| {
@@ -888,14 +1472,47 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     .as_ref()
                     .and_then(|v| v.hit_test_click(x_px / scale, y_px / scale));
                 if let Some(act) = action {
+                    match act {
+                        ClickAction::PickPricingRow(idx) => {
+                            app.load_pricing_row_into_editor(idx, true);
+                            app.invalidate_dashboard();
+                            return;
+                        }
+                        ClickAction::NewPricingEntry => {
+                            app.clear_pricing_editor_for_new();
+                            app.invalidate_dashboard();
+                            return;
+                        }
+                        ClickAction::SavePricingEntry => {
+                            app.save_pricing_from_editor();
+                            return;
+                        }
+                        ClickAction::ResetPricingEntry => {
+                            app.reset_pricing_from_editor();
+                            return;
+                        }
+                        _ => {}
+                    }
                     let mut need_refresh = false;
                     let mut prefs_changed = false;
                     if let Some(view) = &mut app.dash_view {
                         let res = view.apply_action(hwnd, act, &mut app.human, &mut app.light_theme);
                         need_refresh = res.0;
                         prefs_changed = res.1;
+                        app.cost_mode = view.cost_mode;
+                        app.group_subagents = view.group_subagents;
                         app.fresh_only = view.fresh_only;
                         app.date_scope = view.scope;
+                    }
+                    if !app
+                        .dash_view
+                        .as_ref()
+                        .map(DashboardView::is_pricing_editor_active)
+                        .unwrap_or(false)
+                    {
+                        app.pricing_edits.hide_all(hwnd);
+                    } else if !app.pricing_edits.initialized_values && !app.snapshot.pricing_rows.is_empty() {
+                        app.load_pricing_row_into_editor(0, false);
                     }
                     if prefs_changed {
                         app.persist_and_sync(hwnd);
@@ -908,6 +1525,30 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 }
             });
             LRESULT(0)
+        }
+        WM_CTLCOLOREDIT => {
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            with_app(|app| app.pricing_edits.handle_ctlcolor(hdc, app.light_theme))
+                .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
+        }
+        WM_COMMAND => {
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u16;
+            let ctrl = HWND(lparam.0 as *mut core::ffi::c_void);
+            if code == EN_SETFOCUS || code == EN_KILLFOCUS {
+                with_app(|app| {
+                    let idx = app.pricing_edits.index_of(ctrl);
+                    if let Some(view) = &mut app.dash_view {
+                        if code == EN_SETFOCUS {
+                            view.pricing_focused_field = idx;
+                        } else if view.pricing_focused_field == idx {
+                            view.pricing_focused_field = None;
+                        }
+                    }
+                    app.invalidate_dashboard();
+                });
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_APP_SYNC_PREFS => {
             let p = load_user_prefs();
@@ -943,6 +1584,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 0x34 => Some(ClickAction::SelectTab(Tab::Models)),    // '4'
                 0x35 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '5'
                 0x36 => Some(ClickAction::ToggleSystemView),          // '6'
+                0x44 if !ctrl => Some(ClickAction::ToggleCostMode),   // 'D'
                 0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),  // 'T'
                 0x52 => Some(ClickAction::Refresh),                   // 'R'
                 x if x == VK_F5.0 => Some(ClickAction::Refresh),
@@ -958,8 +1600,20 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         let res = view.apply_action(hwnd, act, &mut app.human, &mut app.light_theme);
                         need_refresh = res.0;
                         prefs_changed = res.1;
+                        app.cost_mode = view.cost_mode;
+                        app.group_subagents = view.group_subagents;
                         app.fresh_only = view.fresh_only;
                         app.date_scope = view.scope;
+                    }
+                    if !app
+                        .dash_view
+                        .as_ref()
+                        .map(DashboardView::is_pricing_editor_active)
+                        .unwrap_or(false)
+                    {
+                        app.pricing_edits.hide_all(hwnd);
+                    } else if !app.pricing_edits.initialized_values && !app.snapshot.pricing_rows.is_empty() {
+                        app.load_pricing_row_into_editor(0, false);
                     }
                     if prefs_changed {
                         app.persist_and_sync(hwnd);
@@ -1005,6 +1659,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 }
             });
             let _ = EndPaint(hwnd, &ps);
+            with_app(|app| app.sync_pricing_controls(hwnd));
             LRESULT(0)
         }
         WM_PRINTCLIENT => {
@@ -1044,6 +1699,12 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
             LRESULT(0)
         }
+        WM_ACTIVATEAPP => {
+            if wparam.0 == 0 {
+                ensure_pill_topmost_if_needed(false);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CLOSE => {
             hide_dashboard_safe();
             LRESULT(0)
@@ -1053,6 +1714,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 app.dash_visible = false;
                 app.dash_hwnd = None;
                 app.dash_view = None;
+                app.pricing_edits.reset_handles();
                 app.dashboard_only
             })
             .unwrap_or(false);
@@ -1067,8 +1729,10 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
 
 struct CliOpts {
     data_dir: PathBuf,
+    pricing_path: Option<PathBuf>,
     mini: Option<bool>,
     light: Option<bool>,
+    cost_mode: Option<bool>,
     open_detail: bool,
     dashboard_only: bool,
     human: Option<bool>,
@@ -1080,8 +1744,10 @@ struct CliOpts {
 fn parse_args() -> CliOpts {
     let mut opts = CliOpts {
         data_dir: IncrementalScanner::default_data_dir(),
+        pricing_path: None,
         mini: None,
         light: None,
+        cost_mode: None,
         open_detail: false,
         dashboard_only: false,
         human: None,
@@ -1095,6 +1761,8 @@ fn parse_args() -> CliOpts {
             "--mini" => opts.mini = Some(true),
             "--light" => opts.light = Some(true),
             "--dark" => opts.light = Some(false),
+            "--cost" | "--usd" => opts.cost_mode = Some(true),
+            "--tokens" => opts.cost_mode = Some(false),
             "--open-detail" => opts.open_detail = true,
             "--dashboard-only" => opts.dashboard_only = true,
             "--exact" => opts.human = Some(false),
@@ -1108,6 +1776,11 @@ fn parse_args() -> CliOpts {
             "--data-dir" => {
                 if let Some(v) = args.next() {
                     opts.data_dir = PathBuf::from(v);
+                }
+            }
+            "--pricing" => {
+                if let Some(v) = args.next() {
+                    opts.pricing_path = Some(PathBuf::from(v));
                 }
             }
             _ => {}
@@ -1150,13 +1823,20 @@ fn run_app(opts: CliOpts) -> Result<()> {
     if let Some(v) = opts.human {
         prefs.human = v;
     }
+    if let Some(v) = opts.cost_mode {
+        prefs.cost_mode = v;
+    }
     if let Some(v) = opts.monitor {
         prefs.monitor_index = v;
     }
 
     let factories = D2DFactories::new()?;
     let fonts = Fonts::new(&factories)?;
-    let mut scanner = IncrementalScanner::new(opts.data_dir.clone());
+    let pricing_override = opts
+        .pricing_path
+        .clone()
+        .or_else(pricing::PricingCatalog::default_override_path);
+    let mut scanner = IncrementalScanner::new_with_pricing(opts.data_dir.clone(), pricing_override);
     let snapshot = scanner.scan();
     let telemetry = SystemTelemetry::new(90);
 
@@ -1255,9 +1935,13 @@ fn run_app(opts: CliOpts) -> Result<()> {
             drag_start_win: (0, 0),
             pill_hovered: false,
             pill_tracking: false,
+            pill_menu_open: false,
+            topmost_unyielding_blocker: None,
             light_theme: prefs.light_theme,
             topmost: prefs.topmost,
             human: prefs.human,
+            cost_mode: prefs.cost_mode,
+            group_subagents: prefs.group_subagents,
             fresh_only: prefs.fresh_only,
             date_scope: DateScope::from_u8(prefs.date_scope),
             pill_items: prefs.pill_items,
@@ -1267,6 +1951,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             dash_owner_hwnd: None,
             dash_hwnd: None,
             dash_view: None,
+            pricing_edits: PricingEditControls::default(),
             dash_visible: false,
             dash_tracking: false,
             dash_monitor_index: prefs.monitor_index,
@@ -1286,6 +1971,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
         } else {
             let _ = ShowWindow(pill_hwnd, SW_SHOWNOACTIVATE);
             with_app(|app| app.redraw_pill());
+            ensure_pill_topmost_if_needed(true);
             trim_self_working_set();
             if opts.open_detail {
                 open_or_focus_dashboard_safe();
@@ -1299,24 +1985,13 @@ fn run_app(opts: CliOpts) -> Result<()> {
             let t_open = Instant::now();
             create_dashboard_window_local();
             let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
-            for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::System] {
-                with_app(|app| {
-                    if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
-                        view.active_tab = tab;
-                        let dpi = window_dpi_scale(hwnd) * 96.0;
-                        let _ = view.render_to_hdc(
-                            &app.factories,
-                            &app.fonts,
-                            hwnd,
-                            None,
-                            dpi,
-                            &app.snapshot,
-                            &app.telemetry,
-                            app.human,
-                            app.light_theme,
-                        );
-                        if tab == Tab::Overview {
-                            view.breakdown_mode = BreakdownMode::Workspace;
+            for cost_m in [false, true] {
+                for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::System] {
+                    with_app(|app| {
+                        if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
+                            view.cost_mode = cost_m;
+                            view.active_tab = tab;
+                            let dpi = window_dpi_scale(hwnd) * 96.0;
                             let _ = view.render_to_hdc(
                                 &app.factories,
                                 &app.fonts,
@@ -1328,24 +2003,54 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 app.human,
                                 app.light_theme,
                             );
-                            view.breakdown_mode = BreakdownMode::Model;
+                            if tab == Tab::Overview {
+                                view.breakdown_mode = BreakdownMode::Workspace;
+                                let _ = view.render_to_hdc(
+                                    &app.factories,
+                                    &app.fonts,
+                                    hwnd,
+                                    None,
+                                    dpi,
+                                    &app.snapshot,
+                                    &app.telemetry,
+                                    app.human,
+                                    app.light_theme,
+                                );
+                                view.breakdown_mode = BreakdownMode::Model;
+                            }
+                            if tab == Tab::Models {
+                                view.model_view = ModelViewMode::Pricing;
+                                let _ = view.render_to_hdc(
+                                    &app.factories,
+                                    &app.fonts,
+                                    hwnd,
+                                    None,
+                                    dpi,
+                                    &app.snapshot,
+                                    &app.telemetry,
+                                    app.human,
+                                    app.light_theme,
+                                );
+                                view.model_view = ModelViewMode::CacheCompare;
+                            }
+                            if tab == Tab::Weekly {
+                                view.weekly_mode = WeeklyMode::Monthly;
+                                let _ = view.render_to_hdc(
+                                    &app.factories,
+                                    &app.fonts,
+                                    hwnd,
+                                    None,
+                                    dpi,
+                                    &app.snapshot,
+                                    &app.telemetry,
+                                    app.human,
+                                    app.light_theme,
+                                );
+                                view.weekly_mode = WeeklyMode::Weekly;
+                            }
                         }
-                        if tab == Tab::Weekly {
-                            view.weekly_mode = WeeklyMode::Monthly;
-                            let _ = view.render_to_hdc(
-                                &app.factories,
-                                &app.fonts,
-                                hwnd,
-                                None,
-                                dpi,
-                                &app.snapshot,
-                                &app.telemetry,
-                                app.human,
-                                app.light_theme,
-                            );
-                        }
-                    }
-                });
+                    });
+                }
             }
             let open_mb = read_self_private_mb();
             hide_dashboard_safe();
@@ -1357,10 +2062,11 @@ fn run_app(opts: CliOpts) -> Result<()> {
             destroy_dashboard_safe();
             let summary = with_app(|app| {
                 format!(
-                    "RUST_SELF_TEST_OK theme={} sessions={} total_tokens={} cold_scan_ms={:.1} cached_ms={:.2} open1_ms={:.1} reopen_ms={:.1} pill_idle_mb={:.1} dash_open_mb={:.1} hide_priv_mb={:.1} hide_ws_mb={:.1}",
+                    "RUST_SELF_TEST_OK theme={} sessions={} total_tokens={} total_usd={:.2} cold_scan_ms={:.1} cached_ms={:.2} open1_ms={:.1} reopen_ms={:.1} pill_idle_mb={:.1} dash_open_mb={:.1} hide_priv_mb={:.1} hide_ws_mb={:.1}",
                     if app.light_theme { "paper" } else { "obsidian" },
                     app.snapshot.sessions.len(),
                     app.snapshot.agg.total.total_tokens(),
+                    app.snapshot.agg.total.cost.total_usd(),
                     cold_ms,
                     cached_ms,
                     open_ms,
@@ -1389,6 +2095,40 @@ fn run_app(opts: CliOpts) -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_KEYDOWN {
+                let edit_idx = with_app(|app| app.pricing_edits.index_of(msg.hwnd)).flatten();
+                if let Some(idx) = edit_idx {
+                    let vk = msg.wParam.0 as u16;
+                    let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+                    let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                    if vk == VK_TAB.0 {
+                        let next = if shift { (idx + 4) % 5 } else { (idx + 1) % 5 };
+                        with_app(|app| app.pricing_edits.focus_field(next));
+                        continue;
+                    }
+                    if vk == VK_RETURN.0 {
+                        with_app(|app| app.save_pricing_from_editor());
+                        continue;
+                    }
+                    if vk == VK_ESCAPE.0 {
+                        with_app(|app| {
+                            if let Some(dh) = app.dash_hwnd {
+                                let _ = SetFocus(dh);
+                            }
+                            if let Some(view) = &mut app.dash_view {
+                                view.pricing_focused_field = None;
+                            }
+                            app.invalidate_dashboard();
+                        });
+                        continue;
+                    }
+                    if ctrl && vk == 0x41 {
+                        // Ctrl+A select all in single-line Win32 EDIT
+                        let _ = SendMessageW(msg.hwnd, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                        continue;
+                    }
+                }
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

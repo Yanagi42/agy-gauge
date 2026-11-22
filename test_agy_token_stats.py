@@ -315,6 +315,213 @@ class AgyTokenStatsTests(unittest.TestCase):
             model_lines = [ln for ln in txt_model.splitlines() if ln.strip()]
             self.assertTrue(model_lines[-1].startswith("compaction (secondary)"))
 
+    def test_api_cost_calculation_and_pricing_override(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self._create_fixture(root)
+            # Append a compaction checkpoint to verify it inherits the session's real model pricing
+            s1_file = root / "brain" / "11111111-aaaa-bbbb-cccc-000000000001" / ".system_generated" / "logs" / "transcript.jsonl"
+            with s1_file.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps({
+                        "step_index": 9,
+                        "type": "CHECKPOINT",
+                        "status": "DONE",
+                        "created_at": "2026-11-21T04:00:00Z",
+                        "input_tokens": 1_000_000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 0,
+                    }) + "\n"
+                )
+
+            rep = mod.scan_usage(root, tz=tz_utc, pricing_path=None)
+            agg = mod.aggregate_sessions(rep.sessions)
+            s1 = next(s for s in rep.sessions if s.conversation_id.startswith("11111111"))
+            # Checkpoint inherits gemini-4-neon-xhigh ($3/M input -> $3.00)
+            cp_turn = next(t for t in s1.turns if t.step_type == "CHECKPOINT")
+            self.assertAlmostEqual(cp_turn.cost.total_usd, 3.0, places=6)
+            self.assertEqual(agg["total"].cost.unpriced_calls, 0)
+            self.assertGreater(agg["total"].total_cost_usd, 3.0)
+
+            # Custom pricing.json override (prefix + exact effort override)
+            custom_pricing = root / "pricing.json"
+            custom_pricing.write_text(
+                json.dumps({
+                    "models": {
+                        "gemini-4-neon": {"input": 10.0, "cache_read": 1.0, "output": 20.0},
+                        "gemini-4-neon-xhigh": {"input": 15.0, "cache_read": 1.5, "output": 30.0},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            rep_custom = mod.scan_usage(root, tz=tz_utc, pricing_path=custom_pricing)
+            s1_custom = next(s for s in rep_custom.sessions if s.conversation_id.startswith("11111111"))
+            cp_custom = next(t for t in s1_custom.turns if t.step_type == "CHECKPOINT")
+            # Checkpoint inherits gemini-4-neon-xhigh (exact $15/M), while gemini-4-neon-high uses prefix ($10/M)
+            self.assertAlmostEqual(cp_custom.cost.total_usd, 15.0, places=6)
+            cat_custom = mod.PricingCatalog(custom_pricing)
+            self.assertAlmostEqual(cat_custom.resolve_rate("gemini-4-neon-high", 0, None).input, 10.0, places=6)
+            pricing_txt = mod.render_pricing_table(cat_custom, ["gemini-4-neon-xhigh"], dt.date(2026, 11, 22), False)
+            self.assertIn("custom(exact)", pricing_txt)
+            self.assertIn("claude-opus-5-5", pricing_txt)
+
+            # Cost sorting and JSON/CSV/text outputs include cost fields
+            ordered_cost = mod._sort_sessions(rep_custom.sessions, "cost")
+            self.assertEqual(ordered_cost[0].conversation_id, s1_custom.conversation_id)
+            js = json.loads(
+                mod.render_json(
+                    rep_custom,
+                    mod.aggregate_sessions(rep_custom.sessions),
+                    sort_by="cost",
+                    tz_label="UTC",
+                    include_turns=True,
+                )
+            )
+            self.assertGreater(js["overview"]["cost_usd"], 10.0)
+            self.assertIn("cost_usd", js["sessions"][0]["turns"][0])
+            csv_out = mod.render_csv(rep_custom, mod.aggregate_sessions(rep_custom.sessions), view="model", sort_by="cost")
+            self.assertIn("cost_usd", csv_out.splitlines()[0])
+            txt = mod.render_text(
+                rep_custom,
+                mod.aggregate_sessions(rep_custom.sessions),
+                view="summary",
+                sort_by="cost",
+                limit=10,
+                human=True,
+                tz_label="UTC",
+                since=None,
+                until=None,
+                model_filter=None,
+                session_filter=None,
+                color=False,
+            )
+            self.assertIn("Estimated Cost", txt)
+            self.assertIn("Cost($)", txt)
+
+    def test_subagent_linking_workspace_inheritance_and_long_model_name(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            parent_id = "8c1095e2-1558-4a06-bfde-446204f978aa"
+            child_id = "14ee4713-eb4d-4a3c-b6a9-6745e2e553e2"
+            p_logs = root / "brain" / parent_id / ".system_generated" / "logs"
+            c_logs = root / "brain" / child_id / ".system_generated" / "logs"
+            cache_dir = root / "cache"
+            p_logs.mkdir(parents=True)
+            c_logs.mkdir(parents=True)
+            cache_dir.mkdir(parents=True)
+
+            (cache_dir / "conversation_metadata.json").write_text(
+                json.dumps({
+                    "conversations": {
+                        parent_id: {
+                            "summary": {
+                                "Title": "SubVault Review",
+                                "WorkspaceURIs": ["file:///C:/Users/test/agent-home"],
+                            }
+                        },
+                        child_id: {"is_internal": True},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (p_logs / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "status": "DONE",
+                        "content": "<USER_REQUEST>\nReview SubVault\n</USER_REQUEST>",
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-22T14:48:00Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 100,
+                    }),
+                    # Subagent reply to parent must never misclassify parent as a subagent.
+                    json.dumps({
+                        "step_index": 2,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T14:50:00Z sender={child_id} priority=MESSAGE_PRIORITY_HIGH content=Done\n</SYSTEM_MESSAGE>",
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            (c_logs / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T14:48:47Z sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=You are executing **Wave 2 · Track A** for `SubVault`.\n</SYSTEM_MESSAGE>",
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-22T14:49:00Z",
+                        "model": "gemini-4-hydrogen-tiered-xhigh",
+                        "input_tokens": 2000,
+                        "cache_read_tokens": 5000,
+                        "output_tokens": 300,
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            rep = mod.scan_usage(root, tz=tz_utc, pricing_path=None)
+            self.assertEqual(len(rep.sessions), 2)
+            parent = next(s for s in rep.sessions if s.conversation_id == parent_id)
+            child = next(s for s in rep.sessions if s.conversation_id == child_id)
+            self.assertFalse(parent.is_subagent)
+            self.assertIsNone(parent.parent_id)
+            self.assertTrue(child.is_subagent)
+            self.assertEqual(child.parent_id, parent_id)
+            self.assertEqual(child.parent_title, "SubVault Review")
+            self.assertEqual(child.workspace, "C:/Users/test/agent-home")
+            self.assertEqual(child.title, "You are executing Wave 2 · Track A for SubVault.")
+
+            # Inherited workspace works with --workspace filter
+            rep_ws = mod.scan_usage(root, tz=tz_utc, workspace_filter="agent-home", pricing_path=None)
+            self.assertEqual(len(rep_ws.sessions), 2)
+
+            agg = mod.aggregate_sessions(rep.sessions)
+            self.assertNotIn("(unknown)", agg["by_workspace"])
+
+            # Default text view groups subagent under parent; --show-subagents lists full 30-char model unclipped
+            txt_grouped = mod.render_text(
+                rep, agg, view="summary", sort_by="time", limit=10, human=True,
+                tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                color=False, show_subagents=False,
+            )
+            self.assertIn("1 (+1 subagents)", txt_grouped)
+            self.assertIn("(+1 sub)", txt_grouped)
+            self.assertIn("gemini-4-hydrogen-tiered-xhigh", txt_grouped)
+
+            txt_flat = mod.render_text(
+                rep, agg, view="session", sort_by="time", limit=10, human=True,
+                tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                color=False, show_subagents=True,
+            )
+            self.assertIn("gemini-4-hydrogen-tiered-xhigh", txt_flat)
+            self.assertIn("↳ You are executing Wave 2", txt_flat)
+
+            js = json.loads(mod.render_json(rep, agg, sort_by="time", tz_label="UTC", include_turns=False))
+            js_child = next(s for s in js["sessions"] if s["conversation_id"] == child_id)
+            self.assertTrue(js_child["is_subagent"])
+            self.assertEqual(js_child["parent_id"], parent_id)
+            self.assertEqual(js_child["parent_title"], "SubVault Review")
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}

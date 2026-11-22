@@ -790,17 +790,24 @@ pub fn draw_area_series(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarUnit {
+    Tokens,
+    Usd,
+}
+
 #[derive(Debug, Clone)]
 pub struct BarItem {
     pub label: String,
-    pub cache: u64,
-    pub input: u64,
-    pub output: u64,
+    pub cache: f64,
+    pub input: f64,
+    pub output: f64,
     pub marker: bool,
     pub tooltip: Vec<String>,
 }
 
-/// Editorial minimalist stacked bar chart supporting Total vs Fresh-Only (non-cached) display mode.
+/// Editorial minimalist stacked bar chart supporting Total vs Fresh-Only (non-cached)
+/// and both Token and USD display units.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_editorial_bars(
     rt: &ID2D1RenderTarget,
@@ -809,6 +816,7 @@ pub fn draw_editorial_bars(
     plot_bounds: D2D_RECT_F,
     items: &[BarItem],
     fresh_only: bool,
+    unit: BarUnit,
     mouse_pos: Option<(f32, f32)>,
     empty_msg: &str,
 ) -> Vec<D2D_RECT_F> {
@@ -828,7 +836,7 @@ pub fn draw_editorial_bars(
     let plot_w = (plot_r - plot_l).max(40.0);
     let plot_h = (plot_b - plot_t).max(36.0);
 
-    let bar_val = |it: &BarItem| -> u64 {
+    let bar_val = |it: &BarItem| -> f64 {
         if fresh_only {
             it.input + it.output
         } else {
@@ -836,7 +844,11 @@ pub fn draw_editorial_bars(
         }
     };
 
-    let max_val = items.iter().map(bar_val).max().unwrap_or(0).max(1);
+    let raw_max = items.iter().map(bar_val).fold(0.0_f64, f64::max);
+    let max_val = match unit {
+        BarUnit::Tokens => raw_max.max(1.0),
+        BarUnit::Usd => raw_max.max(0.001),
+    };
 
     // 3 quiet horizontal rules (0%, 50%, 100%)
     for (i, frac) in [0.0_f32, 0.5, 1.0].iter().enumerate() {
@@ -850,10 +862,14 @@ pub fn draw_editorial_bars(
             if i == 0 { theme.border } else { theme.grid },
             1.0,
         );
-        let tv = (max_val as f64 * *frac as f64).round() as u64;
+        let tv = max_val * (*frac as f64);
+        let axis_lbl = match unit {
+            BarUnit::Tokens => crate::stats::fmt_compact(tv.round() as u64),
+            BarUnit::Usd => crate::pricing::fmt_usd_axis(tv, max_val),
+        };
         draw_text(
             rt,
-            &crate::stats::fmt_compact(tv),
+            &axis_lbl,
             &fonts.mono_small_right,
             rect_f(plot_bounds.left, y - 7.0, pad_l - 8.0, 14.0),
             theme.muted,
@@ -897,22 +913,22 @@ pub fn draw_editorial_bars(
         }
 
         let total = bar_val(it);
-        if total > 0 {
-            let total_h = ((total as f64 / max_val as f64) as f32 * plot_h).max(3.0);
+        if total > 0.0 {
+            let total_h = ((total / max_val) as f32 * plot_h).max(3.0);
             let y_top = (plot_b - total_h).max(plot_t);
 
-            let segs: [(u64, D2D1_COLOR_F); 3] = if fresh_only {
-                [(0, theme.cache), (it.input, theme.accent), (it.output, theme.output)]
+            let segs: [(f64, D2D1_COLOR_F); 3] = if fresh_only {
+                [(0.0, theme.cache), (it.input, theme.accent), (it.output, theme.output)]
             } else {
                 [(it.cache, theme.cache), (it.input, theme.accent), (it.output, theme.output)]
             };
-            let last_nz = segs.iter().rposition(|(v, _)| *v > 0);
+            let last_nz = segs.iter().rposition(|(v, _)| *v > 0.0);
             let mut cur_y = plot_b;
             for (s_idx, &(val, col)) in segs.iter().enumerate() {
-                if val == 0 {
+                if val <= 0.0 {
                     continue;
                 }
-                let sh = ((val as f64 / total as f64) as f32 * total_h).max(2.0);
+                let sh = ((val / total) as f32 * total_h).max(2.0);
                 let ny = if Some(s_idx) == last_nz {
                     y_top
                 } else {

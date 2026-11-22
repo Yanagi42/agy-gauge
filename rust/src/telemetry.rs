@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -27,8 +28,11 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, PostMessageW, SystemParametersInfoW, SPI_GETWORKAREA,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP,
+    FindWindowW, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, SetWindowPos, SystemParametersInfoW, GWL_EXSTYLE, GW_HWNDPREV,
+    HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SPI_GETWORKAREA, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WINDOWPOS, WM_APP, WS_EX_TOPMOST,
 };
 
 pub const WM_APP_SYNC_PREFS: u32 = WM_APP + 1;
@@ -39,8 +43,14 @@ pub const PILL_ITEM_CACHE_HIT: u32 = 1 << 2;
 pub const PILL_ITEM_ACTIVE_CTX: u32 = 1 << 3;
 pub const PILL_ITEM_CPU: u32 = 1 << 4;
 pub const PILL_ITEM_RAM: u32 = 1 << 5;
-pub const PILL_ITEMS_ALL_MASK: u32 =
-    PILL_ITEM_TOTAL | PILL_ITEM_NON_CACHED | PILL_ITEM_CACHE_HIT | PILL_ITEM_ACTIVE_CTX | PILL_ITEM_CPU | PILL_ITEM_RAM;
+pub const PILL_ITEM_COST: u32 = 1 << 6;
+pub const PILL_ITEMS_ALL_MASK: u32 = PILL_ITEM_TOTAL
+    | PILL_ITEM_NON_CACHED
+    | PILL_ITEM_CACHE_HIT
+    | PILL_ITEM_ACTIVE_CTX
+    | PILL_ITEM_CPU
+    | PILL_ITEM_RAM
+    | PILL_ITEM_COST;
 pub const PILL_ITEMS_DEFAULT: u32 = PILL_ITEM_TOTAL | PILL_ITEM_CPU | PILL_ITEM_RAM;
 
 pub fn migrate_legacy_pill_items(mini: bool, pill_metric: u8) -> u32 {
@@ -62,6 +72,8 @@ pub struct UserPrefs {
     pub mini: bool,
     pub topmost: bool,
     pub human: bool,
+    pub cost_mode: bool,
+    pub group_subagents: bool,
     pub monitor_index: usize,
     pub fresh_only: bool,
     pub date_scope: u8,
@@ -77,6 +89,8 @@ impl Default for UserPrefs {
             mini: false,
             topmost: true,
             human: true,
+            cost_mode: false,
+            group_subagents: true,
             monitor_index: 0,
             fresh_only: false,
             date_scope: 0, // Default to Today (matches corner pill)
@@ -123,6 +137,12 @@ pub fn load_user_prefs() -> UserPrefs {
     }
     if let Some(v) = reg_read_u32(w!("human")) {
         p.human = v != 0;
+    }
+    if let Some(v) = reg_read_u32(w!("cost_mode")) {
+        p.cost_mode = v != 0;
+    }
+    if let Some(v) = reg_read_u32(w!("group_subagents")) {
+        p.group_subagents = v != 0;
     }
     if let Some(v) = reg_read_u32(w!("monitor_index")) {
         p.monitor_index = v as usize;
@@ -178,11 +198,13 @@ pub fn save_user_prefs(p: &UserPrefs) {
             if m != 0 { m } else { PILL_ITEMS_DEFAULT }
         };
         let derived_mini = (pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
-        let entries: [(PCWSTR, u32); 12] = [
+        let entries: [(PCWSTR, u32); 14] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(derived_mini)),
             (w!("topmost"), u32::from(p.topmost)),
             (w!("human"), u32::from(p.human)),
+            (w!("cost_mode"), u32::from(p.cost_mode)),
+            (w!("group_subagents"), u32::from(p.group_subagents)),
             (w!("monitor_index"), p.monitor_index as u32),
             (w!("fresh_only"), u32::from(p.fresh_only)),
             (w!("date_scope"), p.date_scope as u32),
@@ -725,6 +747,231 @@ pub fn wide_pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())
 }
 
+// ---------- Robust Topmost Z-Order Diagnostics & Recovery ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopmostHealth {
+    /// Pill still carries `WS_EX_TOPMOST` and sits above all regular windows & non-system overlays.
+    Healthy,
+    /// Pill still carries `WS_EX_TOPMOST` but another non-system topmost window overlaps it.
+    NeedRaise(isize),
+    /// `WS_EX_TOPMOST` was stripped (0) or a non-topmost window sits above it (blocker HWND).
+    NeedHardReset(isize),
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowAboveDesc {
+    pub hwnd_raw: isize,
+    pub class_name: String,
+    pub is_topmost: bool,
+    pub rect: RECT,
+}
+
+pub fn rects_intersect(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+}
+
+/// System shells, transient menus, IME popups, and taskbars that should legitimately sit
+/// above user floating widgets without fighting for Z-order.
+pub fn is_system_overlay_class(cls: &str) -> bool {
+    matches!(
+        cls,
+        "#32768"
+            | "tooltips_class32"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Shell_InputSwitchTopLevelWindow"
+            | "NotifyIconOverflowWindow"
+            | "TaskListThumbnailWnd"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "ForegroundStaging"
+            | "MultitaskingViewFrame"
+            | "TaskSwitcherWnd"
+            | "IME"
+            | "MSCTFIME UI"
+            | "CicMarshalWndClass"
+            | "EdgeUiInputTopWndClass"
+            | "SysShadow"
+    )
+}
+
+/// Pure classifier used by both live Win32 inspection and unit tests.
+pub fn classify_topmost_health(
+    has_ex_topmost: bool,
+    pill_rect: RECT,
+    above_visible: &[WindowAboveDesc],
+) -> TopmostHealth {
+    if !has_ex_topmost {
+        return TopmostHealth::NeedHardReset(0);
+    }
+    let mut overlapped_by_non_system_topmost: Option<isize> = None;
+    for w in above_visible {
+        if w.rect.right <= w.rect.left || w.rect.bottom <= w.rect.top {
+            continue;
+        }
+        if !w.is_topmost {
+            // Any real visible non-topmost window above our topmost pill indicates Windows
+            // fullscreen demotion / Win+D / Z-order desync ("ghost topmost").
+            if !is_system_overlay_class(&w.class_name) {
+                return TopmostHealth::NeedHardReset(w.hwnd_raw);
+            }
+            continue;
+        }
+        if !is_system_overlay_class(&w.class_name) && rects_intersect(&pill_rect, &w.rect) {
+            overlapped_by_non_system_topmost.get_or_insert(w.hwnd_raw);
+        }
+    }
+    if let Some(blocker) = overlapped_by_non_system_topmost {
+        TopmostHealth::NeedRaise(blocker)
+    } else {
+        TopmostHealth::Healthy
+    }
+}
+
+pub fn window_has_topmost_style(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        (ex & WS_EX_TOPMOST.0) != 0
+    }
+}
+
+fn is_window_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+    }
+}
+
+fn read_window_class(hwnd: HWND) -> String {
+    let mut buf = [0u16; 96];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        String::new()
+    }
+}
+
+/// Inspects live Win32 Z-order above `pill_hwnd` (read-only, microsecond-level) to detect
+/// lost `WS_EX_TOPMOST`, ghost topmost desync, or overlapping non-system topmost windows.
+pub fn inspect_pill_topmost_health(pill_hwnd: HWND) -> TopmostHealth {
+    if pill_hwnd.0.is_null() {
+        return TopmostHealth::Healthy;
+    }
+    unsafe {
+        if !IsWindowVisible(pill_hwnd).as_bool() {
+            return TopmostHealth::Healthy;
+        }
+        let has_top = window_has_topmost_style(pill_hwnd);
+        if !has_top {
+            return TopmostHealth::NeedHardReset(0);
+        }
+        let mut pill_rc = RECT::default();
+        if GetWindowRect(pill_hwnd, &mut pill_rc).is_err() {
+            return TopmostHealth::Healthy;
+        }
+        let mut above = Vec::new();
+        let mut cur = GetWindow(pill_hwnd, GW_HWNDPREV).unwrap_or_default();
+        let mut steps = 0usize;
+        while !cur.0.is_null() && steps < 96 {
+            steps += 1;
+            if IsWindowVisible(cur).as_bool()
+                && !IsIconic(cur).as_bool()
+                && !is_window_cloaked(cur)
+            {
+                let mut rc = RECT::default();
+                if GetWindowRect(cur, &mut rc).is_ok() && rc.right > rc.left && rc.bottom > rc.top {
+                    above.push(WindowAboveDesc {
+                        hwnd_raw: cur.0 as isize,
+                        class_name: read_window_class(cur),
+                        is_topmost: window_has_topmost_style(cur),
+                        rect: rc,
+                    });
+                }
+            }
+            cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
+        }
+        classify_topmost_health(has_top, pill_rc, &above)
+    }
+}
+
+/// Restores topmost Z-order for `pill_hwnd`. When `hard_reset` is true, performs a silent
+/// `HWND_NOTOPMOST -> HWND_TOPMOST` cycle to break Windows ghost-topmost / fullscreen demotion.
+pub fn apply_pill_topmost(pill_hwnd: HWND, topmost: bool, hard_reset: bool) {
+    if pill_hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        if topmost {
+            if hard_reset {
+                let _ = SetWindowPos(
+                    pill_hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                );
+            }
+            let _ = SetWindowPos(
+                pill_hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            );
+        } else {
+            let _ = SetWindowPos(
+                pill_hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            );
+        }
+    }
+}
+
+/// Guards `WM_WINDOWPOSCHANGING` for a topmost pill: intercepts attempts to demote the pill
+/// below any non-topmost window (`HWND_BOTTOM`, `HWND_NOTOPMOST`, `HWND_TOP`, or a non-topmost
+/// HWND), while allowing legitimate topmost overlays (context menus, taskbar) to stay above.
+pub fn guard_topmost_windowpos(wp: &mut WINDOWPOS, topmost_enabled: bool) -> bool {
+    if !topmost_enabled || (wp.flags.0 & SWP_NOZORDER.0) != 0 {
+        return false;
+    }
+    let after = wp.hwndInsertAfter;
+    if after == HWND_TOPMOST {
+        return false;
+    }
+    let is_demotion = after == HWND_BOTTOM
+        || after == HWND_NOTOPMOST
+        || after == HWND_TOP
+        || (unsafe { IsWindow(after).as_bool() } && !window_has_topmost_style(after));
+    if is_demotion {
+        wp.hwndInsertAfter = HWND_TOPMOST;
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,5 +1035,163 @@ mod tests {
             migrate_legacy_pill_items(false, 2),
             PILL_ITEM_ACTIVE_CTX | PILL_ITEM_CPU | PILL_ITEM_RAM
         );
+    }
+
+    #[test]
+    fn test_zorder_health_classification() {
+        let pill = RECT { left: 1700, top: 1300, right: 1900, bottom: 1340 };
+
+        // 1. Healthy when nothing sits above, or only system overlays / non-overlapping topmost windows
+        let ok_above = vec![
+            WindowAboveDesc {
+                hwnd_raw: 1,
+                class_name: "Shell_TrayWnd".into(),
+                is_topmost: true,
+                rect: RECT { left: 0, top: 1300, right: 1920, bottom: 1440 },
+            },
+            WindowAboveDesc {
+                hwnd_raw: 2,
+                class_name: "#32768".into(),
+                is_topmost: true,
+                rect: pill,
+            },
+            WindowAboveDesc {
+                hwnd_raw: 3,
+                class_name: "SomeOtherWidget".into(),
+                is_topmost: true,
+                rect: RECT { left: 10, top: 10, right: 200, bottom: 60 },
+            },
+        ];
+        assert_eq!(classify_topmost_health(true, pill, &ok_above), TopmostHealth::Healthy);
+
+        // 2. Missing WS_EX_TOPMOST -> NeedHardReset
+        assert_eq!(classify_topmost_health(false, pill, &[]), TopmostHealth::NeedHardReset(0));
+
+        // 3. Ghost topmost (WS_EX_TOPMOST still set, but a regular non-topmost app sits above) -> NeedHardReset
+        let ghost = vec![WindowAboveDesc {
+            hwnd_raw: 42,
+            class_name: "Chrome_WidgetWin_1".into(),
+            is_topmost: false,
+            rect: RECT { left: 0, top: 0, right: 1920, bottom: 1380 },
+        }];
+        assert_eq!(classify_topmost_health(true, pill, &ghost), TopmostHealth::NeedHardReset(42));
+
+        // 4. Overlapping non-system topmost window -> NeedRaise
+        let overlap_top = vec![WindowAboveDesc {
+            hwnd_raw: 99,
+            class_name: "OtherTopmostApp".into(),
+            is_topmost: true,
+            rect: RECT { left: 1600, top: 1200, right: 1920, bottom: 1380 },
+        }];
+        assert_eq!(classify_topmost_health(true, pill, &overlap_top), TopmostHealth::NeedRaise(99));
+    }
+
+    #[test]
+    fn test_win32_pill_topmost_recovery_and_guard() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, ShowWindow, SW_SHOWNOACTIVATE, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap_or_default();
+            let pill = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                w!("STATIC"),
+                w!("TestPill"),
+                WS_POPUP,
+                100,
+                100,
+                160,
+                40,
+                None,
+                None,
+                hinst,
+                None,
+            )
+            .unwrap();
+            let regular = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("TestRegular"),
+                WS_POPUP,
+                80,
+                80,
+                260,
+                160,
+                None,
+                None,
+                hinst,
+                None,
+            )
+            .unwrap();
+            let other_top = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                w!("STATIC"),
+                w!("TestOtherTop"),
+                WS_POPUP,
+                90,
+                90,
+                200,
+                100,
+                None,
+                None,
+                hinst,
+                None,
+            )
+            .unwrap();
+
+            let _ = ShowWindow(regular, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(pill, SW_SHOWNOACTIVATE);
+            apply_pill_topmost(pill, true, false);
+            assert!(window_has_topmost_style(pill));
+
+            // 1) Simulate demotion (e.g. fullscreen / Win+D stripping topmost and placing regular app above)
+            apply_pill_topmost(pill, false, false);
+            let _ = SetWindowPos(regular, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            assert!(matches!(inspect_pill_topmost_health(pill), TopmostHealth::NeedHardReset(_)));
+
+            // Hard-reset recovery brings pill back above regular window
+            apply_pill_topmost(pill, true, true);
+            assert!(window_has_topmost_style(pill));
+            assert_eq!(inspect_pill_topmost_health(pill), TopmostHealth::Healthy);
+
+            // 2) Simulate overlapping peer topmost window covering pill
+            let _ = ShowWindow(other_top, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(other_top, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            assert_eq!(inspect_pill_topmost_health(pill), TopmostHealth::NeedRaise(other_top.0 as isize));
+            apply_pill_topmost(pill, true, false);
+            assert_eq!(inspect_pill_topmost_health(pill), TopmostHealth::Healthy);
+
+            // 3) Guard intercepts demotion below regular window or HWND_BOTTOM, allows topmost peer
+            let mut wp_demote = WINDOWPOS {
+                hwnd: pill,
+                hwndInsertAfter: regular,
+                ..Default::default()
+            };
+            assert!(guard_topmost_windowpos(&mut wp_demote, true));
+            assert_eq!(wp_demote.hwndInsertAfter, HWND_TOPMOST);
+
+            let mut wp_bottom = WINDOWPOS {
+                hwnd: pill,
+                hwndInsertAfter: HWND_BOTTOM,
+                ..Default::default()
+            };
+            assert!(guard_topmost_windowpos(&mut wp_bottom, true));
+            assert_eq!(wp_bottom.hwndInsertAfter, HWND_TOPMOST);
+
+            let mut wp_peer = WINDOWPOS {
+                hwnd: pill,
+                hwndInsertAfter: other_top,
+                ..Default::default()
+            };
+            assert!(!guard_topmost_windowpos(&mut wp_peer, true));
+            assert_eq!(wp_peer.hwndInsertAfter, other_top);
+
+            let _ = DestroyWindow(other_top);
+            let _ = DestroyWindow(regular);
+            let _ = DestroyWindow(pill);
+        }
     }
 }

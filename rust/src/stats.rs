@@ -16,7 +16,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+use crate::pricing::{CostBreakdown, ModelRate, PricingCatalog, PricingTableRow};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TokenCounts {
     pub calls: u64,
     pub input_tokens: u64,       // Uncached new input tokens
@@ -24,6 +26,7 @@ pub struct TokenCounts {
     pub cache_write_tokens: u64, // Prompt cache creation tokens (if reported)
     pub output_tokens: u64,      // Output tokens (thinking + response + tool calls)
     pub peak_context: u64,       // Max single-call total input tokens
+    pub cost: CostBreakdown,     // Estimated API cost in USD
 }
 
 impl TokenCounts {
@@ -52,12 +55,25 @@ impl TokenCounts {
         }
     }
 
+    #[allow(dead_code)]
     pub fn add_call(&mut self, input: u64, cache_read: u64, cache_write: u64, output: u64) {
+        self.add_call_with_cost(input, cache_read, cache_write, output, CostBreakdown::default());
+    }
+
+    pub fn add_call_with_cost(
+        &mut self,
+        input: u64,
+        cache_read: u64,
+        cache_write: u64,
+        output: u64,
+        cost: CostBreakdown,
+    ) {
         self.calls += 1;
         self.input_tokens += input;
         self.cache_read_tokens += cache_read;
         self.cache_write_tokens += cache_write;
         self.output_tokens += output;
+        self.cost.merge(&cost);
         let ctx = input + cache_read + cache_write;
         if ctx > self.peak_context {
             self.peak_context = ctx;
@@ -70,6 +86,7 @@ impl TokenCounts {
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
         self.output_tokens += other.output_tokens;
+        self.cost.merge(&other.cost);
         if other.peak_context > self.peak_context {
             self.peak_context = other.peak_context;
         }
@@ -86,6 +103,7 @@ pub struct TurnRecord {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
+    pub cost: CostBreakdown,
 }
 
 impl TurnRecord {
@@ -109,6 +127,9 @@ pub struct SessionInfo {
     pub conversation_id: String,
     pub title: String,
     pub workspace: String,
+    pub is_subagent: bool,
+    pub parent_id: Option<String>,
+    pub parent_title: String,
     pub turns: Vec<TurnRecord>,
     pub counts: TokenCounts,
     pub models: BTreeSet<String>,
@@ -235,6 +256,11 @@ pub struct ScanSnapshot {
     pub data_dir: PathBuf,
     pub sessions: Vec<SessionInfo>,
     pub agg: AggregatedStats,
+    pub model_rate_labels: HashMap<String, String>,
+    pub pricing_rows: Vec<PricingTableRow>,
+    pub pricing_path: Option<PathBuf>,
+    pub custom_pricing_count: usize,
+    pub pricing_changed: bool,
     pub skipped_empty: usize,
     pub skipped_lines: usize,
     pub files_cached: usize,
@@ -275,6 +301,7 @@ impl DateScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSort {
     Recent,
+    Cost,
     NonCached,
     TotalTokens,
     HitRateLow,
@@ -293,6 +320,8 @@ struct CachedTranscript {
     sig: FileSig,
     turns: Vec<TurnRecord>,
     first_user_preview: String,
+    subagent_parent_id: Option<String>,
+    subagent_preview: String,
     skipped_lines: usize,
 }
 
@@ -301,11 +330,13 @@ struct CachedMetaEntry {
     title: String,
     preview: String,
     workspace: String,
+    is_internal: bool,
 }
 
 pub struct IncrementalScanner {
     data_dir: PathBuf,
     canon_root: Option<PathBuf>,
+    pricing: PricingCatalog,
     verified_paths: HashSet<PathBuf>,
     transcript_cache: HashMap<PathBuf, CachedTranscript>,
     ann_cache: HashMap<PathBuf, (FileSig, String)>,
@@ -314,11 +345,17 @@ pub struct IncrementalScanner {
 }
 
 impl IncrementalScanner {
+    #[allow(dead_code)]
     pub fn new(data_dir: PathBuf) -> Self {
+        Self::new_with_pricing(data_dir, PricingCatalog::default_override_path())
+    }
+
+    pub fn new_with_pricing(data_dir: PathBuf, pricing_override: Option<PathBuf>) -> Self {
         let canon_root = fs::canonicalize(&data_dir).ok();
         Self {
             data_dir,
             canon_root,
+            pricing: PricingCatalog::new(pricing_override),
             verified_paths: HashSet::new(),
             transcript_cache: HashMap::new(),
             ann_cache: HashMap::new(),
@@ -338,6 +375,14 @@ impl IncrementalScanner {
     #[allow(dead_code)]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn upsert_pricing_rule(&mut self, model: &str, rate: ModelRate) -> Result<(), String> {
+        self.pricing.upsert_custom_rule(model, rate)
+    }
+
+    pub fn remove_pricing_rule(&mut self, model: &str) -> Result<bool, String> {
+        self.pricing.remove_custom_rule(model)
     }
 
     fn is_safe_regular_file(&mut self, path: &Path) -> Option<FileSig> {
@@ -406,15 +451,22 @@ impl IncrementalScanner {
 
     pub fn scan(&mut self) -> ScanSnapshot {
         let started = Instant::now();
+        let pricing_changed = self.pricing.refresh();
         if self.canon_root.is_none() {
             self.canon_root = fs::canonicalize(&self.data_dir).ok();
         }
         let brain_dir = self.data_dir.join("brain");
         if !brain_dir.is_dir() {
+            let today_local = Local::now().date_naive();
             return ScanSnapshot {
                 data_dir: self.data_dir.clone(),
                 sessions: Vec::new(),
                 agg: AggregatedStats::default(),
+                model_rate_labels: HashMap::new(),
+                pricing_rows: self.pricing.build_table(&[], today_local),
+                pricing_path: self.pricing.override_path().map(Path::to_path_buf),
+                custom_pricing_count: self.pricing.custom_rules_count(),
+                pricing_changed,
                 skipped_empty: 0,
                 skipped_lines: 0,
                 files_cached: 0,
@@ -434,10 +486,16 @@ impl IncrementalScanner {
         let mut seen_paths = BTreeSet::new();
 
         let Ok(entries) = fs::read_dir(&brain_dir) else {
+            let today_local = Local::now().date_naive();
             return ScanSnapshot {
                 data_dir: self.data_dir.clone(),
                 sessions,
                 agg: AggregatedStats::default(),
+                model_rate_labels: HashMap::new(),
+                pricing_rows: self.pricing.build_table(&[], today_local),
+                pricing_path: self.pricing.override_path().map(Path::to_path_buf),
+                custom_pricing_count: self.pricing.custom_rules_count(),
+                pricing_changed,
                 skipped_empty,
                 skipped_lines,
                 files_cached,
@@ -510,6 +568,16 @@ impl IncrementalScanner {
 
             let ann_title = self.get_annotation_title(&cid);
             let meta = self.meta_cache.get(&cid);
+            let is_subagent = match meta {
+                Some(m) if m.is_internal => true,
+                Some(_) => false,
+                None => cached.subagent_parent_id.is_some(),
+            };
+            let parent_id = if is_subagent {
+                cached.subagent_parent_id.clone().filter(|p| p != &cid)
+            } else {
+                None
+            };
             let title = if !ann_title.is_empty() {
                 ann_title
             } else if let Some(m) = meta.filter(|m| !m.title.is_empty()) {
@@ -518,6 +586,10 @@ impl IncrementalScanner {
                 m.preview.clone()
             } else if !cached.first_user_preview.is_empty() {
                 cached.first_user_preview.clone()
+            } else if is_subagent && !cached.subagent_preview.is_empty() {
+                cached.subagent_preview.clone()
+            } else if is_subagent {
+                "(子会话)".to_string()
             } else {
                 "(未命名会话)".to_string()
             };
@@ -531,8 +603,38 @@ impl IncrementalScanner {
             let mut first_time: Option<DateTime<Local>> = None;
             let mut last_time: Option<DateTime<Local>> = None;
 
-            for t in &cached.turns {
-                counts.add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
+            let fallback_model = dominant_real_model(&cached.turns);
+            let mut last_real_model: Option<String> = None;
+            let mut priced_turns = cached.turns;
+
+            for t in &mut priced_turns {
+                let eff_model = if !t.is_checkpoint && !is_compaction_model(&t.model) && t.model != "unknown" {
+                    last_real_model = Some(t.model.clone());
+                    t.model.as_str()
+                } else if !is_compaction_model(&t.model) && t.model != "unknown" {
+                    t.model.as_str()
+                } else if let Some(prev) = last_real_model.as_deref() {
+                    prev
+                } else {
+                    fallback_model.as_deref().unwrap_or(t.model.as_str())
+                };
+                let local_date = t.timestamp_utc.map(|u| u.with_timezone(&Local).date_naive());
+                t.cost = self.pricing.price_turn(
+                    eff_model,
+                    t.input_tokens,
+                    t.cache_read_tokens,
+                    t.cache_write_tokens,
+                    t.output_tokens,
+                    local_date,
+                );
+
+                counts.add_call_with_cost(
+                    t.input_tokens,
+                    t.cache_read_tokens,
+                    t.cache_write_tokens,
+                    t.output_tokens,
+                    t.cost,
+                );
                 models.insert(t.model.clone());
                 if let Some(ts_utc) = t.timestamp_utc {
                     let ts_local = ts_utc.with_timezone(&Local);
@@ -551,7 +653,10 @@ impl IncrementalScanner {
                 conversation_id: cid,
                 title,
                 workspace,
-                turns: cached.turns,
+                is_subagent,
+                parent_id,
+                parent_title: String::new(),
+                turns: priced_turns,
                 counts,
                 models,
                 first_time,
@@ -559,10 +664,76 @@ impl IncrementalScanner {
             });
         }
 
+        // Link subagent sessions to their parent session so they inherit workspace and parent title.
+        let parent_lookup: HashMap<String, (String, String)> = sessions
+            .iter()
+            .map(|s| (s.conversation_id.clone(), (s.title.clone(), s.workspace.clone())))
+            .collect();
+        for s in &mut sessions {
+            if !s.is_subagent {
+                continue;
+            }
+            let Some(pid) = s.parent_id.clone() else { continue };
+            let resolved = if let Some((ptitle, pws)) = parent_lookup.get(&pid) {
+                Some((ptitle.clone(), pws.clone()))
+            } else {
+                let p_ann = self.get_annotation_title(&pid);
+                let p_meta = self.meta_cache.get(&pid);
+                let ptitle = if !p_ann.is_empty() {
+                    p_ann
+                } else if let Some(m) = p_meta.filter(|m| !m.title.is_empty()) {
+                    m.title.clone()
+                } else if let Some(m) = p_meta.filter(|m| !m.preview.is_empty()) {
+                    m.preview.clone()
+                } else {
+                    String::new()
+                };
+                let pws = p_meta
+                    .filter(|m| !m.workspace.is_empty())
+                    .map(|m| m.workspace.clone())
+                    .unwrap_or_default();
+                if !ptitle.is_empty() || !pws.is_empty() {
+                    Some((ptitle, pws))
+                } else {
+                    None
+                }
+            };
+            if let Some((ptitle, pws)) = resolved {
+                if !ptitle.is_empty() {
+                    s.parent_title = ptitle.clone();
+                }
+                if (s.workspace.is_empty() || s.workspace == "(未知工作区)")
+                    && !pws.is_empty()
+                    && pws != "(未知工作区)"
+                {
+                    s.workspace = pws;
+                }
+                if (s.title == "(子会话)" || s.title == "(未命名会话)") && !ptitle.is_empty() {
+                    s.title = format!("子任务 · {}", ptitle);
+                }
+            }
+        }
+
         self.transcript_cache.retain(|k, _| seen_paths.contains(k));
         sessions.sort_by(|a, b| b.last_time.cmp(&a.last_time));
 
         let agg = aggregate_sessions(&sessions);
+        let today_local = Local::now().date_naive();
+        let mut model_rate_labels = HashMap::new();
+        let mut observed_ranked: Vec<(String, u64)> = agg
+            .by_model
+            .iter()
+            .filter(|(name, _)| !is_compaction_model(name) && name.as_str() != "unknown")
+            .map(|(name, c)| (name.clone(), c.total_tokens()))
+            .collect();
+        observed_ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let observed_names: Vec<String> = observed_ranked.into_iter().map(|(n, _)| n).collect();
+        for name in agg.by_model.keys() {
+            if let Some(lbl) = self.pricing.rate_label(name, Some(today_local)) {
+                model_rate_labels.insert(name.clone(), lbl);
+            }
+        }
+        let pricing_rows = self.pricing.build_table(&observed_names, today_local);
         let warning = if skipped_lines > 0 {
             Some(format!("已跳过 {skipped_lines} 行未写完/异常 JSONL（活跃写入时属正常现象）"))
         } else {
@@ -573,6 +744,11 @@ impl IncrementalScanner {
             data_dir: self.data_dir.clone(),
             sessions,
             agg,
+            model_rate_labels,
+            pricing_rows,
+            pricing_path: self.pricing.override_path().map(Path::to_path_buf),
+            custom_pricing_count: self.pricing.custom_rules_count(),
+            pricing_changed,
             skipped_empty,
             skipped_lines,
             files_cached,
@@ -581,6 +757,20 @@ impl IncrementalScanner {
             warning,
         }
     }
+}
+
+fn dominant_real_model(turns: &[TurnRecord]) -> Option<String> {
+    let mut by_m: HashMap<&str, u64> = HashMap::new();
+    for t in turns {
+        if t.is_checkpoint || is_compaction_model(&t.model) || t.model == "unknown" {
+            continue;
+        }
+        let entry = by_m.entry(t.model.as_str()).or_insert(0);
+        *entry = entry.saturating_add(t.total_input() + t.output_tokens);
+    }
+    by_m.into_iter()
+        .max_by_key(|&(_, tok)| tok)
+        .map(|(m, _)| m.to_string())
 }
 
 pub fn filter_snapshot(snapshot: &ScanSnapshot, scope: DateScope) -> (Vec<SessionInfo>, AggregatedStats) {
@@ -610,7 +800,13 @@ pub fn filter_snapshot(snapshot: &ScanSnapshot, scope: DateScope) -> (Vec<Sessio
             if ts_local.date_naive() < min_date || ts_local.date_naive() > today {
                 continue;
             }
-            counts.add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
+            counts.add_call_with_cost(
+                t.input_tokens,
+                t.cache_read_tokens,
+                t.cache_write_tokens,
+                t.output_tokens,
+                t.cost,
+            );
             models.insert(t.model.clone());
             first_time = Some(match first_time {
                 Some(prev) if prev <= ts_local => prev,
@@ -627,6 +823,9 @@ pub fn filter_snapshot(snapshot: &ScanSnapshot, scope: DateScope) -> (Vec<Sessio
                 conversation_id: s.conversation_id.clone(),
                 title: s.title.clone(),
                 workspace: s.workspace.clone(),
+                is_subagent: s.is_subagent,
+                parent_id: s.parent_id.clone(),
+                parent_title: s.parent_title.clone(),
                 turns,
                 counts,
                 models,
@@ -654,7 +853,13 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
             agg.by_model
                 .entry(t.model.clone())
                 .or_default()
-                .add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
+                .add_call_with_cost(
+                    t.input_tokens,
+                    t.cache_read_tokens,
+                    t.cache_write_tokens,
+                    t.output_tokens,
+                    t.cost,
+                );
 
             let mcs = agg.by_model_cache.entry(t.model.clone()).or_default();
             if idx > 0 && !t.is_checkpoint {
@@ -679,21 +884,40 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
                 agg.by_day
                     .entry(day_key.clone())
                     .or_default()
-                    .add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
+                    .add_call_with_cost(
+                        t.input_tokens,
+                        t.cache_read_tokens,
+                        t.cache_write_tokens,
+                        t.output_tokens,
+                        t.cost,
+                    );
                 agg.by_week
                     .entry(wk_key.clone())
                     .or_default()
-                    .add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
+                    .add_call_with_cost(
+                        t.input_tokens,
+                        t.cache_read_tokens,
+                        t.cache_write_tokens,
+                        t.output_tokens,
+                        t.cost,
+                    );
                 week_day_sets.entry(wk_key).or_default().insert(day_key);
                 agg.by_month
                     .entry(month_key)
                     .or_default()
-                    .add_call(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens);
-                agg.by_hour[hour].add_call(
+                    .add_call_with_cost(
+                        t.input_tokens,
+                        t.cache_read_tokens,
+                        t.cache_write_tokens,
+                        t.output_tokens,
+                        t.cost,
+                    );
+                agg.by_hour[hour].add_call_with_cost(
                     t.input_tokens,
                     t.cache_read_tokens,
                     t.cache_write_tokens,
                     t.output_tokens,
+                    t.cost,
                 );
             }
         }
@@ -777,7 +1001,10 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
     let mut reader = BufReader::with_capacity(64 * 1024, fh);
     let mut by_step: BTreeMap<i64, TurnRecord> = BTreeMap::new();
     let mut fallback_step: i64 = -1;
+    let mut seen_user_input = false;
     let mut first_user_preview = String::new();
+    let mut subagent_parent_id: Option<String> = None;
+    let mut subagent_preview = String::new();
     let mut skipped_lines = 0usize;
     let mut line = String::new();
 
@@ -793,10 +1020,15 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
         }
         // Fast path: skip full JSON DOM parsing for bulky tool-result / non-token lines
         // that are syntactically framed as a JSON object and carry no token counters.
-        let need_preview = first_user_preview.is_empty() && trimmed.contains("USER_INPUT");
+        let need_preview = !seen_user_input && trimmed.contains("USER_INPUT");
+        let need_subagent_meta = !seen_user_input
+            && subagent_parent_id.is_none()
+            && subagent_preview.is_empty()
+            && trimmed.contains("SYSTEM_MESSAGE");
         if trimmed.starts_with('{')
             && trimmed.ends_with('}')
             && !need_preview
+            && !need_subagent_meta
             && !trimmed.contains("_tokens")
         {
             continue;
@@ -806,11 +1038,23 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
             continue;
         };
 
-        if first_user_preview.is_empty()
-            && map.get("type").and_then(Value::as_str) == Some("USER_INPUT")
+        let step_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+        if step_type == "USER_INPUT" {
+            seen_user_input = true;
+            if first_user_preview.is_empty() {
+                if let Some(content) = map.get("content").and_then(Value::as_str) {
+                    first_user_preview = extract_user_preview(content);
+                }
+            }
+        } else if !seen_user_input
+            && subagent_parent_id.is_none()
+            && subagent_preview.is_empty()
+            && step_type == "SYSTEM_MESSAGE"
         {
             if let Some(content) = map.get("content").and_then(Value::as_str) {
-                first_user_preview = extract_user_preview(content);
+                let (pid, prev) = extract_subagent_meta(content);
+                subagent_parent_id = pid;
+                subagent_preview = prev;
             }
         }
 
@@ -847,7 +1091,6 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
             .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
-        let step_type = map.get("type").and_then(Value::as_str).unwrap_or("");
         let is_checkpoint = step_type == "CHECKPOINT";
         let model = map
             .get("model")
@@ -877,19 +1120,73 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
                 cache_read_tokens,
                 cache_write_tokens,
                 output_tokens,
+                cost: CostBreakdown::default(),
             },
         );
     }
 
     let mut turns: Vec<TurnRecord> = by_step.into_values().collect();
     turns.sort_by_key(|t| (if t.step_index >= 0 { t.step_index } else { i64::MAX }, t.timestamp_utc));
+    if seen_user_input {
+        subagent_parent_id = None;
+        subagent_preview.clear();
+    }
 
     Some(CachedTranscript {
         sig,
         turns,
         first_user_preview,
+        subagent_parent_id,
+        subagent_preview,
         skipped_lines,
     })
+}
+
+fn is_uuid_like(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &ch) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parses subagent launcher system message:
+/// `[Message] timestamp=... sender=<parent-uuid> priority=... content=<task prompt>`
+fn extract_subagent_meta(content: &str) -> (Option<String>, String) {
+    let mut parent_id = None;
+    if let Some(pos) = content.find("sender=") {
+        let rest = &content[pos + "sender=".len()..];
+        let token = rest.split_whitespace().next().unwrap_or("");
+        if is_uuid_like(token) {
+            parent_id = Some(token.to_string());
+        }
+    }
+    let mut preview = String::new();
+    if let Some(pos) = content.find("content=") {
+        let body = &content[pos + "content=".len()..];
+        // Pick first meaningful non-empty line, strip markdown markers for crisp display.
+        for line in body.lines() {
+            let trimmed = line.trim().trim_start_matches('#').trim();
+            if trimmed.is_empty() || trimmed.starts_with("</SYSTEM_MESSAGE>") {
+                continue;
+            }
+            let cleaned_md = trimmed.replace("**", "").replace('`', "");
+            preview = clean_single_line(&cleaned_md, 72);
+            if !preview.is_empty() {
+                break;
+            }
+        }
+    }
+    (parent_id, preview)
 }
 
 fn val_to_u64(val: Option<&Value>) -> u64 {
@@ -947,32 +1244,38 @@ fn parse_metadata_json(text: &str) -> HashMap<String, CachedMetaEntry> {
         return out;
     };
     for (cid, entry) in convs {
-        let Some(summary) = entry.get("summary").and_then(Value::as_object) else {
-            continue;
-        };
+        let is_internal = entry
+            .get("is_internal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let summary = entry.get("summary").and_then(Value::as_object);
         let title = summary
-            .get("Title")
+            .and_then(|s| s.get("Title"))
             .and_then(Value::as_str)
             .map(|s| clean_single_line(s, 100))
             .unwrap_or_default();
         let preview = summary
-            .get("Preview")
+            .and_then(|s| s.get("Preview"))
             .and_then(Value::as_str)
             .map(|s| clean_single_line(s, 100))
             .unwrap_or_default();
         let workspace = summary
-            .get("WorkspaceURIs")
+            .and_then(|s| s.get("WorkspaceURIs"))
             .and_then(Value::as_array)
             .and_then(|arr| arr.first())
             .and_then(Value::as_str)
             .map(decode_file_uri)
             .unwrap_or_default();
+        if !is_internal && summary.is_none() {
+            continue;
+        }
         out.insert(
             cid.clone(),
             CachedMetaEntry {
                 title,
                 preview,
                 workspace,
+                is_internal,
             },
         );
     }
@@ -1099,6 +1402,9 @@ mod tests {
             conversation_id: "abc".into(),
             title: "t".into(),
             workspace: "C:/Users/qingz/agent-home/".into(),
+            is_subagent: false,
+            parent_id: None,
+            parent_title: String::new(),
             turns: vec![
                 TurnRecord {
                     step_index: 1,
@@ -1109,6 +1415,7 @@ mod tests {
                     cache_read_tokens: 500_000,
                     cache_write_tokens: 0,
                     output_tokens: 6_000,
+                    cost: CostBreakdown::default(),
                 },
                 TurnRecord {
                     step_index: 2,
@@ -1119,6 +1426,7 @@ mod tests {
                     cache_read_tokens: 100_000,
                     cache_write_tokens: 0,
                     output_tokens: 500,
+                    cost: CostBreakdown::default(),
                 },
                 TurnRecord {
                     step_index: 3,
@@ -1129,6 +1437,7 @@ mod tests {
                     cache_read_tokens: 10_000,
                     cache_write_tokens: 0,
                     output_tokens: 200,
+                    cost: CostBreakdown::default(),
                 },
             ],
             counts: TokenCounts::default(),
@@ -1151,6 +1460,9 @@ mod tests {
             conversation_id: "m".into(),
             title: "m".into(),
             workspace: "".into(),
+            is_subagent: false,
+            parent_id: None,
+            parent_title: String::new(),
             turns: vec![
                 // Turn 0 cold start is not counted as a multi-turn miss
                 TurnRecord {
@@ -1162,6 +1474,7 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                     output_tokens: 500,
+                    cost: CostBreakdown::default(),
                 },
                 // Normal high hit
                 TurnRecord {
@@ -1173,6 +1486,7 @@ mod tests {
                     cache_read_tokens: 40_000,
                     cache_write_tokens: 0,
                     output_tokens: 500,
+                    cost: CostBreakdown::default(),
                 },
                 // Big cache miss (>=30K ctx, <50% hit)
                 TurnRecord {
@@ -1184,6 +1498,7 @@ mod tests {
                     cache_read_tokens: 5_000,
                     cache_write_tokens: 0,
                     output_tokens: 800,
+                    cost: CostBreakdown::default(),
                 },
             ],
             counts: TokenCounts::default(),
@@ -1205,5 +1520,98 @@ mod tests {
         assert!(is_compaction_model(COMPACTION_MODEL_LABEL));
         assert!(is_compaction_model("compaction"));
         assert!(!is_compaction_model("gemini-4-neon-xhigh"));
+    }
+
+    #[test]
+    fn test_scanner_pricing_compaction_and_override() {
+        let base = std::env::temp_dir().join(format!("agy_gauge_price_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let logs = base
+            .join("brain")
+            .join("sess-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let jsonl = [
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T01:00:00Z","model":"gemini-4-neon-xhigh","input_tokens":1000000,"cache_read_tokens":0,"output_tokens":0}"#,
+            r#"{"step_index":2,"type":"CHECKPOINT","status":"DONE","created_at":"2026-11-22T01:05:00Z","input_tokens":1000000,"cache_read_tokens":0,"output_tokens":0}"#,
+        ]
+        .join("\n");
+        fs::write(logs.join("transcript.jsonl"), jsonl).unwrap();
+
+        let pricing_path = base.join("pricing.json");
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), Some(pricing_path.clone()));
+        let snap1 = scanner.scan();
+        // Built-in gemini-4-neon input = $3/M -> 2 turns * $3 = $6.00 (checkpoint inherited neon)
+        assert!((snap1.agg.total.cost.total_usd() - 6.0).abs() < 1e-6);
+        assert_eq!(snap1.agg.total.cost.unpriced_calls, 0);
+
+        // Drop a pricing.json override and verify hot reload on next scan
+        fs::write(
+            &pricing_path,
+            r#"{"models":{"gemini-4-neon":{"input":10.0,"cache_read":0.5,"output":20.0}}}"#,
+        )
+        .unwrap();
+        let snap2 = scanner.scan();
+        assert!(snap2.pricing_changed);
+        assert_eq!(snap2.custom_pricing_count, 1);
+        assert!((snap2.agg.total.cost.total_usd() - 20.0).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_subagent_parent_linking_and_workspace_inheritance() {
+        let base = std::env::temp_dir().join(format!("agy_gauge_subagent_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let parent_id = "8c1095e2-1558-4a06-bfde-446204f978aa";
+        let child_id = "14ee4713-eb4d-4a3c-b6a9-6745e2e553e2";
+        let p_logs = base.join("brain").join(parent_id).join(".system_generated").join("logs");
+        let c_logs = base.join("brain").join(child_id).join(".system_generated").join("logs");
+        let cache = base.join("cache");
+        fs::create_dir_all(&p_logs).unwrap();
+        fs::create_dir_all(&c_logs).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        fs::write(
+            cache.join("conversation_metadata.json"),
+            format!(
+                r#"{{"conversations":{{"{parent_id}":{{"summary":{{"Title":"Subvault Review","WorkspaceURIs":["file:///C:/Users/qingz/agent-home"]}}}},"{child_id}":{{"is_internal":true}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let parent_lines = [
+            r#"{"step_index":0,"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","content":"<USER_REQUEST>\nReview SubVault\n</USER_REQUEST>"}"#.to_string(),
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T14:48:00Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":0,"output_tokens":100}"#.to_string(),
+            // Reply SYSTEM_MESSAGE sent from child back to parent must NEVER mark parent as a subagent.
+            format!(
+                r#"{{"step_index":2,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T14:50:00Z sender={child_id} priority=MESSAGE_PRIORITY_HIGH content=Subagent finished\n</SYSTEM_MESSAGE>"}}"#
+            ),
+        ]
+        .join("\n");
+        fs::write(p_logs.join("transcript.jsonl"), format!("{parent_lines}\n")).unwrap();
+        let child_sys = format!(
+            r#"{{"step_index":0,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T14:48:47Z sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=You are executing **Wave 2 · Track A** for `SubVault`.\n</SYSTEM_MESSAGE>"}}"#
+        );
+        let child_turn = r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T14:49:00Z","model":"gemini-4-hydrogen-tiered-xhigh","input_tokens":2000,"cache_read_tokens":5000,"output_tokens":300}"#;
+        fs::write(c_logs.join("transcript.jsonl"), format!("{child_sys}\n{child_turn}\n")).unwrap();
+
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None);
+        let snap = scanner.scan();
+        assert_eq!(snap.sessions.len(), 2);
+        let parent = snap.sessions.iter().find(|s| s.conversation_id == parent_id).unwrap();
+        assert!(!parent.is_subagent);
+        assert!(parent.parent_id.is_none());
+        let child = snap.sessions.iter().find(|s| s.conversation_id == child_id).unwrap();
+        assert!(child.is_subagent);
+        assert_eq!(child.parent_id.as_deref(), Some(parent_id));
+        assert_eq!(child.parent_title, "Subvault Review");
+        assert_eq!(child.workspace, "C:/Users/qingz/agent-home");
+        assert_eq!(child.title, "You are executing Wave 2 · Track A for SubVault.");
+        // Child's tokens are aggregated under the inherited parent workspace, not "(未知工作区)"
+        assert!(!snap.agg.by_workspace.contains_key("(未知工作区)"));
+        assert_eq!(snap.agg.by_workspace.get("C:/Users/qingz/agent-home").unwrap().0, 2);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
