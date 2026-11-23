@@ -5,7 +5,7 @@ use std::mem::{size_of, zeroed};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, PWSTR, w};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED,
@@ -22,9 +22,10 @@ use windows::Win32::System::ProcessStatus::{
     K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_READ, KEY_SET_VALUE,
+    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ,
+    RRF_RT_REG_SZ,
 };
 use windows::Win32::System::SystemInformation::{GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetSystemTimes};
@@ -1154,6 +1155,162 @@ impl Drop for TrayIcon {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayPromoteResult {
+    NotFound,
+    AlreadyPromoted,
+    PromotedNow,
+}
+
+fn normalize_exe_path_for_compare(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"');
+    let stripped = trimmed
+        .strip_prefix(r"\\?\")
+        .or_else(|| trimmed.strip_prefix("//?/"))
+        .unwrap_or(trimmed);
+    stripped.replace('/', "\\").to_ascii_lowercase()
+}
+
+fn reg_read_key_u32(hkey: HKEY, name: PCWSTR) -> Option<u32> {
+    unsafe {
+        let mut val: u32 = 0;
+        let mut sz: u32 = size_of::<u32>() as u32;
+        if RegGetValueW(
+            hkey,
+            None,
+            name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut val as *mut u32).cast()),
+            Some(&mut sz),
+        )
+        .is_ok()
+        {
+            Some(val)
+        } else {
+            None
+        }
+    }
+}
+
+fn reg_read_key_string(hkey: HKEY, name: PCWSTR) -> Option<String> {
+    unsafe {
+        let mut sz: u32 = 0;
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+        if RegGetValueW(hkey, None, name, flags, None, None, Some(&mut sz)).is_err() || sz < 2 {
+            return None;
+        }
+        let mut buf = vec![0u16; (sz as usize + 1) / 2];
+        if RegGetValueW(
+            hkey,
+            None,
+            name,
+            flags,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut sz),
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    }
+}
+
+/// Promotes (pins) this executable's notification icon directly onto the visible Windows 11
+/// taskbar (beside the IME indicator and clock, outside the `^` overflow chevron) by setting
+/// `IsPromoted = 1` in the user's `HKCU\Control Panel\NotifyIconSettings\<id>` entry.
+pub fn promote_self_tray_icon_on_taskbar() -> TrayPromoteResult {
+    let Ok(self_exe) = std::env::current_exe() else {
+        return TrayPromoteResult::NotFound;
+    };
+    let target = normalize_exe_path_for_compare(&self_exe.to_string_lossy());
+    if target.is_empty() {
+        return TrayPromoteResult::NotFound;
+    }
+
+    const NOTIFY_SETTINGS_KEY: PCWSTR = w!("Control Panel\\NotifyIconSettings");
+    let mut found_already = false;
+    let mut promoted_now = false;
+
+    unsafe {
+        let mut root = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            NOTIFY_SETTINGS_KEY,
+            0,
+            KEY_READ | KEY_ENUMERATE_SUB_KEYS,
+            &mut root,
+        )
+        .is_err()
+        {
+            return TrayPromoteResult::NotFound;
+        }
+
+        let mut index = 0u32;
+        let mut name_buf = [0u16; 256];
+        loop {
+            let mut name_len = name_buf.len() as u32;
+            let status = RegEnumKeyExW(
+                root,
+                index,
+                PWSTR(name_buf.as_mut_ptr()),
+                &mut name_len,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            );
+            if status.is_err() {
+                break;
+            }
+            index += 1;
+
+            let sub_name = PCWSTR(name_buf.as_ptr());
+            let mut sub = HKEY::default();
+            if RegOpenKeyExW(root, sub_name, 0, KEY_READ, &mut sub).is_err() {
+                continue;
+            }
+            let exe_match = reg_read_key_string(sub, w!("ExecutablePath"))
+                .map(|p| normalize_exe_path_for_compare(&p) == target)
+                .unwrap_or(false);
+            let uid_match = reg_read_key_u32(sub, w!("UID"))
+                .map(|u| u == 1)
+                .unwrap_or(true);
+            let cur_promoted = reg_read_key_u32(sub, w!("IsPromoted"));
+            let _ = RegCloseKey(sub);
+
+            if !exe_match || !uid_match {
+                continue;
+            }
+            if cur_promoted == Some(1) {
+                found_already = true;
+                continue;
+            }
+
+            let mut sub_w = HKEY::default();
+            if RegOpenKeyExW(root, sub_name, 0, KEY_SET_VALUE, &mut sub_w).is_ok() {
+                let one = 1u32.to_le_bytes();
+                if RegSetValueExW(sub_w, w!("IsPromoted"), 0, REG_DWORD, Some(&one)).is_ok() {
+                    promoted_now = true;
+                }
+                let _ = RegCloseKey(sub_w);
+            }
+        }
+        let _ = RegCloseKey(root);
+    }
+
+    if promoted_now {
+        TrayPromoteResult::PromotedNow
+    } else if found_already {
+        TrayPromoteResult::AlreadyPromoted
+    } else {
+        TrayPromoteResult::NotFound
+    }
+}
+
 pub fn prompt_save_file(
     owner: HWND,
     default_filename: &str,
@@ -1680,5 +1837,10 @@ mod tests {
         assert!(is_cursor_in_tray_hover_zone((2240, 1370), icon_mid, pos, 240, 50, 10)); // on pill
         assert!(!is_cursor_in_tray_hover_zone((2400, 1416), icon_mid, pos, 240, 50, 10)); // adjacent tray icon
         assert!(!is_cursor_in_tray_hover_zone((2296, 1200), icon_mid, pos, 240, 50, 10)); // far above pill
+
+        assert_eq!(
+            normalize_exe_path_for_compare(r#"\\?\C:/Users/Qingz/agy-token-monitor.exe"#),
+            r"c:\users\qingz\agy-token-monitor.exe"
+        );
     }
 }
