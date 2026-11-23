@@ -95,12 +95,12 @@ use telemetry::{
     clamp_pos_to_work_area, copy_text_to_clipboard, dpi_for_point, enable_dpi_awareness,
     get_work_area, guard_topmost_windowpos, inspect_pill_topmost_health, is_autostart_enabled,
     is_cursor_in_tray_hover_zone, is_other_app_fullscreen, load_user_prefs,
-    monitor_index_for_point, promote_self_tray_icon_on_taskbar, prompt_save_file,
-    read_self_private_mb, read_self_working_set_mb, register_taskbar_created_msg, save_user_prefs,
-    set_autostart_enabled, to_wide_null, trim_self_working_set, wide_pcwstr, window_dpi_scale,
-    SingleInstanceGuard, SystemTelemetry, TopmostHealth, TrayIcon, TrayPromoteResult, UserPrefs,
-    PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
-    WM_APP_SYNC_PREFS, WM_APP_TRAY,
+    monitor_index_for_point, prompt_save_file, read_self_private_mb, read_self_working_set_mb,
+    register_taskbar_created_msg, save_user_prefs, set_autostart_enabled,
+    set_self_tray_icon_taskbar_promoted, to_wide_null, trim_self_working_set, wide_pcwstr,
+    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, TopmostHealth, TrayIcon, TrayPinResult,
+    UserPrefs, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM,
+    PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS, WM_APP_TRAY,
 };
 
 const TIMER_TELEMETRY: usize = 1;
@@ -692,7 +692,7 @@ struct AppState {
     tray_hover_icon_rect: Option<RECT>,
     tray_hover_leave_since: Option<Instant>,
     tray_hover_suppress_until: Option<Instant>,
-    tray_promote_retries: u8,
+    tray_pin_retries: u8,
     fullscreen_hidden: bool,
     notifications_enabled: bool,
     hide_on_fullscreen: bool,
@@ -1110,9 +1110,7 @@ impl AppState {
             self.tray_hover_mode = p.tray_hover_mode;
             self.tray_hover_shown = false;
             self.tray_hover_leave_since = None;
-            if self.tray_hover_mode {
-                self.tray_promote_retries = 6;
-            }
+            self.tray_pin_retries = 6;
             if !self.pill_hwnd.0.is_null() {
                 unsafe {
                     let _ = KillTimer(self.pill_hwnd, TIMER_TRAY_HOVER);
@@ -1267,14 +1265,14 @@ impl AppState {
         }
     }
 
-    fn ensure_tray_promoted(&mut self) {
-        if !self.tray_hover_mode || self.self_test_mode || self.dashboard_only {
-            self.tray_promote_retries = 0;
+    fn sync_tray_taskbar_pin(&mut self) {
+        if self.self_test_mode || self.dashboard_only {
+            self.tray_pin_retries = 0;
             return;
         }
-        match promote_self_tray_icon_on_taskbar() {
-            TrayPromoteResult::PromotedNow => {
-                self.tray_promote_retries = 0;
+        match set_self_tray_icon_taskbar_promoted(self.tray_hover_mode) {
+            TrayPinResult::UpdatedNow => {
+                self.tray_pin_retries = 0;
                 let tip = self.build_tray_tooltip();
                 if let Some(tray) = &mut self.tray {
                     tray.remove();
@@ -1282,11 +1280,11 @@ impl AppState {
                 }
                 self.last_tray_tip = tip;
             }
-            TrayPromoteResult::AlreadyPromoted => {
-                self.tray_promote_retries = 0;
+            TrayPinResult::AlreadyMatched => {
+                self.tray_pin_retries = 0;
             }
-            TrayPromoteResult::NotFound => {
-                self.tray_promote_retries = self.tray_promote_retries.saturating_sub(1);
+            TrayPinResult::NotFound => {
+                self.tray_pin_retries = self.tray_pin_retries.saturating_sub(1);
             }
         }
     }
@@ -2066,14 +2064,13 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                     let restored_top = with_app(|app| {
                         app.tray_hover_mode = !app.tray_hover_mode;
                         app.hide_tray_hover_flyout();
-                        if app.tray_hover_mode {
-                            app.tray_promote_retries = 6;
-                            app.ensure_tray_promoted();
-                        } else {
+                        if !app.tray_hover_mode {
                             app.pill_visible = true;
                             app.fullscreen_hidden = false;
                             app.pill_renderer.invalidate_position();
                         }
+                        app.tray_pin_retries = 6;
+                        app.sync_tray_taskbar_pin();
                         app.apply_pill_visibility();
                         app.sync_tray_and_alerts();
                         app.persist_and_sync(hwnd);
@@ -2092,6 +2089,8 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                             app.pill_visible = true;
                             app.fullscreen_hidden = false;
                             app.pill_renderer.invalidate_position();
+                            app.tray_pin_retries = 6;
+                            app.sync_tray_taskbar_pin();
                         } else {
                             app.pill_visible = !app.pill_visible;
                             if app.pill_visible {
@@ -2167,8 +2166,13 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                 }
                 CMD_REDOCK => {
                     with_app(|app| {
+                        let left_hover = app.tray_hover_mode;
                         app.tray_hover_mode = false;
                         app.hide_tray_hover_flyout();
+                        if left_hover {
+                            app.tray_pin_retries = 6;
+                            app.sync_tray_taskbar_pin();
+                        }
                         app.pill_visible = true;
                         app.fullscreen_hidden = false;
                         app.custom_pos = None;
@@ -2485,8 +2489,8 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let top = p.topmost;
             with_app(|app| {
                 app.apply_synced_prefs(p);
-                if app.tray_hover_mode && app.tray_promote_retries > 0 {
-                    app.ensure_tray_promoted();
+                if app.tray_pin_retries > 0 {
+                    app.sync_tray_taskbar_pin();
                 }
                 app.apply_pill_visibility();
                 app.sync_tray_and_alerts();
@@ -2500,8 +2504,8 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 TIMER_TELEMETRY => {
                     with_app(|app| {
                         app.telemetry.sample();
-                        if app.tray_promote_retries > 0 {
-                            app.ensure_tray_promoted();
+                        if app.tray_pin_retries > 0 {
+                            app.sync_tray_taskbar_pin();
                         }
                         app.check_fullscreen_guard();
                         app.redraw_pill();
@@ -2565,10 +2569,8 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     if let Some(tray) = &mut app.tray {
                         tray.add(&tip);
                     }
-                    if app.tray_hover_mode {
-                        app.tray_promote_retries = 6;
-                        app.ensure_tray_promoted();
-                    }
+                    app.tray_pin_retries = 6;
+                    app.sync_tray_taskbar_pin();
                 });
                 return LRESULT(0);
             }
@@ -3294,7 +3296,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             tray_hover_icon_rect: None,
             tray_hover_leave_since: None,
             tray_hover_suppress_until: None,
-            tray_promote_retries: if prefs.tray_hover_mode { 6 } else { 0 },
+            tray_pin_retries: 6,
             fullscreen_hidden: false,
             notifications_enabled: prefs.notifications_enabled,
             hide_on_fullscreen: prefs.hide_on_fullscreen,
@@ -3332,9 +3334,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
         } else {
             with_app(|app| {
                 app.sync_tray_and_alerts();
-                if app.tray_hover_mode {
-                    app.ensure_tray_promoted();
-                }
+                app.sync_tray_taskbar_pin();
             });
             if (!prefs.tray_hover_mode && prefs.pill_visible) || opts.self_test {
                 with_app(|app| app.redraw_pill());

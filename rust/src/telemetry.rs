@@ -24,8 +24,7 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_READ, KEY_SET_VALUE,
-    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ,
-    RRF_RT_REG_SZ,
+    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::SystemInformation::{GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetSystemTimes};
@@ -391,7 +390,8 @@ pub fn clamp_pos_to_work_area(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) ->
 }
 
 /// Computes the layered window `(win_x, win_y)` for the tray-hover capsule flyout so that the
-/// visible pill hugs snugly right above (or adjacent to) the taskbar/tray icon without clipping.
+/// visible pill aligns cleanly from the tray icon rightward toward the bottom-right corner
+/// (keeping a comfortable breathing margin from the screen edge and taskbar) without clipping.
 pub fn compute_tray_flyout_pos_in_list(
     mons: &[MonitorDesc],
     icon: RECT,
@@ -402,13 +402,14 @@ pub fn compute_tray_flyout_pos_in_list(
 ) -> (i32, i32) {
     let vis_w = (px_w - shadow_px * 2).max(1);
     let vis_h = (px_h - shadow_px * 2).max(1);
-    let gap = (4.0 * scale).round() as i32;
+    let gap = (6.0 * scale).round() as i32;
     let margin = (6.0 * scale).round() as i32;
+    let right_margin = (18.0 * scale).round() as i32;
     let icx = (icon.left + icon.right) / 2;
     let icy = (icon.top + icon.bottom) / 2;
 
     if mons.is_empty() {
-        return (icx - vis_w / 2 - shadow_px, icon.top - gap - vis_h - shadow_px);
+        return (icon.left - shadow_px, icon.top - gap - vis_h - shadow_px);
     }
 
     let cur = &mons[nearest_monitor_idx(mons, icx, icy)];
@@ -417,8 +418,8 @@ pub fn compute_tray_flyout_pos_in_list(
 
     let clamp_x = |lo: i32, hi_edge: i32| -> i32 {
         let min_x = lo + margin;
-        let max_x = (hi_edge - margin - vis_w).max(min_x);
-        (icx - vis_w / 2).clamp(min_x, max_x)
+        let max_x = (hi_edge - right_margin - vis_w).max(min_x);
+        icon.left.clamp(min_x, max_x)
     };
     let clamp_y = |lo: i32, hi_edge: i32| -> i32 {
         let min_y = lo + margin;
@@ -522,14 +523,14 @@ pub fn is_cursor_in_tray_hover_zone(
     if vb <= icon.top + 8 {
         // Capsule is above icon (bottom taskbar)
         let bl = icon.left - 14;
-        let br = icon.right + 14;
+        let br = (icon.right + 24).min(vr + 6).max(icon.right + 14);
         if in_rect(bl, vb - 4, br, icon.top + 4) {
             return true;
         }
     } else if vt >= icon.bottom - 8 {
         // Capsule is below icon (top taskbar)
         let bl = icon.left - 14;
-        let br = icon.right + 14;
+        let br = (icon.right + 24).min(vr + 6).max(icon.right + 14);
         if in_rect(bl, icon.bottom - 4, br, vt + 4) {
             return true;
         }
@@ -1156,10 +1157,19 @@ impl Drop for TrayIcon {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayPromoteResult {
+pub enum TrayPinResult {
     NotFound,
-    AlreadyPromoted,
-    PromotedNow,
+    AlreadyMatched,
+    UpdatedNow,
+}
+
+fn desired_tray_promoted_write(current: Option<u32>, want_promoted: bool) -> Option<u32> {
+    let currently_promoted = current.unwrap_or(0) != 0;
+    if currently_promoted == want_promoted {
+        None
+    } else {
+        Some(u32::from(want_promoted))
+    }
 }
 
 fn normalize_exe_path_for_compare(raw: &str) -> String {
@@ -1196,7 +1206,9 @@ fn reg_read_key_u32(hkey: HKEY, name: PCWSTR) -> Option<u32> {
 fn reg_read_key_string(hkey: HKEY, name: PCWSTR) -> Option<String> {
     unsafe {
         let mut sz: u32 = 0;
-        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+        // RRF_RT_REG_SZ (without RRF_NOEXPAND) reads REG_SZ and auto-expands REG_EXPAND_SZ.
+        // Passing RRF_RT_REG_EXPAND_SZ without RRF_NOEXPAND fails with ERROR_INVALID_PARAMETER.
+        let flags = RRF_RT_REG_SZ;
         if RegGetValueW(hkey, None, name, flags, None, None, Some(&mut sz)).is_err() || sz < 2 {
             return None;
         }
@@ -1219,21 +1231,22 @@ fn reg_read_key_string(hkey: HKEY, name: PCWSTR) -> Option<String> {
     }
 }
 
-/// Promotes (pins) this executable's notification icon directly onto the visible Windows 11
-/// taskbar (beside the IME indicator and clock, outside the `^` overflow chevron) by setting
-/// `IsPromoted = 1` in the user's `HKCU\Control Panel\NotifyIconSettings\<id>` entry.
-pub fn promote_self_tray_icon_on_taskbar() -> TrayPromoteResult {
+/// Sets whether this executable's notification icon is promoted (pinned) directly onto the visible
+/// Windows 11 taskbar (`promoted = true`, `IsPromoted = 1`, beside IME/clock outside `^`) or folded
+/// cleanly back into the `^` overflow chevron (`promoted = false`, `IsPromoted = 0`) in the user's
+/// `HKCU\Control Panel\NotifyIconSettings\<id>` entry.
+pub fn set_self_tray_icon_taskbar_promoted(promoted: bool) -> TrayPinResult {
     let Ok(self_exe) = std::env::current_exe() else {
-        return TrayPromoteResult::NotFound;
+        return TrayPinResult::NotFound;
     };
     let target = normalize_exe_path_for_compare(&self_exe.to_string_lossy());
     if target.is_empty() {
-        return TrayPromoteResult::NotFound;
+        return TrayPinResult::NotFound;
     }
 
     const NOTIFY_SETTINGS_KEY: PCWSTR = w!("Control Panel\\NotifyIconSettings");
-    let mut found_already = false;
-    let mut promoted_now = false;
+    let mut found_matched = false;
+    let mut updated_now = false;
 
     unsafe {
         let mut root = HKEY::default();
@@ -1246,7 +1259,7 @@ pub fn promote_self_tray_icon_on_taskbar() -> TrayPromoteResult {
         )
         .is_err()
         {
-            return TrayPromoteResult::NotFound;
+            return TrayPinResult::NotFound;
         }
 
         let mut index = 0u32;
@@ -1285,16 +1298,16 @@ pub fn promote_self_tray_icon_on_taskbar() -> TrayPromoteResult {
             if !exe_match || !uid_match {
                 continue;
             }
-            if cur_promoted == Some(1) {
-                found_already = true;
+            let Some(next_val) = desired_tray_promoted_write(cur_promoted, promoted) else {
+                found_matched = true;
                 continue;
-            }
+            };
 
             let mut sub_w = HKEY::default();
             if RegOpenKeyExW(root, sub_name, 0, KEY_SET_VALUE, &mut sub_w).is_ok() {
-                let one = 1u32.to_le_bytes();
-                if RegSetValueExW(sub_w, w!("IsPromoted"), 0, REG_DWORD, Some(&one)).is_ok() {
-                    promoted_now = true;
+                let bytes = next_val.to_le_bytes();
+                if RegSetValueExW(sub_w, w!("IsPromoted"), 0, REG_DWORD, Some(&bytes)).is_ok() {
+                    updated_now = true;
                 }
                 let _ = RegCloseKey(sub_w);
             }
@@ -1302,12 +1315,12 @@ pub fn promote_self_tray_icon_on_taskbar() -> TrayPromoteResult {
         let _ = RegCloseKey(root);
     }
 
-    if promoted_now {
-        TrayPromoteResult::PromotedNow
-    } else if found_already {
-        TrayPromoteResult::AlreadyPromoted
+    if updated_now {
+        TrayPinResult::UpdatedNow
+    } else if found_matched {
+        TrayPinResult::AlreadyMatched
     } else {
-        TrayPromoteResult::NotFound
+        TrayPinResult::NotFound
     }
 }
 
@@ -1812,29 +1825,30 @@ mod tests {
         };
         let mons = vec![primary];
 
-        // 1) Bottom taskbar, icon centered with room on right -> docks 4px above taskbar, centered on icon
+        // 1) Bottom taskbar, icon with room on right -> docks 6px above taskbar, anchored from icon.left rightward
         let icon_mid = RECT { left: 2280, top: 1392, right: 2312, bottom: 1440 };
         let pos = compute_tray_flyout_pos_in_list(&mons, icon_mid, 240, 50, 10, 1.0);
-        // vis_w = 220, vis_h = 30; icx = 2296 -> vis_x = 2186 -> win_x = 2176
-        // vis_y = 1392 - 4 - 30 = 1358 -> win_y = 1348 (vis_bottom = 1388)
-        assert_eq!(pos, (2176, 1348));
+        // vis_w = 220, vis_h = 30; vis_x = 2280 -> win_x = 2270 (vis_right = 2500, 60px from right edge)
+        // vis_y = 1392 - 6 - 30 = 1356 -> win_y = 1346 (vis_bottom = 1386)
+        assert_eq!(pos, (2270, 1346));
 
-        // 2) Bottom taskbar near far-right clock -> clamped 6px inside right screen edge
-        let icon_right = RECT { left: 2500, top: 1392, right: 2532, bottom: 1440 };
+        // 2) Bottom taskbar near right side -> clamped with 18px breathing margin inside right screen edge
+        let icon_right = RECT { left: 2420, top: 1392, right: 2452, bottom: 1440 };
         let pos_r = compute_tray_flyout_pos_in_list(&mons, icon_right, 240, 50, 10, 1.0);
         let vis_right = pos_r.0 + 240 - 10;
-        assert_eq!(vis_right, 2554); // 2560 - 6
-        assert_eq!(pos_r.1 + 50 - 10, 1388); // 4px above taskbar
+        assert_eq!(vis_right, 2542); // 2560 - 18
+        assert_eq!(pos_r.1 + 50 - 10, 1386); // 6px above taskbar
 
         // 3) Icon inside Windows 11 overflow flyout (above taskbar) -> docks right above the overflow icon
         let icon_overflow = RECT { left: 2300, top: 1280, right: 2332, bottom: 1312 };
         let pos_ov = compute_tray_flyout_pos_in_list(&mons, icon_overflow, 240, 50, 10, 1.0);
-        assert_eq!(pos_ov.1 + 50 - 10, 1276); // 1280 - 4
+        assert_eq!(pos_ov.1 + 50 - 10, 1274); // 1280 - 6
 
-        // 4) Hover zone includes icon, bridge corridor, and visible capsule, excludes adjacent taskbar icons
+        // 4) Hover zone includes icon, bridge corridor (including up-right path), and visible capsule, excludes adjacent taskbar icons
         assert!(is_cursor_in_tray_hover_zone((2296, 1416), icon_mid, pos, 240, 50, 10)); // on icon
-        assert!(is_cursor_in_tray_hover_zone((2296, 1390), icon_mid, pos, 240, 50, 10)); // 4px bridge
-        assert!(is_cursor_in_tray_hover_zone((2240, 1370), icon_mid, pos, 240, 50, 10)); // on pill
+        assert!(is_cursor_in_tray_hover_zone((2296, 1389), icon_mid, pos, 240, 50, 10)); // 6px bridge
+        assert!(is_cursor_in_tray_hover_zone((2330, 1389), icon_mid, pos, 240, 50, 10)); // up-right bridge
+        assert!(is_cursor_in_tray_hover_zone((2380, 1370), icon_mid, pos, 240, 50, 10)); // on pill
         assert!(!is_cursor_in_tray_hover_zone((2400, 1416), icon_mid, pos, 240, 50, 10)); // adjacent tray icon
         assert!(!is_cursor_in_tray_hover_zone((2296, 1200), icon_mid, pos, 240, 50, 10)); // far above pill
 
@@ -1842,5 +1856,33 @@ mod tests {
             normalize_exe_path_for_compare(r#"\\?\C:/Users/Qingz/agy-token-monitor.exe"#),
             r"c:\users\qingz\agy-token-monitor.exe"
         );
+        assert_eq!(desired_tray_promoted_write(None, true), Some(1));
+        assert_eq!(desired_tray_promoted_write(Some(0), true), Some(1));
+        assert_eq!(desired_tray_promoted_write(Some(1), true), None);
+        assert_eq!(desired_tray_promoted_write(None, false), None);
+        assert_eq!(desired_tray_promoted_write(Some(0), false), None);
+        assert_eq!(desired_tray_promoted_write(Some(1), false), Some(0));
+
+        // Verify reg_read_key_string actually succeeds against a real Win32 HKCU REG_SZ value
+        // (guards against the RegGetValueW RRF_RT_REG_EXPAND_SZ without RRF_NOEXPAND pitfall).
+        unsafe {
+            let mut hkey = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders"),
+                0,
+                KEY_READ,
+                &mut hkey,
+            )
+            .is_ok()
+            {
+                let desktop = reg_read_key_string(hkey, w!("Desktop"));
+                let _ = RegCloseKey(hkey);
+                assert!(
+                    desktop.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                    "reg_read_key_string failed to read HKCU Shell Folders\\Desktop"
+                );
+            }
+        }
     }
 }
