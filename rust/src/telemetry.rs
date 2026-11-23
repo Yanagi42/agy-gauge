@@ -6,13 +6,16 @@ use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{PCWSTR, w};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED,
     DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::ProcessStatus::{
@@ -29,12 +32,14 @@ use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP,
-    NIIF_ERROR, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_INFO,
+    NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+    QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
@@ -90,6 +95,7 @@ pub struct UserPrefs {
     pub group_subagents: bool,
     pub privacy_mode: bool,
     pub pill_visible: bool,
+    pub tray_hover_mode: bool,
     pub notifications_enabled: bool,
     pub hide_on_fullscreen: bool,
     pub monitor_index: usize,
@@ -111,6 +117,7 @@ impl Default for UserPrefs {
             group_subagents: true,
             privacy_mode: false,
             pill_visible: true,
+            tray_hover_mode: false,
             notifications_enabled: true,
             hide_on_fullscreen: true,
             monitor_index: 0,
@@ -172,6 +179,9 @@ pub fn load_user_prefs() -> UserPrefs {
     if let Some(v) = reg_read_u32(w!("pill_visible")) {
         p.pill_visible = v != 0;
     }
+    if let Some(v) = reg_read_u32(w!("tray_hover_mode")) {
+        p.tray_hover_mode = v != 0;
+    }
     if let Some(v) = reg_read_u32(w!("notifications_enabled")) {
         p.notifications_enabled = v != 0;
     }
@@ -232,7 +242,7 @@ pub fn save_user_prefs(p: &UserPrefs) {
             if m != 0 { m } else { PILL_ITEMS_DEFAULT }
         };
         let derived_mini = (pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
-        let entries: [(PCWSTR, u32); 18] = [
+        let entries: [(PCWSTR, u32); 19] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(derived_mini)),
             (w!("topmost"), u32::from(p.topmost)),
@@ -241,6 +251,7 @@ pub fn save_user_prefs(p: &UserPrefs) {
             (w!("group_subagents"), u32::from(p.group_subagents)),
             (w!("privacy_mode"), u32::from(p.privacy_mode)),
             (w!("pill_visible"), u32::from(p.pill_visible)),
+            (w!("tray_hover_mode"), u32::from(p.tray_hover_mode)),
             (w!("notifications_enabled"), u32::from(p.notifications_enabled)),
             (w!("hide_on_fullscreen"), u32::from(p.hide_on_fullscreen)),
             (w!("monitor_index"), p.monitor_index as u32),
@@ -376,6 +387,168 @@ pub fn clamp_pos_to_monitors(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) -> 
 pub fn clamp_pos_to_work_area(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) -> (i32, i32) {
     let mons = get_monitors();
     clamp_pos_in_list(&mons, x, y, w, h, shadow_px, true)
+}
+
+/// Computes the layered window `(win_x, win_y)` for the tray-hover capsule flyout so that the
+/// visible pill hugs snugly right above (or adjacent to) the taskbar/tray icon without clipping.
+pub fn compute_tray_flyout_pos_in_list(
+    mons: &[MonitorDesc],
+    icon: RECT,
+    px_w: i32,
+    px_h: i32,
+    shadow_px: i32,
+    scale: f32,
+) -> (i32, i32) {
+    let vis_w = (px_w - shadow_px * 2).max(1);
+    let vis_h = (px_h - shadow_px * 2).max(1);
+    let gap = (4.0 * scale).round() as i32;
+    let margin = (6.0 * scale).round() as i32;
+    let icx = (icon.left + icon.right) / 2;
+    let icy = (icon.top + icon.bottom) / 2;
+
+    if mons.is_empty() {
+        return (icx - vis_w / 2 - shadow_px, icon.top - gap - vis_h - shadow_px);
+    }
+
+    let cur = &mons[nearest_monitor_idx(mons, icx, icy)];
+    let mon = cur.monitor;
+    let work = cur.work;
+
+    let clamp_x = |lo: i32, hi_edge: i32| -> i32 {
+        let min_x = lo + margin;
+        let max_x = (hi_edge - margin - vis_w).max(min_x);
+        (icx - vis_w / 2).clamp(min_x, max_x)
+    };
+    let clamp_y = |lo: i32, hi_edge: i32| -> i32 {
+        let min_y = lo + margin;
+        let max_y = (hi_edge - margin - vis_h).max(min_y);
+        (icy - vis_h / 2).clamp(min_y, max_y)
+    };
+
+    let (vis_x, vis_y) = if mon.bottom - work.bottom >= 16 {
+        // Bottom taskbar (most common)
+        let vx = clamp_x(work.left, work.right);
+        let vy = if icon.top >= work.bottom - 8 {
+            // Icon sits directly on the bottom taskbar -> dock snugly above taskbar
+            (work.bottom - gap - vis_h).max(work.top + margin)
+        } else {
+            // Icon sits inside the Windows 11 overflow flyout -> dock right above the icon
+            let min_y = work.top + margin;
+            let max_y = (work.bottom - gap - vis_h).max(min_y);
+            (icon.top - gap - vis_h).clamp(min_y, max_y)
+        };
+        (vx, vy)
+    } else if work.top - mon.top >= 16 {
+        // Top taskbar
+        let vx = clamp_x(work.left, work.right);
+        let vy = if icon.bottom <= work.top + 8 {
+            work.top + gap
+        } else {
+            let min_y = work.top + gap;
+            let max_y = (work.bottom - margin - vis_h).max(min_y);
+            (icon.bottom + gap).clamp(min_y, max_y)
+        };
+        (vx, vy)
+    } else if mon.right - work.right >= 16 {
+        // Right-edge vertical taskbar
+        let vx = if icon.left >= work.right - 8 {
+            (work.right - gap - vis_w).max(work.left + margin)
+        } else {
+            (icon.left - gap - vis_w).max(work.left + margin)
+        };
+        (vx, clamp_y(work.top, work.bottom))
+    } else if work.left - mon.left >= 16 {
+        // Left-edge vertical taskbar
+        let vx = if icon.right <= work.left + 8 {
+            work.left + gap
+        } else {
+            (icon.right + gap).min((work.right - margin - vis_w).max(work.left + gap))
+        };
+        (vx, clamp_y(work.top, work.bottom))
+    } else {
+        // Auto-hide taskbar (work == monitor): anchor right above the icon
+        let vx = clamp_x(mon.left, mon.right);
+        let vy = if icon.top - gap - vis_h >= mon.top + margin {
+            icon.top - gap - vis_h
+        } else {
+            (icon.bottom + gap).min((mon.bottom - margin - vis_h).max(mon.top + margin))
+        };
+        (vx, vy)
+    };
+
+    (vis_x - shadow_px, vis_y - shadow_px)
+}
+
+pub fn compute_tray_flyout_pos(
+    icon: RECT,
+    px_w: i32,
+    px_h: i32,
+    shadow_px: i32,
+    scale: f32,
+) -> (i32, i32) {
+    let mons = get_monitors();
+    compute_tray_flyout_pos_in_list(&mons, icon, px_w, px_h, shadow_px, scale)
+}
+
+/// Returns `true` while the cursor stays on the tray icon, on the popped-up capsule, or inside
+/// the narrow corridor bridging the tray icon to the capsule so moving up to click never flickers.
+pub fn is_cursor_in_tray_hover_zone(
+    cursor: (i32, i32),
+    icon: RECT,
+    pill_pos: (i32, i32),
+    px_w: i32,
+    px_h: i32,
+    shadow_px: i32,
+) -> bool {
+    let (cx, cy) = cursor;
+    let in_rect = |l: i32, t: i32, r: i32, b: i32| cx >= l && cx <= r && cy >= t && cy <= b;
+
+    // 1) Over the tray icon itself (small forgiving halo)
+    if in_rect(icon.left - 6, icon.top - 8, icon.right + 6, icon.bottom + 8) {
+        return true;
+    }
+
+    // 2) Over the visible capsule body
+    let vl = pill_pos.0 + shadow_px;
+    let vt = pill_pos.1 + shadow_px;
+    let vr = pill_pos.0 + px_w - shadow_px;
+    let vb = pill_pos.1 + px_h - shadow_px;
+    if in_rect(vl - 6, vt - 6, vr + 6, vb + 6) {
+        return true;
+    }
+
+    // 3) Bridge corridor between tray icon and capsule
+    if vb <= icon.top + 8 {
+        // Capsule is above icon (bottom taskbar)
+        let bl = icon.left - 14;
+        let br = icon.right + 14;
+        if in_rect(bl, vb - 4, br, icon.top + 4) {
+            return true;
+        }
+    } else if vt >= icon.bottom - 8 {
+        // Capsule is below icon (top taskbar)
+        let bl = icon.left - 14;
+        let br = icon.right + 14;
+        if in_rect(bl, icon.bottom - 4, br, vt + 4) {
+            return true;
+        }
+    } else if vr <= icon.left + 8 {
+        // Capsule is left of icon (right taskbar)
+        let bt = icon.top - 14;
+        let bb = icon.bottom + 14;
+        if in_rect(vr - 4, bt, icon.left + 4, bb) {
+            return true;
+        }
+    } else if vl >= icon.right - 8 {
+        // Capsule is right of icon (left taskbar)
+        let bt = icon.top - 14;
+        let bb = icon.bottom + 14;
+        if in_rect(icon.right - 4, bt, vl + 4, bb) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Notify peer windows (pill <-> independent dashboard) to reload saved preferences immediately.
@@ -622,6 +795,19 @@ pub fn window_dpi_scale(hwnd: HWND) -> f32 {
             dpi as f32 / 96.0
         } else {
             1.0
+        }
+    }
+}
+
+pub fn dpi_for_point(x: i32, y: i32) -> f32 {
+    unsafe {
+        let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut dx = 96u32;
+        let mut dy = 96u32;
+        if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_ok() && dx > 0 {
+            dx as f32
+        } else {
+            96.0
         }
     }
 }
@@ -906,6 +1092,21 @@ impl TrayIcon {
             nid.uFlags = NIF_TIP;
             copy_utf16_fixed(&mut nid.szTip, tip);
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    pub fn get_rect(&self) -> Option<RECT> {
+        if !self.active || self.hwnd.0.is_null() {
+            return None;
+        }
+        unsafe {
+            let mut id: NOTIFYICONIDENTIFIER = zeroed();
+            id.cbSize = size_of::<NOTIFYICONIDENTIFIER>() as u32;
+            id.hWnd = self.hwnd;
+            id.uID = 1;
+            Shell_NotifyIconGetRect(&id)
+                .ok()
+                .filter(|r| r.right > r.left && r.bottom > r.top)
         }
     }
 
@@ -1442,5 +1643,42 @@ mod tests {
             let _ = DestroyWindow(regular);
             let _ = DestroyWindow(pill);
         }
+    }
+
+    #[test]
+    fn test_tray_flyout_positioning_and_hover_zone() {
+        let primary = MonitorDesc {
+            label: "Primary".into(),
+            is_primary: true,
+            monitor: RECT { left: 0, top: 0, right: 2560, bottom: 1440 },
+            work: RECT { left: 0, top: 0, right: 2560, bottom: 1392 },
+        };
+        let mons = vec![primary];
+
+        // 1) Bottom taskbar, icon centered with room on right -> docks 4px above taskbar, centered on icon
+        let icon_mid = RECT { left: 2280, top: 1392, right: 2312, bottom: 1440 };
+        let pos = compute_tray_flyout_pos_in_list(&mons, icon_mid, 240, 50, 10, 1.0);
+        // vis_w = 220, vis_h = 30; icx = 2296 -> vis_x = 2186 -> win_x = 2176
+        // vis_y = 1392 - 4 - 30 = 1358 -> win_y = 1348 (vis_bottom = 1388)
+        assert_eq!(pos, (2176, 1348));
+
+        // 2) Bottom taskbar near far-right clock -> clamped 6px inside right screen edge
+        let icon_right = RECT { left: 2500, top: 1392, right: 2532, bottom: 1440 };
+        let pos_r = compute_tray_flyout_pos_in_list(&mons, icon_right, 240, 50, 10, 1.0);
+        let vis_right = pos_r.0 + 240 - 10;
+        assert_eq!(vis_right, 2554); // 2560 - 6
+        assert_eq!(pos_r.1 + 50 - 10, 1388); // 4px above taskbar
+
+        // 3) Icon inside Windows 11 overflow flyout (above taskbar) -> docks right above the overflow icon
+        let icon_overflow = RECT { left: 2300, top: 1280, right: 2332, bottom: 1312 };
+        let pos_ov = compute_tray_flyout_pos_in_list(&mons, icon_overflow, 240, 50, 10, 1.0);
+        assert_eq!(pos_ov.1 + 50 - 10, 1276); // 1280 - 4
+
+        // 4) Hover zone includes icon, bridge corridor, and visible capsule, excludes adjacent taskbar icons
+        assert!(is_cursor_in_tray_hover_zone((2296, 1416), icon_mid, pos, 240, 50, 10)); // on icon
+        assert!(is_cursor_in_tray_hover_zone((2296, 1390), icon_mid, pos, 240, 50, 10)); // 4px bridge
+        assert!(is_cursor_in_tray_hover_zone((2240, 1370), icon_mid, pos, 240, 50, 10)); // on pill
+        assert!(!is_cursor_in_tray_hover_zone((2400, 1416), icon_mid, pos, 240, 50, 10)); // adjacent tray icon
+        assert!(!is_cursor_in_tray_hover_zone((2296, 1200), icon_mid, pos, 240, 50, 10)); // far above pill
     }
 }

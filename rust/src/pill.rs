@@ -9,7 +9,7 @@
 
 use chrono::{Local, Utc};
 use windows::core::{w, Result};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Direct2D::ID2D1RenderTarget;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -27,10 +27,11 @@ use crate::pricing::fmt_cost_compact;
 use crate::quota::{fmt_countdown, AlertSeverity, QuotaProvenance};
 use crate::stats::{fmt_compact, iso_week_key, ScanSnapshot, TokenCounts};
 use crate::telemetry::{
-    clamp_pos_to_work_area, get_monitors, get_work_area, monitor_index_for_point, to_wide_null,
-    wide_pcwstr, SystemTelemetry, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX,
-    PILL_ITEM_BLOCK_5H, PILL_ITEM_CACHE_HIT, PILL_ITEM_COST, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED,
-    PILL_ITEM_QUOTA, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
+    clamp_pos_to_work_area, compute_tray_flyout_pos, get_monitors, get_work_area,
+    monitor_index_for_point, to_wide_null, wide_pcwstr, SystemTelemetry, PILL_ITEMS_ALL_MASK,
+    PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX, PILL_ITEM_BLOCK_5H, PILL_ITEM_CACHE_HIT,
+    PILL_ITEM_COST, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED, PILL_ITEM_QUOTA, PILL_ITEM_RAM,
+    PILL_ITEM_TOTAL,
 };
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
@@ -45,6 +46,7 @@ pub const CMD_TOGGLE_PRIVACY: u32 = 1009;
 pub const CMD_TOGGLE_NOTIFICATIONS: u32 = 1010;
 pub const CMD_TOGGLE_HIDE_FULLSCREEN: u32 = 1011;
 pub const CMD_TOGGLE_AUTOSTART: u32 = 1012;
+pub const CMD_TOGGLE_TRAY_HOVER: u32 = 1013;
 pub const CMD_MONITOR_BASE: u32 = 1100;
 pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1208 -> bit 0..8
 pub const CMD_PILL_ITEMS_RESET: u32 = 1210;
@@ -110,6 +112,7 @@ impl PillRenderer {
         dpi: f32,
         monitor_index: usize,
         custom_pos: Option<(i32, i32)>,
+        flyout_anchor: Option<RECT>,
         light_theme: bool,
         hovered: bool,
         dash_open: bool,
@@ -320,14 +323,25 @@ impl PillRenderer {
 
         // Cache monitor placement so 1-second telemetry ticks never re-enumerate display monitors.
         let shadow_px = (SHADOW_PAD * scale).round() as i32;
-        let key = (monitor_index, custom_pos, px_w, px_h, dpi.round() as i32);
-        let (win_x, win_y) = if self.pos_cache_key == Some(key) {
-            self.cached_pos
+        let (win_x, win_y) = if let Some(icon_rect) = flyout_anchor {
+            compute_tray_flyout_pos(icon_rect, px_w, px_h, shadow_px, scale)
         } else {
-            let computed = if let Some((cx, cy)) = custom_pos {
-                if monitor_index_for_point(cx + px_w / 2, cy + px_h / 2).is_some() {
-                    // Always clamp visible capsule inside that monitor's work area (never behind taskbar!)
-                    clamp_pos_to_work_area(cx, cy, px_w, px_h, shadow_px)
+            let key = (monitor_index, custom_pos, px_w, px_h, dpi.round() as i32);
+            if self.pos_cache_key == Some(key) {
+                self.cached_pos
+            } else {
+                let computed = if let Some((cx, cy)) = custom_pos {
+                    if monitor_index_for_point(cx + px_w / 2, cy + px_h / 2).is_some() {
+                        // Always clamp visible capsule inside that monitor's work area (never behind taskbar!)
+                        clamp_pos_to_work_area(cx, cy, px_w, px_h, shadow_px)
+                    } else {
+                        let work = get_work_area(monitor_index);
+                        let margin_px = (12.0 * scale).round() as i32;
+                        (
+                            (work.right - px_w + shadow_px - margin_px).max(work.left),
+                            (work.bottom - px_h + shadow_px - margin_px).max(work.top),
+                        )
+                    }
                 } else {
                     let work = get_work_area(monitor_index);
                     let margin_px = (12.0 * scale).round() as i32;
@@ -335,18 +349,11 @@ impl PillRenderer {
                         (work.right - px_w + shadow_px - margin_px).max(work.left),
                         (work.bottom - px_h + shadow_px - margin_px).max(work.top),
                     )
-                }
-            } else {
-                let work = get_work_area(monitor_index);
-                let margin_px = (12.0 * scale).round() as i32;
-                (
-                    (work.right - px_w + shadow_px - margin_px).max(work.left),
-                    (work.bottom - px_h + shadow_px - margin_px).max(work.top),
-                )
-            };
-            self.pos_cache_key = Some(key);
-            self.cached_pos = computed;
-            computed
+                };
+                self.pos_cache_key = Some(key);
+                self.cached_pos = computed;
+                computed
+            }
         };
 
         if let Some(surface) = &self.surface {
@@ -552,6 +559,7 @@ pub fn show_context_menu(
     hwnd: HWND,
     dash_open: bool,
     pill_visible: bool,
+    tray_hover_mode: bool,
     light_theme: bool,
     topmost: bool,
     human: bool,
@@ -572,9 +580,21 @@ pub fn show_context_menu(
         );
         let _ = AppendMenuW(
             menu,
+            MF_STRING | if tray_hover_mode { MF_CHECKED } else { MF_UNCHECKED },
+            CMD_TOGGLE_TRAY_HOVER as usize,
+            w!("托盘悬停模式 (悬停图标显示胶囊)"),
+        );
+        let _ = AppendMenuW(
+            menu,
             MF_STRING,
             CMD_TOGGLE_PILL_VISIBLE as usize,
-            if pill_visible { w!("隐藏悬浮胶囊 (托盘保活)") } else { w!("显示悬浮胶囊") },
+            if tray_hover_mode {
+                w!("恢复常驻悬浮胶囊")
+            } else if pill_visible {
+                w!("隐藏悬浮胶囊 (托盘保活)")
+            } else {
+                w!("显示悬浮胶囊")
+            },
         );
         let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH as usize, w!("立即刷新"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);

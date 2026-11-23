@@ -42,18 +42,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW, LoadImageW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, ES_AUTOHSCROLL, HICON, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
-    IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPOS, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFONT, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    GetWindowTextW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, MoveWindow,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetForegroundWindow,
+    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HICON, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
+    IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPOS, WM_ACTIVATEAPP, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 const WM_SETTINGCHANGE: u32 = 0x001A;
@@ -86,24 +86,25 @@ use pill::{
     show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_PILL_ITEMS_RESET,
     CMD_PILL_ITEM_BASE, CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_AUTOSTART,
     CMD_TOGGLE_HIDE_FULLSCREEN, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_NOTIFICATIONS,
-    CMD_TOGGLE_PILL_VISIBLE, CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST,
+    CMD_TOGGLE_PILL_VISIBLE, CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST, CMD_TOGGLE_TRAY_HOVER,
 };
 use pricing::ModelRate;
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
 use telemetry::{
     apply_pill_topmost, apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors,
-    clamp_pos_to_work_area, copy_text_to_clipboard, enable_dpi_awareness, get_work_area,
-    guard_topmost_windowpos, inspect_pill_topmost_health, is_autostart_enabled,
-    is_other_app_fullscreen, load_user_prefs, monitor_index_for_point, prompt_save_file,
-    read_self_private_mb, read_self_working_set_mb, register_taskbar_created_msg, save_user_prefs,
-    set_autostart_enabled, to_wide_null, trim_self_working_set, wide_pcwstr, window_dpi_scale,
-    SingleInstanceGuard, SystemTelemetry, TopmostHealth, TrayIcon, UserPrefs, PILL_ITEMS_ALL_MASK,
-    PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM, PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS,
-    WM_APP_TRAY,
+    clamp_pos_to_work_area, copy_text_to_clipboard, dpi_for_point, enable_dpi_awareness,
+    get_work_area, guard_topmost_windowpos, inspect_pill_topmost_health, is_autostart_enabled,
+    is_cursor_in_tray_hover_zone, is_other_app_fullscreen, load_user_prefs,
+    monitor_index_for_point, prompt_save_file, read_self_private_mb, read_self_working_set_mb,
+    register_taskbar_created_msg, save_user_prefs, set_autostart_enabled, to_wide_null,
+    trim_self_working_set, wide_pcwstr, window_dpi_scale, SingleInstanceGuard, SystemTelemetry,
+    TopmostHealth, TrayIcon, UserPrefs, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_CPU,
+    PILL_ITEM_RAM, PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS, WM_APP_TRAY,
 };
 
 const TIMER_TELEMETRY: usize = 1;
 const TIMER_TOKENS: usize = 2;
+const TIMER_TRAY_HOVER: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditTarget {
@@ -685,6 +686,11 @@ struct AppState {
     group_subagents: bool,
     privacy_mode: bool,
     pill_visible: bool,
+    tray_hover_mode: bool,
+    tray_hover_shown: bool,
+    tray_hover_icon_rect: Option<RECT>,
+    tray_hover_leave_since: Option<Instant>,
+    tray_hover_suppress_until: Option<Instant>,
     fullscreen_hidden: bool,
     notifications_enabled: bool,
     hide_on_fullscreen: bool,
@@ -931,7 +937,7 @@ fn hide_dashboard_safe() {
         }
         let pill_top = with_app(|app| {
             app.redraw_pill();
-            (app.pill_hwnd, app.topmost)
+            (app.pill_hwnd, app.is_pill_effectively_topmost() && app.should_pill_be_visible())
         });
         if let Some((ph, true)) = pill_top {
             apply_pill_topmost(ph, true, false);
@@ -991,9 +997,8 @@ fn set_pill_topmost_safe(top: bool, persist: bool) {
 fn ensure_pill_topmost_if_needed(force_raise: bool) {
     let info = with_app(|app| {
         if app.dashboard_only
-            || !app.topmost
-            || !app.pill_visible
-            || app.fullscreen_hidden
+            || !app.is_pill_effectively_topmost()
+            || !app.should_pill_be_visible()
             || app.pill_menu_open
             || app.drag_down
         {
@@ -1067,6 +1072,7 @@ impl AppState {
                 .map(|v| v.privacy_mode)
                 .unwrap_or(self.privacy_mode),
             pill_visible: self.pill_visible,
+            tray_hover_mode: self.tray_hover_mode,
             notifications_enabled: self.notifications_enabled,
             hide_on_fullscreen: self.hide_on_fullscreen,
             monitor_index: self.monitor_index,
@@ -1098,6 +1104,16 @@ impl AppState {
         self.group_subagents = p.group_subagents;
         self.privacy_mode = p.privacy_mode;
         self.pill_visible = p.pill_visible;
+        if self.tray_hover_mode != p.tray_hover_mode {
+            self.tray_hover_mode = p.tray_hover_mode;
+            self.tray_hover_shown = false;
+            self.tray_hover_leave_since = None;
+            if !self.pill_hwnd.0.is_null() {
+                unsafe {
+                    let _ = KillTimer(self.pill_hwnd, TIMER_TRAY_HOVER);
+                }
+            }
+        }
         self.notifications_enabled = p.notifications_enabled;
         self.hide_on_fullscreen = p.hide_on_fullscreen;
         self.monitor_index = p.monitor_index;
@@ -1117,11 +1133,35 @@ impl AppState {
         }
     }
 
+    fn should_pill_be_visible(&self) -> bool {
+        if self.dashboard_only {
+            return false;
+        }
+        if self.tray_hover_mode {
+            self.tray_hover_shown
+        } else {
+            self.pill_visible && !self.fullscreen_hidden
+        }
+    }
+
+    fn is_pill_effectively_topmost(&self) -> bool {
+        self.topmost || (self.tray_hover_mode && self.tray_hover_shown)
+    }
+
     fn redraw_pill(&mut self) {
-        if self.dashboard_only || self.pill_hwnd.0.is_null() || !self.pill_visible || self.fullscreen_hidden {
+        if self.pill_hwnd.0.is_null() || !self.should_pill_be_visible() {
             return;
         }
-        let dpi = window_dpi_scale(self.pill_hwnd) * 96.0;
+        let flyout_anchor = if self.tray_hover_mode {
+            self.tray_hover_icon_rect
+        } else {
+            None
+        };
+        let dpi = if let Some(ir) = flyout_anchor {
+            dpi_for_point((ir.left + ir.right) / 2, (ir.top + ir.bottom) / 2)
+        } else {
+            window_dpi_scale(self.pill_hwnd) * 96.0
+        };
         let recent = self
             .recent_activity_until
             .map(|t| Instant::now() < t)
@@ -1133,6 +1173,7 @@ impl AppState {
             dpi,
             self.monitor_index,
             self.custom_pos,
+            flyout_anchor,
             self.light_theme,
             self.pill_hovered,
             self.dash_visible,
@@ -1145,17 +1186,93 @@ impl AppState {
         }
     }
 
+    fn show_tray_hover_flyout(&mut self, icon_rect: RECT) {
+        if !self.tray_hover_mode || self.dashboard_only || self.pill_hwnd.0.is_null() {
+            return;
+        }
+        let rect_changed = self.tray_hover_icon_rect != Some(icon_rect);
+        self.tray_hover_icon_rect = Some(icon_rect);
+        self.tray_hover_leave_since = None;
+        if !self.tray_hover_shown {
+            self.tray_hover_shown = true;
+            self.redraw_pill();
+            unsafe {
+                let _ = ShowWindow(self.pill_hwnd, SW_SHOWNOACTIVATE);
+                apply_pill_topmost(self.pill_hwnd, true, true);
+                let _ = SetTimer(self.pill_hwnd, TIMER_TRAY_HOVER, 100, None);
+            }
+        } else if rect_changed {
+            self.redraw_pill();
+        }
+    }
+
+    fn hide_tray_hover_flyout(&mut self) {
+        if !self.tray_hover_shown {
+            return;
+        }
+        self.tray_hover_shown = false;
+        self.tray_hover_leave_since = None;
+        self.pill_hovered = false;
+        if !self.pill_hwnd.0.is_null() {
+            unsafe {
+                let _ = KillTimer(self.pill_hwnd, TIMER_TRAY_HOVER);
+                let _ = ShowWindow(self.pill_hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    fn tick_tray_hover_guard(&mut self) {
+        if !self.tray_hover_mode || !self.tray_hover_shown || self.pill_hwnd.0.is_null() {
+            if !self.pill_hwnd.0.is_null() {
+                unsafe {
+                    let _ = KillTimer(self.pill_hwnd, TIMER_TRAY_HOVER);
+                }
+            }
+            return;
+        }
+        if self.pill_menu_open {
+            self.tray_hover_leave_since = None;
+            return;
+        }
+        let mut pt = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_err() {
+                return;
+            }
+        }
+        if let Some(fresh_rect) = self.tray.as_ref().and_then(TrayIcon::get_rect) {
+            self.tray_hover_icon_rect = Some(fresh_rect);
+        }
+        let Some(icon_rect) = self.tray_hover_icon_rect else {
+            self.hide_tray_hover_flyout();
+            return;
+        };
+        let (pw, ph) = self.pill_renderer.size_px();
+        let sh = self.pill_renderer.shadow_px();
+        if is_cursor_in_tray_hover_zone((pt.x, pt.y), icon_rect, self.pill_pos, pw, ph, sh) {
+            self.tray_hover_leave_since = None;
+        } else {
+            match self.tray_hover_leave_since {
+                None => self.tray_hover_leave_since = Some(Instant::now()),
+                Some(t0) if t0.elapsed() >= Duration::from_millis(220) => {
+                    self.hide_tray_hover_flyout();
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn apply_pill_visibility(&mut self) {
         if self.dashboard_only || self.pill_hwnd.0.is_null() {
             return;
         }
-        let should_show = self.pill_visible && !self.fullscreen_hidden;
+        let should_show = self.should_pill_be_visible();
         unsafe {
             let currently_visible = IsWindowVisible(self.pill_hwnd).as_bool();
             if should_show && !currently_visible {
-                let _ = ShowWindow(self.pill_hwnd, SW_SHOWNOACTIVATE);
                 self.redraw_pill();
-                if self.topmost {
+                let _ = ShowWindow(self.pill_hwnd, SW_SHOWNOACTIVATE);
+                if self.is_pill_effectively_topmost() {
                     apply_pill_topmost(self.pill_hwnd, true, true);
                 }
             } else if !should_show && currently_visible {
@@ -1165,7 +1282,7 @@ impl AppState {
     }
 
     fn check_fullscreen_guard(&mut self) {
-        if self.dashboard_only || self.self_test_mode || !self.pill_visible {
+        if self.dashboard_only || self.self_test_mode || self.tray_hover_mode || !self.pill_visible {
             return;
         }
         let want_hidden = self.hide_on_fullscreen && is_other_app_fullscreen();
@@ -1176,6 +1293,10 @@ impl AppState {
     }
 
     fn build_tray_tooltip(&self) -> String {
+        if self.tray_hover_mode {
+            // Suppress Windows' native gray text tooltip so it never covers our hover capsule flyout.
+            return String::new();
+        }
         let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
         let tc = self
             .snapshot
@@ -1863,6 +1984,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             app.human,
             app.privacy_mode,
             app.pill_visible,
+            app.tray_hover_mode,
             app.notifications_enabled,
             app.hide_on_fullscreen,
             app.monitor_index,
@@ -1876,6 +1998,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
         human,
         privacy_mode,
         pill_visible,
+        tray_hover_mode,
         notifications_enabled,
         hide_on_fullscreen,
         mon,
@@ -1894,6 +2017,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             hwnd,
             dash_open,
             pill_visible,
+            tray_hover_mode,
             light,
             topmost,
             human,
@@ -1909,15 +2033,47 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
         if let Some(cmd) = chosen {
             match cmd {
                 CMD_OPEN_DETAIL => toggle_dashboard_safe(),
-                CMD_TOGGLE_PILL_VISIBLE => {
-                    with_app(|app| {
-                        app.pill_visible = !app.pill_visible;
-                        if app.pill_visible {
+                CMD_TOGGLE_TRAY_HOVER => {
+                    let restored_top = with_app(|app| {
+                        app.tray_hover_mode = !app.tray_hover_mode;
+                        app.hide_tray_hover_flyout();
+                        if !app.tray_hover_mode {
+                            app.pill_visible = true;
                             app.fullscreen_hidden = false;
+                            app.pill_renderer.invalidate_position();
                         }
                         app.apply_pill_visibility();
+                        app.sync_tray_and_alerts();
                         app.persist_and_sync(hwnd);
+                        (!app.tray_hover_mode, app.topmost)
                     });
+                    if let Some((true, top)) = restored_top {
+                        set_pill_topmost_safe(top, false);
+                    }
+                    handled_topmost = true;
+                }
+                CMD_TOGGLE_PILL_VISIBLE => {
+                    let restored_top = with_app(|app| {
+                        if app.tray_hover_mode {
+                            app.tray_hover_mode = false;
+                            app.hide_tray_hover_flyout();
+                            app.pill_visible = true;
+                            app.fullscreen_hidden = false;
+                            app.pill_renderer.invalidate_position();
+                        } else {
+                            app.pill_visible = !app.pill_visible;
+                            if app.pill_visible {
+                                app.fullscreen_hidden = false;
+                            }
+                        }
+                        app.apply_pill_visibility();
+                        app.sync_tray_and_alerts();
+                        app.persist_and_sync(hwnd);
+                        (app.pill_visible, app.topmost)
+                    });
+                    if let Some((true, top)) = restored_top {
+                        set_pill_topmost_safe(top, false);
+                    }
                     handled_topmost = true;
                 }
                 CMD_REFRESH => {
@@ -1979,12 +2135,15 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                 }
                 CMD_REDOCK => {
                     with_app(|app| {
+                        app.tray_hover_mode = false;
+                        app.hide_tray_hover_flyout();
                         app.pill_visible = true;
                         app.fullscreen_hidden = false;
                         app.custom_pos = None;
                         app.pill_renderer.invalidate_position();
                         app.apply_pill_visibility();
                         app.redraw_pill();
+                        app.sync_tray_and_alerts();
                         app.persist_and_sync(hwnd);
                     });
                     if topmost {
@@ -2052,7 +2211,8 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
     match msg {
         WM_ERASEBKGND => LRESULT(1),
         WM_WINDOWPOSCHANGING => {
-            let guard_on = with_app(|app| app.topmost && !app.pill_menu_open).unwrap_or(false);
+            let guard_on = with_app(|app| app.is_pill_effectively_topmost() && !app.pill_menu_open)
+                .unwrap_or(false);
             if guard_on && lparam.0 != 0 {
                 let wp = &mut *(lparam.0 as *mut WINDOWPOS);
                 guard_topmost_windowpos(wp, true);
@@ -2078,13 +2238,22 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
             };
             let _ = ClientToScreen(hwnd, &mut pt);
-            with_app(|app| {
+            let allow_drag = with_app(|app| {
+                if app.tray_hover_mode {
+                    app.drag_down = false;
+                    app.dragging = false;
+                    return false;
+                }
                 app.drag_down = true;
                 app.dragging = false;
                 app.drag_start_cursor = (pt.x, pt.y);
                 app.drag_start_win = app.pill_pos;
-            });
-            let _ = SetCapture(hwnd);
+                true
+            })
+            .unwrap_or(false);
+            if allow_drag {
+                let _ = SetCapture(hwnd);
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2211,21 +2380,68 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 with_app(|app| app.redraw_pill());
             }
             if !was_dragging {
+                with_app(|app| {
+                    if app.tray_hover_mode {
+                        app.hide_tray_hover_flyout();
+                    }
+                });
                 toggle_dashboard_safe();
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            with_app(|app| {
+                if app.tray_hover_mode {
+                    app.hide_tray_hover_flyout();
+                }
+            });
             handle_pill_or_tray_context_menu(hwnd);
             LRESULT(0)
         }
         WM_APP_TRAY => {
             let ev = (lparam.0 & 0xFFFF) as u32;
             match ev {
+                WM_MOUSEMOVE => {
+                    with_app(|app| {
+                        if !app.tray_hover_mode || app.pill_menu_open || app.self_test_mode {
+                            return;
+                        }
+                        if app
+                            .tray_hover_suppress_until
+                            .map(|t| Instant::now() < t)
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
+                        let icon_rect = app
+                            .tray
+                            .as_ref()
+                            .and_then(TrayIcon::get_rect)
+                            .unwrap_or_else(|| {
+                                let mut pt = POINT::default();
+                                let _ = GetCursorPos(&mut pt);
+                                RECT {
+                                    left: pt.x - 12,
+                                    top: pt.y - 12,
+                                    right: pt.x + 12,
+                                    bottom: pt.y + 12,
+                                }
+                            });
+                        app.show_tray_hover_flyout(icon_rect);
+                    });
+                }
                 WM_LBUTTONUP => {
+                    with_app(|app| {
+                        app.tray_hover_suppress_until = Some(Instant::now() + Duration::from_millis(600));
+                        app.hide_tray_hover_flyout();
+                    });
                     toggle_dashboard_safe();
                 }
                 WM_RBUTTONUP => {
+                    with_app(|app| {
+                        app.tray_hover_suppress_until = Some(Instant::now() + Duration::from_millis(600));
+                        app.hide_tray_hover_flyout();
+                    });
                     handle_pill_or_tray_context_menu(hwnd);
                 }
                 _ => {}
@@ -2238,6 +2454,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             with_app(|app| {
                 app.apply_synced_prefs(p);
                 app.apply_pill_visibility();
+                app.sync_tray_and_alerts();
                 app.redraw_pill();
             });
             set_pill_topmost_safe(top, false);
@@ -2257,6 +2474,11 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 TIMER_TOKENS => {
                     with_app(|app| {
                         app.refresh_tokens(false);
+                    });
+                }
+                TIMER_TRAY_HOVER => {
+                    with_app(|app| {
+                        app.tick_tray_hover_guard();
                     });
                 }
                 _ => {}
@@ -2776,6 +2998,7 @@ struct CliOpts {
     pricing_path: Option<PathBuf>,
     no_archive: bool,
     mini: Option<bool>,
+    tray_hover: Option<bool>,
     light: Option<bool>,
     cost_mode: Option<bool>,
     privacy_mode: Option<bool>,
@@ -2793,6 +3016,7 @@ fn parse_args() -> CliOpts {
         pricing_path: None,
         no_archive: false,
         mini: None,
+        tray_hover: None,
         light: None,
         cost_mode: None,
         privacy_mode: None,
@@ -2807,6 +3031,8 @@ fn parse_args() -> CliOpts {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--mini" => opts.mini = Some(true),
+            "--tray-hover" => opts.tray_hover = Some(true),
+            "--no-tray-hover" => opts.tray_hover = Some(false),
             "--light" => opts.light = Some(true),
             "--dark" => opts.light = Some(false),
             "--cost" | "--usd" => opts.cost_mode = Some(true),
@@ -2872,6 +3098,9 @@ fn run_app(opts: CliOpts) -> Result<()> {
         } else {
             prefs.pill_items |= PILL_ITEM_CPU | PILL_ITEM_RAM;
         }
+    }
+    if let Some(v) = opts.tray_hover {
+        prefs.tray_hover_mode = v;
     }
     if let Some(v) = opts.light {
         prefs.light_theme = v;
@@ -2986,7 +3215,8 @@ fn run_app(opts: CliOpts) -> Result<()> {
 
         let taskbar_created_msg = register_taskbar_created_msg();
         let tray = if !opts.dashboard_only && !opts.self_test && !pill_hwnd.0.is_null() {
-            Some(TrayIcon::new(pill_hwnd, icon_sm, "AGY Gauge · 初始化中"))
+            let init_tip = if prefs.tray_hover_mode { "" } else { "AGY Gauge · 初始化中" };
+            Some(TrayIcon::new(pill_hwnd, icon_sm, init_tip))
         } else {
             None
         };
@@ -3017,6 +3247,11 @@ fn run_app(opts: CliOpts) -> Result<()> {
             group_subagents: prefs.group_subagents,
             privacy_mode: prefs.privacy_mode,
             pill_visible: prefs.pill_visible,
+            tray_hover_mode: prefs.tray_hover_mode,
+            tray_hover_shown: false,
+            tray_hover_icon_rect: None,
+            tray_hover_leave_since: None,
+            tray_hover_suppress_until: None,
             fullscreen_hidden: false,
             notifications_enabled: prefs.notifications_enabled,
             hide_on_fullscreen: prefs.hide_on_fullscreen,
@@ -3053,9 +3288,9 @@ fn run_app(opts: CliOpts) -> Result<()> {
             }
         } else {
             with_app(|app| app.sync_tray_and_alerts());
-            if prefs.pill_visible || opts.self_test {
-                let _ = ShowWindow(pill_hwnd, SW_SHOWNOACTIVATE);
+            if (!prefs.tray_hover_mode && prefs.pill_visible) || opts.self_test {
                 with_app(|app| app.redraw_pill());
+                let _ = ShowWindow(pill_hwnd, SW_SHOWNOACTIVATE);
                 ensure_pill_topmost_if_needed(true);
             }
             trim_self_working_set();

@@ -16,8 +16,9 @@
 - **预算阈值与托盘气球预警（`budget.json`）**：
   - 在「模型 → 预算 / 桥接」（快捷键 `B`）中可设置 **5h / 每日 / 每周美元预算** 与 **预警 / 临界百分比**，保存至程序目录 `budget.json`。
   - 达到预警/临界阈值或官方剩余配额过低时，悬浮胶囊数值与状态点自动切换警示色，并弹出按窗口去重的 Windows 托盘气球提醒（右键菜单可开关）。
-- **系统托盘、全屏自动隐藏与开机自启**：
-  - 常驻 Windows 系统托盘（左键切换详情面板，右键打开统一菜单，Explorer 重启自动恢复图标），悬停显示今日用量、5h 窗口与官方配额摘要。
+- **系统托盘、托盘悬停模式、全屏自动隐藏与开机自启**：
+  - 常驻 Windows 系统托盘（左键切换详情面板，右键打开统一菜单，Explorer 重启自动恢复图标），默认悬停显示今日用量、5h 窗口与官方配额摘要。
+  - **托盘悬停模式（右键菜单勾选或 `--tray-hover`）**：胶囊不再常占屏幕空间；鼠标悬停在右下角任务栏托盘图标上时，自动在任务栏正上方贴边浮出实时毛玻璃胶囊（支持鼠标移入胶囊查看或直接点击打开面板，移开后自动收起），点击图标同样即时打开/关闭详情面板（Win11 可直接将图标从 `^` 折叠区拖至任务栏固定）。
   - 支持「隐藏悬浮胶囊」仅保留托盘后台监控、「全屏应用自动隐藏胶囊」（通过 `SHQueryUserNotificationState` 检测游戏/演示全屏）以及免提权开机自启（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgyGauge`）。
 - **Antigravity 多端聚合 + 本地轻量归档（`archive.json`）**：
   - 自动只读聚合本机存在的 `~/.gemini/antigravity-cli`（CLI）、`~/.gemini/antigravity`（App）与 `~/.gemini/antigravity-ide`（IDE）会话日志，在会话列表标注来源标签 `[App]` / `[IDE]`。
@@ -100,7 +101,8 @@ copy target\release\agy-statusline.exe ..\agy-statusline.exe
 ```powershell
 # 启动桌面悬浮胶囊与系统托盘
 .\agy-widget.cmd
-# 常用参数：极简角标 / 浅色纸感 / 费用视图 / 脱敏模式 / 禁用本地归档 / 指定副屏 / 指定单价表
+# 常用参数：托盘悬停模式 / 极简角标 / 浅色纸感 / 费用视图 / 脱敏模式 / 禁用本地归档 / 指定副屏 / 指定单价表
+.\agy-widget.cmd --tray-hover
 .\agy-widget.cmd --mini --light --cost --redact
 .\agy-widget.cmd --no-archive --monitor 1 --pricing .\pricing.json
 
