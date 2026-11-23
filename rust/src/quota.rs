@@ -1014,6 +1014,7 @@ mod tests {
             output_tokens: 10_000,
             tool_names: Vec::new(),
             thinking_chars: 0,
+            gen_secs: None,
             cost: CostBreakdown {
                 input_usd: usd,
                 ..Default::default()

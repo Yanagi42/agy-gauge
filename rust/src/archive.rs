@@ -185,6 +185,9 @@ impl UsageArchive {
                     if t.thinking_chars > 0 {
                         to.insert("th".into(), json!(t.thinking_chars));
                     }
+                    if let Some(g) = t.gen_secs {
+                        to.insert("gen".into(), json!(g));
+                    }
                     Value::Object(to)
                 })
                 .collect();
@@ -278,6 +281,7 @@ fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
             })
             .unwrap_or_default();
         let thinking_chars = to.get("th").and_then(Value::as_u64).unwrap_or(0);
+        let gen_secs = to.get("gen").and_then(Value::as_u64).map(|g| g.min(u32::MAX as u64) as u32);
         turns.push(TurnRecord {
             step_index,
             timestamp_utc,
@@ -289,6 +293,7 @@ fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
             output_tokens,
             tool_names,
             thinking_chars,
+            gen_secs,
             cost: CostBreakdown::default(),
         });
     }
@@ -419,6 +424,7 @@ mod tests {
                 output_tokens: 2_000,
                 tool_names: vec!["read_file".into()],
                 thinking_chars: 120,
+                gen_secs: None,
                 cost: CostBreakdown::default(),
             }],
             counts: TokenCounts::default(),

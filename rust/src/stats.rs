@@ -161,12 +161,33 @@ pub struct TurnRecord {
     pub output_tokens: u64,
     pub tool_names: Vec<String>,
     pub thinking_chars: u64,
+    /// Estimated wall-clock generation seconds (request start -> last tool call streamed out).
+    /// `None` when not measurable (pure text replies, checkpoints, missing tool steps).
+    pub gen_secs: Option<u32>,
     pub cost: CostBreakdown,
 }
 
+/// Minimum window for a trustworthy speed estimate: timestamps have 1 s resolution, so shorter
+/// windows (or tiny outputs) would swing wildly.
+pub const TPS_MIN_GEN_SECS: u32 = 3;
+pub const TPS_MIN_OUTPUT_TOKENS: u64 = 64;
+
 impl TurnRecord {
+    /// End-to-end output speed (tokens/s, thinking included, TTFT included).
+    pub fn output_tps(&self) -> Option<f64> {
+        let g = self.gen_secs?;
+        if g < TPS_MIN_GEN_SECS || self.output_tokens < TPS_MIN_OUTPUT_TOKENS {
+            return None;
+        }
+        Some(self.output_tokens as f64 / g as f64)
+    }
+
     pub fn total_input(&self) -> u64 {
         self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.total_input().saturating_add(self.output_tokens)
     }
 
     pub fn cache_hit_rate(&self) -> f64 {
@@ -336,9 +357,18 @@ pub struct ModelCacheStats {
     pub multi_turn_calls: u64,
     pub multi_turn_input: u64,
     pub multi_turn_cache_read: u64,
+    /// Output tokens / generation seconds over calls with a trustworthy speed estimate.
+    pub speed_output_tokens: u64,
+    pub speed_gen_secs: u64,
+    pub speed_calls: u64,
 }
 
 impl ModelCacheStats {
+    /// Token-weighted end-to-end output speed (tok/s), robust to 1 s timestamp rounding.
+    pub fn output_tps(&self) -> Option<f64> {
+        (self.speed_gen_secs > 0).then(|| self.speed_output_tokens as f64 / self.speed_gen_secs as f64)
+    }
+
     pub fn multi_turn_hit_rate(&self) -> Option<f64> {
         if self.multi_turn_calls == 0 || self.multi_turn_input == 0 {
             None
@@ -431,10 +461,10 @@ impl DateScope {
 pub enum SessionSort {
     Recent,
     Cost,
-    NonCached,
     TotalTokens,
+    FreshInput,
+    Output,
     HitRateLow,
-    PeakContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1105,6 +1135,11 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
                 );
 
             let mcs = agg.by_model_cache.entry(t.model.clone()).or_default();
+            if t.output_tps().is_some() {
+                mcs.speed_calls += 1;
+                mcs.speed_output_tokens = mcs.speed_output_tokens.saturating_add(t.output_tokens);
+                mcs.speed_gen_secs = mcs.speed_gen_secs.saturating_add(t.gen_secs.unwrap_or(0) as u64);
+            }
             if idx > 0 && !t.is_checkpoint {
                 let ctx = t.total_input();
                 mcs.multi_turn_calls += 1;
@@ -1249,6 +1284,9 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
     let mut subagent_parent_id: Option<String> = None;
     let mut subagent_preview = String::new();
     let mut skipped_lines = 0usize;
+    // created_at of GENERIC (tool execution) steps, keyed by step_index. Tool steps are created the
+    // moment the model streams out each tool call, so they bound when a response finished generating.
+    let mut generic_ts: HashMap<i64, DateTime<Utc>> = HashMap::new();
     let mut line = String::new();
 
     loop {
@@ -1260,6 +1298,9 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        if let Some((step, ts)) = parse_generic_step_header(trimmed) {
+            generic_ts.insert(step, ts);
         }
         // Fast path: skip full JSON DOM parsing for bulky tool-result / non-token lines
         // that are syntactically framed as a JSON object and carry no token counters.
@@ -1387,6 +1428,7 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
                 output_tokens,
                 tool_names,
                 thinking_chars,
+                gen_secs: None,
                 cost: CostBreakdown::default(),
             },
         );
@@ -1394,6 +1436,9 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
 
     let mut turns: Vec<TurnRecord> = by_step.into_values().collect();
     turns.sort_by_key(|t| (if t.step_index >= 0 { t.step_index } else { i64::MAX }, t.timestamp_utc));
+    for t in &mut turns {
+        t.gen_secs = estimate_gen_secs(t, &generic_ts);
+    }
     if seen_user_input {
         subagent_parent_id = None;
         subagent_preview.clear();
@@ -1407,6 +1452,55 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
         subagent_preview,
         skipped_lines,
     })
+}
+
+/// Reads `step_index` + `created_at` from the fixed key header of a GENERIC step line
+/// (`{"step_index":N,"source":..,"type":"GENERIC","status":..,"created_at":"..",...}`) without
+/// parsing the (often huge) tool output that follows. Only the first 256 bytes are inspected and
+/// keys must appear before any `"content"` key, so tool output can never spoof the header.
+fn parse_generic_step_header(line: &str) -> Option<(i64, DateTime<Utc>)> {
+    let mut end = line.len().min(256);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &line[..end];
+    let head = match head.find("\"content\"") {
+        Some(p) => &head[..p],
+        None => head,
+    };
+    if !head.starts_with("{\"step_index\":") || !head.contains("\"type\":\"GENERIC\"") {
+        return None;
+    }
+    let num: String = head["{\"step_index\":".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    let step = num.parse::<i64>().ok()?;
+    let key = "\"created_at\":\"";
+    let start = head.find(key)? + key.len();
+    let rest = &head[start..];
+    let ts_str = &rest[..rest.find('"')?];
+    let ts = DateTime::parse_from_rfc3339(ts_str.trim()).ok()?.with_timezone(&Utc);
+    Some((step, ts))
+}
+
+/// Wall-clock generation time of a tool-calling response: from the response step's `created_at`
+/// (request start) to the latest `created_at` among the tool steps it spawned
+/// (`step+1 ..= step+n`). Includes time-to-first-token and thinking. Timestamps have 1 s
+/// resolution. Returns `None` for pure text replies (no end marker) or when any tool step is
+/// missing / not a GENERIC step (e.g. interleaved errors).
+fn estimate_gen_secs(t: &TurnRecord, generic_ts: &HashMap<i64, DateTime<Utc>>) -> Option<u32> {
+    if t.is_checkpoint || t.tool_names.is_empty() || t.step_index < 0 {
+        return None;
+    }
+    let start = t.timestamp_utc?;
+    let mut end = start;
+    for k in 1..=t.tool_names.len() as i64 {
+        let ts = *generic_ts.get(&(t.step_index + k))?;
+        end = end.max(ts);
+    }
+    let secs = (end - start).num_seconds();
+    (0..=3600).contains(&secs).then_some(secs as u32)
 }
 
 fn is_uuid_like(s: &str) -> bool {
@@ -1686,6 +1780,7 @@ mod tests {
                     output_tokens: 6_000,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
+                    gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
                 TurnRecord {
@@ -1699,6 +1794,7 @@ mod tests {
                     output_tokens: 500,
                     tool_names: vec!["read_file".into()],
                     thinking_chars: 80,
+                    gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
                 TurnRecord {
@@ -1712,6 +1808,7 @@ mod tests {
                     output_tokens: 200,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
+                    gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
             ],
@@ -1753,6 +1850,7 @@ mod tests {
                     output_tokens: 500,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
+                    gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
                 // Normal high hit
@@ -1767,6 +1865,7 @@ mod tests {
                     output_tokens: 500,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
+                    gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
                 // Big cache miss (>=30K ctx, <50% hit)
@@ -1781,6 +1880,7 @@ mod tests {
                     output_tokens: 800,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
+                    gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
             ],
@@ -1839,6 +1939,52 @@ mod tests {
         assert!(snap2.pricing_changed);
         assert_eq!(snap2.custom_pricing_count, 1);
         assert!((snap2.agg.total.cost.total_usd() - 20.0).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_generation_time_and_speed_from_tool_step_timestamps() {
+        let base = std::env::temp_dir().join(format!("agy_gauge_speed_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let logs = base.join("brain").join("sess-s").join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let jsonl = [
+            // Step 1: 2 tool calls; tools stream out at +4 s and +10 s -> gen 10 s, 1000 out -> 100 tok/s
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T01:00:00Z","model":"m-fast","input_tokens":10,"cache_read_tokens":0,"output_tokens":1000,"tool_calls":[{"name":"a"},{"name":"b"}]}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-22T01:00:04Z","content":"{\"step_index\":9,\"type\":\"GENERIC\",\"created_at\":\"2030-01-01T00:00:00Z\"}"}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-22T01:00:10Z","content":"ok"}"#,
+            // Step 4: one tool, gen 2 s -> duration known but too short for a speed estimate
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T01:00:20Z","model":"m-fast","input_tokens":10,"cache_read_tokens":0,"output_tokens":500,"tool_calls":[{"name":"a"}]}"#,
+            r#"{"step_index":5,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-22T01:00:22Z","content":"ok"}"#,
+            // Step 6: tool step missing (interleaved error) -> unmeasurable
+            r#"{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T01:01:00Z","model":"m-fast","input_tokens":10,"cache_read_tokens":0,"output_tokens":800,"tool_calls":[{"name":"a"}]}"#,
+            r#"{"step_index":7,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"503","created_at":"2026-11-22T01:01:30Z"}"#,
+            // Step 8: pure text reply -> no end marker
+            r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-22T01:02:00Z","model":"m-fast","input_tokens":10,"cache_read_tokens":0,"output_tokens":300,"content":"done"}"#,
+        ]
+        .join("\n");
+        fs::write(logs.join("transcript.jsonl"), jsonl).unwrap();
+
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None);
+        let snap = scanner.scan();
+        let turns = &snap.sessions[0].turns;
+        let by_step = |s: i64| turns.iter().find(|t| t.step_index == s).unwrap();
+        assert_eq!(by_step(1).gen_secs, Some(10));
+        assert_eq!(by_step(1).output_tps(), Some(100.0));
+        assert_eq!(by_step(4).gen_secs, Some(2));
+        assert_eq!(by_step(4).output_tps(), None);
+        assert_eq!(by_step(6).gen_secs, None);
+        assert_eq!(by_step(8).gen_secs, None);
+
+        // Per-model speed is token-weighted over measurable calls only
+        let mcs = snap.agg.by_model_cache.get("m-fast").unwrap();
+        assert_eq!(mcs.speed_calls, 1);
+        assert_eq!(mcs.output_tps(), Some(100.0));
+
+        // Header parser ignores spoofed keys inside tool output and non-GENERIC steps
+        assert!(parse_generic_step_header(r#"{"step_index":3,"type":"USER_INPUT","created_at":"2026-11-22T01:00:10Z"}"#).is_none());
+        assert!(parse_generic_step_header(r#"{"step_index":3,"source":"MODEL","content":"\"type\":\"GENERIC\",\"created_at\":\"2026-11-22T01:00:10Z\""}"#).is_none());
 
         let _ = fs::remove_dir_all(&base);
     }

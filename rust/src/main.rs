@@ -76,6 +76,7 @@ const CMD_EXPORT_JSON: u32 = 6101;
 const CMD_EXPORT_SESSIONS_CSV: u32 = 6102;
 const CMD_EXPORT_DAILY_CSV: u32 = 6103;
 const CMD_EXPORT_STATUSLINE_CFG: u32 = 6104;
+const CMD_EXPORT_CALLS_CSV: u32 = 6105;
 
 use d2d::{theme_for, D2DFactories, Fonts};
 use dashboard::{
@@ -1900,6 +1901,7 @@ fn show_export_menu_safe(hwnd: HWND) {
         };
         add_item(CMD_EXPORT_JSON, "导出当前统计快照 (JSON)...");
         add_item(CMD_EXPORT_SESSIONS_CSV, "导出当前会话列表 (CSV)...");
+        add_item(CMD_EXPORT_CALLS_CSV, "导出当前调用记录 (CSV)...");
         add_item(CMD_EXPORT_DAILY_CSV, "导出每日汇总表 (CSV)...");
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
         add_item(CMD_EXPORT_STATUSLINE_CFG, "复制 /statusline 配置片段");
@@ -1959,6 +1961,12 @@ fn show_export_menu_safe(hwnd: HWND) {
             "*.csv",
             "csv",
         ),
+        CMD_EXPORT_CALLS_CSV => (
+            format!("agy-calls-{today_str}.csv"),
+            "CSV 文件 (*.csv)",
+            "*.csv",
+            "csv",
+        ),
         _ => return,
     };
 
@@ -1972,6 +1980,7 @@ fn show_export_menu_safe(hwnd: HWND) {
             CMD_EXPORT_JSON => Some(view.export_snapshot_json(&app.snapshot)),
             CMD_EXPORT_SESSIONS_CSV => Some(view.export_sessions_csv()),
             CMD_EXPORT_DAILY_CSV => Some(view.export_daily_csv()),
+            CMD_EXPORT_CALLS_CSV => Some(view.export_calls_csv()),
             _ => None,
         }
     })
@@ -2857,10 +2866,12 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 return LRESULT(0);
             }
             if vk == 0xBF && !ctrl {
-                // '/' -> jump to Sessions tab & focus inline search input
+                // '/' -> focus inline search (stays on Calls tab, otherwise jumps to Sessions)
                 with_app(|app| {
                     if let Some(view) = &mut app.dash_view {
-                        view.active_tab = Tab::Sessions;
+                        if view.active_tab != Tab::Calls {
+                            view.active_tab = Tab::Sessions;
+                        }
                         view.scroll_rows = 0;
                     }
                     app.pricing_edits.hide_five_edits(hwnd);
@@ -2880,6 +2891,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 0x34 => Some(ClickAction::SelectTab(Tab::Models)),    // '4'
                 0x35 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '5'
                 0x36 => Some(ClickAction::ToggleSystemView),          // '6'
+                0x4C if !ctrl => Some(ClickAction::SelectTab(Tab::Calls)), // 'L' (call log)
                 0x42 if !ctrl => Some(ClickAction::OpenBudgetView),    // 'B'
                 0x44 if !ctrl => Some(ClickAction::ToggleCostMode),    // 'D'
                 0x50 if !ctrl => Some(ClickAction::TogglePrivacyMode), // 'P'
@@ -3355,7 +3367,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             create_dashboard_window_local();
             let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
             for (cost_m, priv_m) in [(false, false), (true, false), (false, true)] {
-                for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::System] {
+                for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::Calls, Tab::System] {
                     with_app(|app| {
                         if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
                             view.cost_mode = cost_m;
