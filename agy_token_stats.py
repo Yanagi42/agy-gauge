@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Strictly read-only token usage analyzer for Antigravity CLI (agy).
+"""Strictly read-only multi-agent token usage analyzer for agy-gauge.
 
-Reads only plain-text local transcript and metadata files under
-~/.gemini/antigravity-cli:
-  - brain/<conversation-id>/.system_generated/logs/transcript.jsonl
-    (falls back to transcript_full.jsonl only if transcript.jsonl is absent)
-  - annotations/<conversation-id>.pbtxt (optional, for conversation titles)
-  - cache/conversation_metadata.json (optional, for titles/previews/workspaces)
+Reads only whitelisted plain-text local transcript and metadata files:
+  - Antigravity (~/.gemini/antigravity{,-cli,-ide}):
+      brain/<conversation-id>/.system_generated/logs/transcript.jsonl
+      (falls back to transcript_full.jsonl only if transcript.jsonl is absent),
+      annotations/<conversation-id>.pbtxt, cache/conversation_metadata.json
+  - Claude Code ($CLAUDE_CONFIG_DIR or ~/.claude, ~/.config/claude):
+      projects/<proj>/<uuid>.jsonl, projects/<proj>/<uuid>/subagents/agent-*.jsonl,
+      optional sessions-index.json and agent-*.meta.json
+  - OpenAI Codex CLI ($CODEX_HOME or ~/.codex):
+      sessions/YYYY/MM/DD/rollout-*.jsonl, archived_sessions/rollout-*.jsonl,
+      optional session_index.jsonl
+  - Gemini CLI ($GEMINI_CLI_HOME or ~/.gemini):
+      tmp/<proj>/chats/session-*.{json,jsonl}, optional .project_root and projects.json
 
 Safety guarantees:
   - Strictly read-only: performs zero file writes, creates no temp/cache files.
   - Never opens SQLite databases (avoids WAL/SHM creation or lock contention
-    with live `agy` CLI processes).
-  - Never reads credentials, OAuth tokens, settings, or network endpoints.
+    with live Antigravity / Codex CLI processes).
+  - Never reads credentials, OAuth tokens, auth/settings files, history, or network endpoints.
+  - Rejects symlinks and verifies canonical root containment before every read.
   - Never invokes subprocesses; uses only the Python standard library.
 """
 
@@ -21,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -40,7 +49,37 @@ DEFAULT_PRICING_PATH = pathlib.Path(__file__).resolve().parent / "pricing.json"
 DEFAULT_STATUSLINE_PATH = pathlib.Path(__file__).resolve().parent / "statusline_state.json"
 DEFAULT_ARCHIVE_PATH = pathlib.Path(__file__).resolve().parent / "archive.json"
 DEFAULT_BUDGET_PATH = pathlib.Path(__file__).resolve().parent / "budget.json"
-BLOCK_WINDOW_SECS = 5 * 3600
+
+TIER1_AGENTS: tuple[str, ...] = ("antigravity", "claude", "codex", "gemini")
+
+_AGENT_ALIASES: dict[str, str] = {
+    "agy": "antigravity",
+    "antigravity": "antigravity",
+    "antigravity-cli": "antigravity",
+    "antigravity-app": "antigravity",
+    "antigravity-ide": "antigravity",
+    "cli": "antigravity",
+    "app": "antigravity",
+    "ide": "antigravity",
+    "claude": "claude",
+    "claude-code": "claude",
+    "claude_code": "claude",
+    "cc": "claude",
+    "codex": "codex",
+    "codex-cli": "codex",
+    "codex_cli": "codex",
+    "openai": "codex",
+    "gemini": "gemini",
+    "gemini-cli": "gemini",
+    "gemini_cli": "gemini",
+}
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    kind: str  # "antigravity" | "claude" | "codex" | "gemini"
+    root: pathlib.Path
+    source_name: str  # "cli" | "app" | "ide" | "custom" | "claude" | "codex" | "gemini"
 
 
 def _infer_source_name(path: pathlib.Path) -> str:
@@ -52,6 +91,104 @@ def _infer_source_name(path: pathlib.Path) -> str:
     if low == "antigravity-ide":
         return "ide"
     return "custom"
+
+
+def _normalize_source_name(source: str) -> str:
+    low = source.strip().lower()
+    if low in ("cli", "antigravity-cli"):
+        return "cli"
+    if low in ("app", "antigravity"):
+        return "app"
+    if low in ("ide", "antigravity-ide"):
+        return "ide"
+    if low in ("claude", "claude-code", "claude_code"):
+        return "claude"
+    if low in ("codex", "codex-cli", "codex_cli"):
+        return "codex"
+    if low in ("gemini", "gemini-cli", "gemini_cli"):
+        return "gemini"
+    return "custom"
+
+
+def source_to_agent_family(source: str) -> str:
+    low = source.strip().lower()
+    if low in ("claude", "claude-code", "claude_code"):
+        return "claude"
+    if low in ("codex", "codex-cli", "codex_cli"):
+        return "codex"
+    if low in ("gemini", "gemini-cli", "gemini_cli"):
+        return "gemini"
+    return "antigravity"
+
+
+def source_badge(source: str) -> str:
+    low = source.strip().lower()
+    return {
+        "cli": "AGY",
+        "app": "App",
+        "ide": "IDE",
+        "custom": "Custom",
+        "claude": "Claude",
+        "codex": "Codex",
+        "gemini": "Gemini",
+    }.get(low, source or "AGY")
+
+
+def source_display_label(source: str) -> str:
+    low = source.strip().lower()
+    return {
+        "cli": "Antigravity CLI",
+        "app": "Antigravity App",
+        "ide": "Antigravity IDE",
+        "custom": "Antigravity Custom",
+        "claude": "Claude Code",
+        "codex": "Codex CLI",
+        "gemini": "Gemini CLI",
+    }.get(low, source or "Antigravity")
+
+
+def agent_display_label(family: str) -> str:
+    return {
+        "antigravity": "Antigravity",
+        "claude": "Claude Code",
+        "codex": "Codex CLI",
+        "gemini": "Gemini CLI",
+    }.get(family, family)
+
+
+def parse_agent_filter(raw_values: Sequence[str] | None) -> set[str] | None:
+    if not raw_values:
+        return None
+    selected: set[str] = set()
+    for raw in raw_values:
+        for tok in raw.split(","):
+            key = tok.strip().lower()
+            if not key:
+                continue
+            if key == "all":
+                selected.update(TIER1_AGENTS)
+                continue
+            mapped = _AGENT_ALIASES.get(key)
+            if mapped is None:
+                raise ValueError(
+                    f"Unknown agent '{tok.strip()}'. Expected one of: agy, antigravity, claude, codex, gemini, all."
+                )
+            selected.add(mapped)
+    return selected or None
+
+
+def _dedup_paths(paths: Sequence[pathlib.Path]) -> list[pathlib.Path]:
+    out: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for p in paths:
+        try:
+            key = str(p.resolve(strict=False)).lower()
+        except OSError:
+            key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
 
 
 def default_data_dirs() -> list[pathlib.Path]:
@@ -66,6 +203,65 @@ def default_data_dirs() -> list[pathlib.Path]:
         if idx == 0 or (p / "brain").is_dir():
             out.append(p)
     return out
+
+
+def discover_claude_dirs() -> list[pathlib.Path]:
+    env_val = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if env_val:
+        candidates = [pathlib.Path(part.strip()).expanduser() for part in env_val.split(",") if part.strip()]
+    else:
+        home = pathlib.Path.home()
+        candidates = [home / ".claude", home / ".config" / "claude"]
+    out: list[pathlib.Path] = []
+    for p in _dedup_paths(candidates):
+        if not p.is_symlink() and (p / "projects").is_dir() and not (p / "projects").is_symlink():
+            out.append(p)
+    return out
+
+
+def discover_codex_dirs() -> list[pathlib.Path]:
+    env_val = os.environ.get("CODEX_HOME", "").strip()
+    root = pathlib.Path(env_val).expanduser() if env_val else (pathlib.Path.home() / ".codex")
+    if root.is_symlink():
+        return []
+    has_sessions = (root / "sessions").is_dir() and not (root / "sessions").is_symlink()
+    has_archived = (root / "archived_sessions").is_dir() and not (root / "archived_sessions").is_symlink()
+    return [root] if (has_sessions or has_archived) else []
+
+
+def discover_gemini_dirs() -> list[pathlib.Path]:
+    env_val = os.environ.get("GEMINI_CLI_HOME", "").strip()
+    if env_val:
+        base = pathlib.Path(env_val).expanduser()
+        candidates = [base / "tmp", base / ".gemini" / "tmp"]
+    else:
+        candidates = [pathlib.Path.home() / ".gemini" / "tmp"]
+    out: list[pathlib.Path] = []
+    for p in _dedup_paths(candidates):
+        if not p.is_symlink() and p.is_dir():
+            out.append(p)
+    return out
+
+
+def discover_default_sources(agents: set[str] | None = None) -> list[SourceSpec]:
+    allowed = set(TIER1_AGENTS) if agents is None else set(agents)
+    sources: list[SourceSpec] = []
+    if "antigravity" in allowed:
+        for p in default_data_dirs():
+            if not p.is_symlink() and (p / "brain").is_dir():
+                sources.append(SourceSpec("antigravity", p, _infer_source_name(p)))
+    if "claude" in allowed:
+        for p in discover_claude_dirs():
+            sources.append(SourceSpec("claude", p, "claude"))
+    if "codex" in allowed:
+        for p in discover_codex_dirs():
+            sources.append(SourceSpec("codex", p, "codex"))
+    if "gemini" in allowed:
+        for p in discover_gemini_dirs():
+            sources.append(SourceSpec("gemini", p, "gemini"))
+    if not sources and "antigravity" in allowed:
+        sources.append(SourceSpec("antigravity", DEFAULT_DATA_DIR, "cli"))
+    return sources
 
 _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 _PBTXT_TITLE_RE = re.compile(r'(?m)^\s*title\s*:\s*"((?:\\.|[^"\\])*)"')
@@ -92,11 +288,14 @@ class ModelRate:
         cache_read_tokens: int,
         cache_write_tokens: int,
         output_tokens: int,
+        cache_write_1h_tokens: int = 0,
     ) -> "CostBreakdown":
         per_m = 1_000_000.0
         in_usd = (input_tokens / per_m) * self.input
         cr_usd = (cache_read_tokens / per_m) * self.cache_read
-        cw_usd = (cache_write_tokens / per_m) * self.cache_write
+        cw_1h = min(max(0, cache_write_1h_tokens), max(0, cache_write_tokens))
+        cw_5m = max(0, cache_write_tokens - cw_1h)
+        cw_usd = (cw_5m / per_m) * self.cache_write + (cw_1h / per_m) * (self.input * 2.0)
         out_usd = (output_tokens / per_m) * self.output
         saved_usd = (
             (cache_read_tokens / per_m) * (self.input - self.cache_read)
@@ -146,11 +345,23 @@ class CostBreakdown:
         return calls > 0 and self.unpriced_calls >= calls
 
 
+_PROVIDER_PREFIXES = (
+    "us.anthropic.",
+    "eu.anthropic.",
+    "global.anthropic.",
+    "anthropic.",
+)
+
+
 def canonical_exact_key(raw: str) -> str:
     s = raw.strip().lower()
     if "/" in s:
         s = s.rsplit("/", 1)[1]
-    return s.replace(".", "-").replace("_", "-")
+    for pfx in _PROVIDER_PREFIXES:
+        if s.startswith(pfx):
+            s = s[len(pfx) :]
+            break
+    return s.replace("@", "-").replace(".", "-").replace("_", "-")
 
 
 def normalize_model_key(raw: str) -> str:
@@ -176,6 +387,8 @@ _BUILTIN_SPECS: tuple[tuple[str, tuple[str, ...], ModelRate, int | None, ModelRa
     ("gemini-3-flash", ("gemini-3-flash", "gemini-3-0-flash"), ModelRate(0.50, 0.05, 0.50, 3.00), None, None, None, None, ""),
     ("gemini-2.5-pro", ("gemini-2-5-pro",), ModelRate(1.25, 0.125, 1.25, 10.00), 200_000, ModelRate(2.50, 0.25, 2.50, 15.00), None, None, ">200K $2.5/$15"),
     ("gemini-2.5-flash", ("gemini-2-5-flash",), ModelRate(0.30, 0.03, 0.30, 2.50), None, None, None, None, ""),
+    ("gemini-2.0-flash-lite", ("gemini-2-0-flash-lite",), ModelRate(0.075, 0.01875, 0.075, 0.30), None, None, None, None, ""),
+    ("gemini-2.0-flash", ("gemini-2-0-flash",), ModelRate(0.10, 0.025, 0.10, 0.40), None, None, None, None, ""),
     ("claude-opus-5-5", ("claude-opus-5-5",), ModelRate(4.00, 0.20, 5.00, 20.00), None, None, None, None, "1M flat"),
     ("claude-sonnet-5-5", ("claude-sonnet-5-5",), ModelRate(2.00, 0.10, 2.50, 10.00), None, None, None, None, ""),
     ("claude-haiku-5-5", ("claude-haiku-5-5",), ModelRate(0.10, 0.01, 0.125, 0.50), 100_000, ModelRate(0.50, 0.05, 0.625, 2.50), None, None, ">100K $0.5/$2.5"),
@@ -187,8 +400,22 @@ _BUILTIN_SPECS: tuple[tuple[str, tuple[str, ...], ModelRate, int | None, ModelRa
     ("claude-sonnet-4", ("claude-sonnet-4", "claude-3-7-sonnet", "claude-3-5-sonnet"), ModelRate(3.00, 0.30, 3.75, 15.00), None, None, None, None, ""),
     ("claude-haiku-4-5", ("claude-haiku-4-5",), ModelRate(1.00, 0.10, 1.25, 5.00), None, None, None, None, ""),
     ("claude-3-5-haiku", ("claude-3-5-haiku",), ModelRate(0.80, 0.08, 1.00, 4.00), None, None, None, None, ""),
+    # OpenAI / Codex models — ordered most-specific before shorter prefixes (e.g. before "gpt-5")
+    ("gpt-5.4", ("gpt-5-4",), ModelRate(2.50, 0.25, 2.50, 15.00), None, None, None, None, ""),
+    ("gpt-5.3-codex", ("gpt-5-3-codex",), ModelRate(1.75, 0.175, 1.75, 14.00), None, None, None, None, ""),
+    ("gpt-5.2-codex", ("gpt-5-2-codex",), ModelRate(1.75, 0.175, 1.75, 14.00), None, None, None, None, ""),
+    ("gpt-5.2", ("gpt-5-2",), ModelRate(1.75, 0.175, 1.75, 14.00), None, None, None, None, ""),
+    ("gpt-5.1-codex-mini", ("gpt-5-1-codex-mini",), ModelRate(0.25, 0.025, 0.25, 2.00), None, None, None, None, ""),
+    ("gpt-5.1-codex", ("gpt-5-1-codex",), ModelRate(1.25, 0.125, 1.25, 10.00), None, None, None, None, ""),
+    ("gpt-5.1", ("gpt-5-1",), ModelRate(1.25, 0.125, 1.25, 10.00), None, None, None, None, ""),
+    ("gpt-5-codex", ("gpt-5-codex",), ModelRate(1.25, 0.125, 1.25, 10.00), None, None, None, None, ""),
     ("gpt-5-mini", ("gpt-5-mini",), ModelRate(0.25, 0.025, 0.25, 2.00), None, None, None, None, ""),
+    ("gpt-5-nano", ("gpt-5-nano",), ModelRate(0.05, 0.005, 0.05, 0.40), None, None, None, None, ""),
     ("gpt-5", ("gpt-5",), ModelRate(1.25, 0.125, 1.25, 10.00), None, None, None, None, ""),
+    ("codex-mini-latest", ("codex-mini-latest", "codex-mini"), ModelRate(1.50, 0.375, 1.50, 6.00), None, None, None, None, ""),
+    ("gpt-4.1-mini", ("gpt-4-1-mini",), ModelRate(0.40, 0.10, 0.40, 1.60), None, None, None, None, ""),
+    ("gpt-4.1-nano", ("gpt-4-1-nano",), ModelRate(0.10, 0.025, 0.10, 0.40), None, None, None, None, ""),
+    ("gpt-4.1", ("gpt-4-1",), ModelRate(2.00, 0.50, 2.00, 8.00), None, None, None, None, ""),
     ("gpt-4o-mini", ("gpt-4o-mini",), ModelRate(0.15, 0.075, 0.15, 0.60), None, None, None, None, ""),
     ("gpt-4o", ("gpt-4o",), ModelRate(2.50, 1.25, 2.50, 10.00), None, None, None, None, ""),
     ("o3-mini", ("o3-mini", "o4-mini"), ModelRate(1.10, 0.55, 1.10, 4.40), None, None, None, None, ""),
@@ -356,12 +583,39 @@ class PricingCatalog:
         cache_write_tokens: int,
         output_tokens: int,
         date_obj: dt.date | None,
+        cache_write_1h_tokens: int = 0,
     ) -> CostBreakdown:
         ctx = input_tokens + cache_read_tokens + cache_write_tokens
         rate = self.resolve_rate(model, ctx, date_obj)
         if rate is None:
             return CostBreakdown(unpriced_calls=1)
-        return rate.calculate(input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
+        return rate.calculate(
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+        )
+
+    def price_turn_with_ttl(
+        self,
+        model: str,
+        input_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        cache_write_1h_tokens: int,
+        output_tokens: int,
+        date_obj: dt.date | None,
+    ) -> CostBreakdown:
+        return self.price_turn(
+            model,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            date_obj,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+        )
 
 
 @dataclass
@@ -462,6 +716,8 @@ class TurnRecord:
     output_tokens: int
     tool_names: tuple[str, ...] = ()
     thinking_chars: int = 0
+    reasoning_tokens: int = 0
+    cache_write_1h_tokens: int = 0
     cost: CostBreakdown = field(default_factory=CostBreakdown)
 
     @property
@@ -476,6 +732,10 @@ class TurnRecord:
     def cache_hit_rate(self) -> float:
         denom = self.total_input_tokens
         return (self.cache_read_tokens / denom) * 100.0 if denom > 0 else 0.0
+
+    @property
+    def has_thinking(self) -> bool:
+        return self.thinking_chars > 0 or self.reasoning_tokens > 0
 
 
 @dataclass
@@ -496,6 +756,10 @@ class SessionInfo:
     last_time: dt.datetime | None = None
 
     @property
+    def agent_family(self) -> str:
+        return source_to_agent_family(self.source)
+
+    @property
     def active_duration_secs(self) -> int:
         times = sorted(t.timestamp for t in self.turns if t.timestamp is not None)
         if not times:
@@ -511,7 +775,7 @@ class SessionInfo:
 
     @property
     def thinking_turns(self) -> int:
-        return sum(1 for t in self.turns if t.thinking_chars > 0)
+        return sum(1 for t in self.turns if t.has_thinking)
 
     def tool_counts(self) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
@@ -917,6 +1181,856 @@ def _parse_transcript_file(
     return ordered, first_user_preview, subagent_parent_id, subagent_preview, skipped_lines
 
 
+def _extract_text_from_content(content: Any) -> str:
+    """Extract plain text snippet from str or Anthropic/OpenAI/Gemini content block lists."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                btype = str(item.get("type") or "")
+                if btype in ("tool_result", "tool_use", "thinking", "redacted_thinking", "image"):
+                    continue
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+        return " ".join(parts).strip()
+    return ""
+
+
+# ---------- Claude Code read-only parser ----------
+
+_CLAUDE_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _is_allowed_claude_session_stem(stem: str) -> bool:
+    if not _CLAUDE_SAFE_ID_RE.match(stem):
+        return False
+    low = stem.lower()
+    if (
+        low == "history"
+        or low == "sessions-index"
+        or low.startswith("agent-")
+        or low.startswith("settings")
+        or low.startswith("auth")
+        or low.startswith("credentials")
+        or "credentials" in low
+        or low.startswith("statsig")
+        or low.startswith("debug")
+    ):
+        return False
+    return True
+
+
+def _is_allowed_claude_agent_id(agent_id: str) -> bool:
+    return bool(_CLAUDE_SAFE_ID_RE.match(agent_id))
+
+
+def _load_claude_sessions_index(
+    index_path: pathlib.Path, root_dir: pathlib.Path
+) -> dict[str, dict[str, str]]:
+    """Read optional Claude Code projects/<proj>/sessions-index.json."""
+    text = _safe_read_text(index_path, root_dir)
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    entries: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and isinstance(payload.get("entries"), list):
+        entries = [e for e in payload["entries"] if isinstance(e, dict)]
+    elif isinstance(payload, list):
+        entries = [e for e in payload if isinstance(e, dict)]
+    elif isinstance(payload, dict):
+        for k, v in payload.items():
+            if isinstance(v, dict):
+                item = dict(v)
+                item.setdefault("sessionId", k)
+                entries.append(item)
+    out: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        sid = str(entry.get("sessionId") or entry.get("id") or "").strip()
+        if not sid:
+            continue
+        summary = _clean_single_line(str(entry.get("summary") or entry.get("customTitle") or ""))
+        first_prompt = _clean_single_line(str(entry.get("firstPrompt") or ""), max_len=80)
+        proj_path = str(entry.get("projectPath") or entry.get("cwd") or "").strip()
+        out[sid] = {
+            "title": summary or first_prompt,
+            "workspace": proj_path,
+        }
+    return out
+
+
+def _parse_claude_agent_meta(meta_path: pathlib.Path, root_dir: pathlib.Path) -> tuple[str, str]:
+    """Read optional subagents/agent-<id>.meta.json -> (agent_type, description)."""
+    text = _safe_read_text(meta_path, root_dir)
+    if not text:
+        return "", ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    agent_type = _clean_single_line(str(payload.get("agentType") or payload.get("subagentType") or ""), max_len=40)
+    desc = _clean_single_line(str(payload.get("description") or payload.get("title") or ""), max_len=96)
+    return agent_type, desc
+
+
+def _parse_claude_jsonl(
+    jsonl_path: pathlib.Path,
+    *,
+    fallback_cid: str,
+    is_subagent: bool,
+    parent_uuid_hint: str | None = None,
+    agent_id_hint: str = "",
+) -> dict[str, Any]:
+    """Parse a single Claude Code JSONL file strictly read-only in UTC."""
+    dedup_entries: dict[tuple[Any, ...], dict[str, Any]] = {}
+    cwd = ""
+    custom_title = ""
+    summary_title = ""
+    first_user_preview = ""
+    session_id_in_file = ""
+    agent_id_in_file = ""
+    skipped_lines = 0
+
+    with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line_idx, line in enumerate(fh):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                skipped_lines += 1
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            if not cwd and isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
+                cwd = obj["cwd"].strip()
+            if not session_id_in_file and isinstance(obj.get("sessionId"), str) and obj["sessionId"].strip():
+                session_id_in_file = obj["sessionId"].strip()
+            if not agent_id_in_file and isinstance(obj.get("agentId"), str) and obj["agentId"].strip():
+                agent_id_in_file = obj["agentId"].strip()
+
+            rec_type = str(obj.get("type") or "")
+            if rec_type == "custom-title":
+                ct = str(obj.get("customTitle") or obj.get("title") or "").strip()
+                if ct:
+                    custom_title = _clean_single_line(ct)
+                continue
+            if rec_type == "summary":
+                sm = str(obj.get("summary") or "").strip()
+                if sm:
+                    summary_title = _clean_single_line(sm)
+                continue
+            if rec_type == "user":
+                if not first_user_preview and not obj.get("isMeta"):
+                    msg = obj.get("message")
+                    raw_c = msg.get("content") if isinstance(msg, dict) else obj.get("content")
+                    txt = _extract_text_from_content(raw_c)
+                    if txt:
+                        first_user_preview = _clean_single_line(txt, max_len=80)
+                continue
+            if rec_type != "assistant":
+                continue
+
+            if obj.get("isApiErrorMessage") is True:
+                continue
+            msg = obj.get("message")
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("isApiErrorMessage") is True:
+                continue
+            raw_model = str(msg.get("model") or "").strip()
+            if raw_model.lower() == "<synthetic>":
+                continue
+
+            msg_id = str(msg.get("id") or "").strip()
+            usage = msg.get("usage")
+            has_usage = isinstance(usage, dict)
+            if not has_usage and not msg_id:
+                continue
+
+            if has_usage:
+                in_tok = _to_non_neg_int(usage.get("input_tokens"))
+                cache_read = _to_non_neg_int(usage.get("cache_read_input_tokens"))
+                cache_write = _to_non_neg_int(usage.get("cache_creation_input_tokens"))
+                out_tok = _to_non_neg_int(usage.get("output_tokens"))
+                cc_obj = usage.get("cache_creation")
+                cw_1h = (
+                    min(_to_non_neg_int(cc_obj.get("ephemeral_1h_input_tokens")), cache_write)
+                    if isinstance(cc_obj, dict)
+                    else 0
+                )
+            else:
+                in_tok = 0
+                cache_read = 0
+                cache_write = 0
+                cw_1h = 0
+                out_tok = 0
+
+            ts = _parse_iso_timestamp(obj.get("timestamp"), dt.timezone.utc)
+            stop_reason = str(msg.get("stop_reason") or "").strip()
+
+            chunk_tools: list[tuple[str | None, str]] = []
+            chunk_thinking = 0
+            raw_content = msg.get("content")
+            if isinstance(raw_content, list):
+                for block in raw_content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = str(block.get("type") or "")
+                    if btype == "tool_use":
+                        tname = str(block.get("name") or "").strip()
+                        tid = str(block.get("id") or "").strip() or None
+                        if tname:
+                            chunk_tools.append((tid, tname))
+                    elif btype == "thinking":
+                        t_txt = block.get("thinking")
+                        chunk_thinking += max(1, len(t_txt) if isinstance(t_txt, str) else 1)
+                    elif btype == "redacted_thinking":
+                        t_data = block.get("data")
+                        chunk_thinking += max(1, len(t_data) if isinstance(t_data, str) else 1)
+
+            req_id = str(obj.get("requestId") or "").strip()
+            rec_uuid = str(obj.get("uuid") or "").strip()
+            if msg_id and req_id:
+                dkey: tuple[Any, ...] = ("mr", msg_id, req_id)
+            elif msg_id:
+                dkey = ("m", msg_id)
+            elif rec_uuid:
+                dkey = ("u", rec_uuid)
+            else:
+                dkey = ("l", line_idx)
+
+            existing = dedup_entries.get(dkey)
+            if existing is None:
+                seen_tids: set[str] = set()
+                seen_anon_tools: set[str] = set()
+                tools_list: list[str] = []
+                for tid, tname in chunk_tools:
+                    if tid is not None:
+                        if tid not in seen_tids:
+                            seen_tids.add(tid)
+                            tools_list.append(tname)
+                    elif tname not in seen_anon_tools:
+                        seen_anon_tools.add(tname)
+                        tools_list.append(tname)
+                dedup_entries[dkey] = {
+                    "timestamp": ts,
+                    "model": raw_model or "unknown",
+                    "status": stop_reason or "DONE",
+                    "input_tokens": in_tok,
+                    "cache_read_tokens": cache_read,
+                    "cache_write_tokens": cache_write,
+                    "cache_write_1h_tokens": cw_1h,
+                    "output_tokens": out_tok,
+                    "tools": tools_list,
+                    "seen_tids": seen_tids,
+                    "seen_anon_tools": seen_anon_tools,
+                    "thinking_chars": chunk_thinking,
+                }
+            else:
+                if ts is not None:
+                    existing["timestamp"] = ts
+                if raw_model:
+                    existing["model"] = raw_model
+                if stop_reason:
+                    existing["status"] = stop_reason
+                if has_usage and (in_tok + cache_read + cache_write) > 0:
+                    existing["input_tokens"] = in_tok
+                    existing["cache_read_tokens"] = cache_read
+                    existing["cache_write_tokens"] = cache_write
+                    existing["cache_write_1h_tokens"] = min(
+                        max(existing["cache_write_1h_tokens"], cw_1h),
+                        cache_write,
+                    )
+                if has_usage and out_tok > existing["output_tokens"]:
+                    existing["output_tokens"] = out_tok
+                if chunk_thinking > existing["thinking_chars"]:
+                    existing["thinking_chars"] = chunk_thinking
+                seen_tids = existing["seen_tids"]
+                seen_anon_tools = existing["seen_anon_tools"]
+                tools_list = existing["tools"]
+                for tid, tname in chunk_tools:
+                    if tid is not None:
+                        if tid not in seen_tids:
+                            seen_tids.add(tid)
+                            tools_list.append(tname)
+                    elif tname not in seen_anon_tools:
+                        seen_anon_tools.add(tname)
+                        tools_list.append(tname)
+
+    if is_subagent:
+        parent_id = parent_uuid_hint or session_id_in_file or None
+        aid = agent_id_in_file or agent_id_hint
+        cid = f"{parent_id}__{aid}" if (parent_id and aid) else fallback_cid
+    else:
+        cid = session_id_in_file or fallback_cid
+        parent_id = None
+
+    turns: list[TurnRecord] = []
+    step_idx = 0
+    for entry in dedup_entries.values():
+        total_tok = (
+            entry["input_tokens"]
+            + entry["cache_read_tokens"]
+            + entry["cache_write_tokens"]
+            + entry["output_tokens"]
+        )
+        if total_tok == 0:
+            continue
+        step_idx += 1
+        turns.append(
+            TurnRecord(
+                conversation_id=cid,
+                step_index=step_idx,
+                timestamp=entry["timestamp"],
+                model=entry["model"],
+                step_type="ASSISTANT",
+                status=entry["status"],
+                input_tokens=entry["input_tokens"],
+                cache_read_tokens=entry["cache_read_tokens"],
+                cache_write_tokens=entry["cache_write_tokens"],
+                output_tokens=entry["output_tokens"],
+                tool_names=tuple(entry["tools"]),
+                thinking_chars=entry["thinking_chars"],
+                cache_write_1h_tokens=entry["cache_write_1h_tokens"],
+            )
+        )
+
+    return {
+        "cid": cid,
+        "parent_id": parent_id,
+        "is_subagent": is_subagent,
+        "cwd": cwd,
+        "title_hint": custom_title or summary_title or first_user_preview,
+        "turns": turns,
+        "skipped_lines": skipped_lines,
+    }
+
+
+# ---------- OpenAI Codex CLI read-only parser ----------
+
+_CODEX_UUID_TAIL_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+_CODEX_TOOL_ITEM_TYPES = frozenset(
+    {"function_call", "custom_tool_call", "local_shell_call", "web_search_call", "mcp_tool_call"}
+)
+
+
+def _load_codex_session_index(root_dir: pathlib.Path) -> dict[str, str]:
+    """Read optional <codex_home>/session_index.jsonl -> {session_id: title}."""
+    idx_path = root_dir / "session_index.jsonl"
+    text = _safe_read_text(idx_path, root_dir)
+    if not text:
+        return {}
+    titles: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        sid = str(obj.get("id") or obj.get("session_id") or "").strip()
+        title = _clean_single_line(
+            str(obj.get("thread_name") or obj.get("title") or obj.get("name") or "")
+        )
+        if sid and title:
+            titles[sid] = title
+    return titles
+
+
+def _codex_usage_tuple(usage: dict[str, Any]) -> tuple[int, int, int, int]:
+    return (
+        _to_non_neg_int(usage.get("input_tokens")),
+        _to_non_neg_int(usage.get("cached_input_tokens")),
+        _to_non_neg_int(usage.get("output_tokens")),
+        _to_non_neg_int(usage.get("reasoning_output_tokens")),
+    )
+
+
+def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
+    """Parse a single Codex CLI rollout-*.jsonl file strictly read-only in UTC."""
+    stem = rollout_path.stem
+    m_uuid = _CODEX_UUID_TAIL_RE.search(stem)
+    session_id = m_uuid.group(1) if m_uuid else stem
+    cwd = ""
+    current_model = ""
+    is_subagent = False
+    parent_id: str | None = None
+    subagent_label = ""
+    first_user_preview = ""
+    buffered_tools: list[str] = []
+    buffered_thinking_chars = 0
+    prev_total: tuple[int, int, int, int] | None = None
+    turns: list[TurnRecord] = []
+    skipped_lines = 0
+
+    with rollout_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                skipped_lines += 1
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            rec_type = str(obj.get("type") or "")
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            if rec_type == "session_meta":
+                sid = str(payload.get("id") or "").strip()
+                if sid:
+                    session_id = sid
+                if not cwd and isinstance(payload.get("cwd"), str) and payload["cwd"].strip():
+                    cwd = payload["cwd"].strip()
+                if not current_model and isinstance(payload.get("model"), str) and payload["model"].strip():
+                    current_model = payload["model"].strip()
+                src = payload.get("source")
+                if isinstance(src, dict) and src.get("subagent") is not None:
+                    is_subagent = True
+                    sub = src.get("subagent")
+                    if isinstance(sub, dict):
+                        ts_obj = sub.get("thread_spawn")
+                        if isinstance(ts_obj, dict):
+                            pid = str(ts_obj.get("parent_thread_id") or "").strip()
+                            if pid:
+                                parent_id = pid
+                            nick = str(ts_obj.get("agent_nickname") or "").strip()
+                            role = str(ts_obj.get("agent_role") or "").strip()
+                            parts = [p for p in (nick, role) if p]
+                            if parts:
+                                subagent_label = _clean_single_line(" · ".join(parts), max_len=72)
+                    elif isinstance(sub, str) and sub.strip():
+                        subagent_label = _clean_single_line(sub, max_len=72)
+                continue
+
+            if rec_type == "turn_context":
+                mdl = str(payload.get("model") or "").strip()
+                if mdl:
+                    current_model = mdl
+                if not cwd and isinstance(payload.get("cwd"), str) and payload["cwd"].strip():
+                    cwd = payload["cwd"].strip()
+                continue
+
+            if rec_type == "response_item":
+                ptype = str(payload.get("type") or "")
+                if ptype in _CODEX_TOOL_ITEM_TYPES:
+                    tname = str(payload.get("name") or ptype).strip()
+                    if tname:
+                        buffered_tools.append(tname)
+                elif ptype == "reasoning":
+                    r_len = 0
+                    for field_key in ("summary", "content"):
+                        val = payload.get(field_key)
+                        if isinstance(val, str):
+                            r_len += len(val)
+                        elif isinstance(val, list):
+                            for elem in val:
+                                if isinstance(elem, dict):
+                                    t_s = elem.get("text")
+                                    if isinstance(t_s, str):
+                                        r_len += len(t_s)
+                    buffered_thinking_chars += max(1, r_len)
+                elif ptype == "message" and payload.get("role") == "user" and not first_user_preview:
+                    txt = _extract_text_from_content(payload.get("content"))
+                    if txt:
+                        first_user_preview = _clean_single_line(txt, max_len=80)
+                continue
+
+            if rec_type != "event_msg":
+                continue
+
+            ptype = str(payload.get("type") or "")
+            if ptype == "user_message" and not first_user_preview:
+                raw_msg = payload.get("message") or payload.get("text")
+                txt = _extract_text_from_content(raw_msg)
+                if txt:
+                    first_user_preview = _clean_single_line(txt, max_len=80)
+                continue
+            if ptype == "agent_reasoning":
+                r_txt = payload.get("text") or payload.get("reasoning") or ""
+                buffered_thinking_chars += max(1, len(r_txt) if isinstance(r_txt, str) else 1)
+                continue
+            if ptype != "token_count":
+                continue
+
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+
+            total_u = info.get("total_token_usage")
+            last_u = info.get("last_token_usage")
+            delta: tuple[int, int, int, int] | None = None
+
+            if isinstance(total_u, dict):
+                curr_total = _codex_usage_tuple(total_u)
+                if prev_total is not None and curr_total == prev_total:
+                    continue
+                if prev_total is None:
+                    delta = curr_total
+                elif curr_total[0] >= prev_total[0] and curr_total[2] >= prev_total[2]:
+                    delta = (
+                        curr_total[0] - prev_total[0],
+                        max(0, curr_total[1] - prev_total[1]),
+                        curr_total[2] - prev_total[2],
+                        max(0, curr_total[3] - prev_total[3]),
+                    )
+                else:
+                    delta = _codex_usage_tuple(last_u) if isinstance(last_u, dict) else curr_total
+                prev_total = curr_total
+            elif isinstance(last_u, dict):
+                delta = _codex_usage_tuple(last_u)
+            else:
+                continue
+
+            d_in, d_cached, d_out, d_reason = delta
+            cache_read = min(d_cached, d_in)
+            uncached_in = max(0, d_in - d_cached)
+            output_tok = d_out
+            if (uncached_in + cache_read + output_tok) == 0:
+                continue
+
+            ts = _parse_iso_timestamp(obj.get("timestamp"), dt.timezone.utc)
+            turn_model = current_model or str(info.get("model") or "").strip() or "unknown"
+            turns.append(
+                TurnRecord(
+                    conversation_id=session_id,
+                    step_index=len(turns) + 1,
+                    timestamp=ts,
+                    model=turn_model,
+                    step_type="TOKEN_COUNT",
+                    status="DONE",
+                    input_tokens=uncached_in,
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=0,
+                    output_tokens=output_tok,
+                    tool_names=tuple(buffered_tools),
+                    thinking_chars=buffered_thinking_chars,
+                    reasoning_tokens=d_reason,
+                )
+            )
+            buffered_tools = []
+            buffered_thinking_chars = 0
+
+    if turns and (buffered_tools or buffered_thinking_chars > 0):
+        last_t = turns[-1]
+        turns[-1] = TurnRecord(
+            conversation_id=last_t.conversation_id,
+            step_index=last_t.step_index,
+            timestamp=last_t.timestamp,
+            model=last_t.model,
+            step_type=last_t.step_type,
+            status=last_t.status,
+            input_tokens=last_t.input_tokens,
+            cache_read_tokens=last_t.cache_read_tokens,
+            cache_write_tokens=last_t.cache_write_tokens,
+            output_tokens=last_t.output_tokens,
+            tool_names=last_t.tool_names + tuple(buffered_tools),
+            thinking_chars=last_t.thinking_chars + buffered_thinking_chars,
+            reasoning_tokens=last_t.reasoning_tokens,
+            cache_write_1h_tokens=last_t.cache_write_1h_tokens,
+        )
+
+    # Ensure conversation_id on every turn reflects final session_id
+    if turns and any(t.conversation_id != session_id for t in turns):
+        turns = [
+            TurnRecord(
+                conversation_id=session_id,
+                step_index=t.step_index,
+                timestamp=t.timestamp,
+                model=t.model,
+                step_type=t.step_type,
+                status=t.status,
+                input_tokens=t.input_tokens,
+                cache_read_tokens=t.cache_read_tokens,
+                cache_write_tokens=t.cache_write_tokens,
+                output_tokens=t.output_tokens,
+                tool_names=t.tool_names,
+                thinking_chars=t.thinking_chars,
+                reasoning_tokens=t.reasoning_tokens,
+                cache_write_1h_tokens=t.cache_write_1h_tokens,
+            )
+            for t in turns
+        ]
+
+    return {
+        "cid": session_id,
+        "parent_id": parent_id if (is_subagent and parent_id != session_id) else None,
+        "is_subagent": is_subagent,
+        "cwd": cwd,
+        "title_hint": first_user_preview or subagent_label,
+        "turns": turns,
+        "skipped_lines": skipped_lines,
+    }
+
+
+# ---------- Gemini CLI read-only parser ----------
+
+
+def _load_gemini_projects_map(home_root: pathlib.Path) -> dict[str, str]:
+    """Read optional <gemini_home>/projects.json -> {slug_or_hash: workspace_path}."""
+    proj_path = home_root / "projects.json"
+    text = _safe_read_text(proj_path, home_root)
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    mapping_obj = payload.get("projects") if isinstance(payload.get("projects"), dict) else payload
+    result: dict[str, str] = {}
+    for k, v in mapping_obj.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        ks, vs = k.strip(), v.strip()
+        if not ks or not vs:
+            continue
+        k_is_path = ("/" in ks) or ("\\" in ks) or (":" in ks)
+        v_is_path = ("/" in vs) or ("\\" in vs) or (":" in vs)
+        if k_is_path and not v_is_path:
+            result[vs] = ks
+            result[hashlib.sha256(ks.encode("utf-8")).hexdigest()] = ks
+        elif v_is_path and not k_is_path:
+            result[ks] = vs
+            result[hashlib.sha256(vs.encode("utf-8")).hexdigest()] = vs
+        else:
+            result[vs] = ks
+            result[ks] = vs
+    return result
+
+
+def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dict[str, Any]], int]:
+    """Replay Gemini CLI append-only session-*.jsonl including $set and $rewindTo mutations."""
+    session_id = session_path.stem
+    summary = ""
+    messages: list[dict[str, Any]] = []
+    skipped_lines = 0
+
+    with session_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                skipped_lines += 1
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            if "$rewindTo" in obj:
+                target = obj["$rewindTo"]
+                if isinstance(target, dict):
+                    target = target.get("messageId") or target.get("id")
+                if isinstance(target, str) and target.strip():
+                    tid = target.strip()
+                    for idx, m in enumerate(messages):
+                        if str(m.get("id") or "") == tid:
+                            messages = messages[:idx]
+                            break
+                elif isinstance(target, int) and not isinstance(target, bool) and target >= 0:
+                    messages = messages[:target]
+                continue
+
+            if "$set" in obj and isinstance(obj["$set"], dict):
+                patch = obj["$set"]
+                target_id = str(obj.get("id") or obj.get("messageId") or "").strip()
+                if target_id:
+                    for m in messages:
+                        if str(m.get("id") or "") == target_id:
+                            m.update(patch)
+                            break
+                else:
+                    if isinstance(patch.get("summary"), str):
+                        summary = _clean_single_line(patch["summary"])
+                    if isinstance(patch.get("sessionId"), str) and patch["sessionId"].strip():
+                        session_id = patch["sessionId"].strip()
+                    if isinstance(patch.get("messages"), list):
+                        messages = [dict(m) for m in patch["messages"] if isinstance(m, dict)]
+                    elif isinstance(patch.get("id"), str) and patch["id"].strip():
+                        pid = patch["id"].strip()
+                        for m in messages:
+                            if str(m.get("id") or "") == pid:
+                                m.update(patch)
+                                break
+                continue
+
+            rec_type = str(obj.get("type") or "")
+            if rec_type == "session_metadata" or (
+                "sessionId" in obj and not rec_type and "tokens" not in obj
+            ):
+                if isinstance(obj.get("sessionId"), str) and obj["sessionId"].strip():
+                    session_id = obj["sessionId"].strip()
+                if isinstance(obj.get("summary"), str) and obj["summary"].strip():
+                    summary = _clean_single_line(obj["summary"])
+                if isinstance(obj.get("messages"), list):
+                    messages = [dict(m) for m in obj["messages"] if isinstance(m, dict)]
+                continue
+
+            if rec_type == "message_update":
+                target_id = str(obj.get("id") or obj.get("messageId") or "").strip()
+                patch = (
+                    obj.get("patch")
+                    if isinstance(obj.get("patch"), dict)
+                    else {k: v for k, v in obj.items() if k not in ("type", "messageId")}
+                )
+                if target_id:
+                    for m in messages:
+                        if str(m.get("id") or "") == target_id:
+                            m.update(patch)
+                            break
+                continue
+
+            if rec_type or "id" in obj or "tokens" in obj:
+                mid = str(obj.get("id") or "").strip()
+                if mid:
+                    replaced = False
+                    for idx, existing in enumerate(messages):
+                        if str(existing.get("id") or "") == mid:
+                            messages[idx] = dict(obj)
+                            replaced = True
+                            break
+                    if not replaced:
+                        messages.append(dict(obj))
+                else:
+                    messages.append(dict(obj))
+
+    return session_id, summary, messages, skipped_lines
+
+
+def _parse_gemini_session_file(session_path: pathlib.Path) -> dict[str, Any]:
+    """Parse a Gemini CLI session-*.json or session-*.jsonl file strictly read-only in UTC."""
+    skipped_lines = 0
+    if session_path.suffix.lower() == ".jsonl":
+        session_id, summary, messages, skipped_lines = _replay_gemini_jsonl(session_path)
+    else:
+        try:
+            with session_path.open("r", encoding="utf-8", errors="replace") as fh:
+                payload = json.load(fh)
+        except json.JSONDecodeError:
+            return {
+                "cid": session_path.stem,
+                "title_hint": "",
+                "turns": [],
+                "skipped_lines": 1,
+            }
+        if not isinstance(payload, dict):
+            return {
+                "cid": session_path.stem,
+                "title_hint": "",
+                "turns": [],
+                "skipped_lines": 0,
+            }
+        session_id = str(payload.get("sessionId") or session_path.stem).strip() or session_path.stem
+        summary = _clean_single_line(str(payload.get("summary") or ""))
+        raw_msgs = payload.get("messages")
+        messages = [m for m in raw_msgs if isinstance(m, dict)] if isinstance(raw_msgs, list) else []
+
+    first_user_preview = ""
+    dedup_gemini: dict[Any, dict[str, Any]] = {}
+    for idx, msg in enumerate(messages):
+        mtype = str(msg.get("type") or "")
+        if mtype == "user" and not first_user_preview:
+            txt = _extract_text_from_content(msg.get("content"))
+            if txt:
+                first_user_preview = _clean_single_line(txt, max_len=80)
+            continue
+        if mtype != "gemini":
+            continue
+        tokens = msg.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        mid = str(msg.get("id") or "").strip()
+        key: Any = ("id", mid) if mid else ("idx", idx)
+        dedup_gemini[key] = msg
+
+    turns: list[TurnRecord] = []
+    step_idx = 0
+    for msg in dedup_gemini.values():
+        tokens = msg["tokens"]
+        raw_in = _to_non_neg_int(tokens.get("input"))
+        raw_cached = _to_non_neg_int(tokens.get("cached"))
+        raw_tool = _to_non_neg_int(tokens.get("tool"))
+        raw_out = _to_non_neg_int(tokens.get("output"))
+        raw_thoughts = _to_non_neg_int(tokens.get("thoughts"))
+
+        cache_read = min(raw_cached, raw_in)
+        uncached_in = max(0, raw_in - raw_cached) + raw_tool
+        output_tok = raw_out + raw_thoughts  # Gemini CLI output excludes thoughts!
+        if (uncached_in + cache_read + output_tok) == 0:
+            continue
+
+        tool_names: list[str] = []
+        raw_tc = msg.get("toolCalls")
+        if isinstance(raw_tc, list):
+            for tc in raw_tc:
+                if isinstance(tc, dict):
+                    tname = str(tc.get("name") or "").strip()
+                    if tname:
+                        tool_names.append(tname)
+
+        thinking_chars = 0
+        raw_thoughts_list = msg.get("thoughts")
+        if isinstance(raw_thoughts_list, list):
+            for th in raw_thoughts_list:
+                if isinstance(th, dict):
+                    subj = str(th.get("subject") or "")
+                    desc = str(th.get("description") or "")
+                    thinking_chars += max(1, len(subj) + len(desc))
+                elif isinstance(th, str):
+                    thinking_chars += max(1, len(th))
+
+        step_idx += 1
+        turns.append(
+            TurnRecord(
+                conversation_id=session_id,
+                step_index=step_idx,
+                timestamp=_parse_iso_timestamp(msg.get("timestamp"), dt.timezone.utc),
+                model=str(msg.get("model") or "").strip() or "unknown",
+                step_type="GEMINI",
+                status="DONE",
+                input_tokens=uncached_in,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=0,
+                output_tokens=output_tok,
+                tool_names=tuple(tool_names),
+                thinking_chars=thinking_chars,
+                reasoning_tokens=raw_thoughts,
+            )
+        )
+
+    return {
+        "cid": session_id,
+        "title_hint": summary or first_user_preview,
+        "turns": turns,
+        "skipped_lines": skipped_lines,
+    }
+
+
 def _read_companion_json(path: pathlib.Path | None) -> dict[str, Any] | None:
     if path is None or path.is_symlink() or not path.is_file():
         return None
@@ -998,7 +2112,6 @@ def load_statusline_state(
 
 def load_budget_config(path: pathlib.Path | None = DEFAULT_BUDGET_PATH) -> dict[str, float]:
     cfg = {
-        "block_5h_usd": 0.0,
         "daily_usd": 0.0,
         "weekly_usd": 0.0,
         "warn_pct": 70.0,
@@ -1014,89 +2127,6 @@ def load_budget_config(path: pathlib.Path | None = DEFAULT_BUDGET_PATH) -> dict[
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
             cfg[k] = float(v)
     return cfg
-
-
-def compute_billing_blocks(
-    sessions: Sequence[SessionInfo],
-    now_utc: dt.datetime | None = None,
-) -> list[dict[str, Any]]:
-    now = now_utc or dt.datetime.now(dt.timezone.utc)
-    flat: list[tuple[dt.datetime, str, TurnRecord]] = []
-    for s in sessions:
-        for t in s.turns:
-            if t.timestamp is not None:
-                flat.append((t.timestamp.astimezone(dt.timezone.utc), s.conversation_id, t))
-    if not flat:
-        return []
-    flat.sort(key=lambda item: item[0])
-
-    window = dt.timedelta(seconds=BLOCK_WINDOW_SECS)
-    blocks: list[dict[str, Any]] = []
-    cur_start: dt.datetime | None = None
-    cur_end: dt.datetime | None = None
-    cur_last: dt.datetime | None = None
-    cur_counts = TokenCounts()
-    cur_cids: set[str] = set()
-    cur_models: set[str] = set()
-
-    def _flush() -> None:
-        if cur_start is None or cur_end is None or cur_last is None:
-            return
-        is_active = cur_start <= now < cur_end
-        elapsed = (
-            max(0, min(BLOCK_WINDOW_SECS, int((now - cur_start).total_seconds())))
-            if is_active
-            else max(60, min(BLOCK_WINDOW_SECS, int((cur_last - cur_start).total_seconds())))
-        )
-        rem = max(0, int((cur_end - now).total_seconds())) if is_active else 0
-        denom = float(max(elapsed, 60))
-        tok_per_min = cur_counts.total_tokens / (denom / 60.0)
-        usd_per_hr = cur_counts.total_cost_usd / (denom / 3600.0)
-        if is_active and (elapsed >= 300 or cur_counts.calls >= 2):
-            proj_tok = cur_counts.total_tokens + int(round(tok_per_min * (rem / 60.0)))
-            proj_usd = cur_counts.total_cost_usd + usd_per_hr * (rem / 3600.0)
-        else:
-            proj_tok = cur_counts.total_tokens
-            proj_usd = cur_counts.total_cost_usd
-        blocks.append({
-            "start_utc": cur_start,
-            "end_utc": cur_end,
-            "last_turn_utc": cur_last,
-            "is_active": is_active,
-            "elapsed_secs": elapsed,
-            "remaining_secs": rem,
-            "time_progress_pct": round((elapsed / BLOCK_WINDOW_SECS) * 100.0, 1),
-            "tokens_per_min": round(tok_per_min, 1),
-            "usd_per_hour": round(usd_per_hr, 4),
-            "projected_tokens": proj_tok,
-            "projected_usd": round(proj_usd, 4),
-            "sessions": len(cur_cids),
-            "models": sorted(cur_models),
-            "counts": cur_counts,
-        })
-
-    for ts, cid, turn in flat:
-        if cur_end is None or ts >= cur_end:
-            _flush()
-            cur_start = ts
-            cur_end = ts + window
-            cur_last = ts
-            cur_counts = TokenCounts()
-            cur_cids = set()
-            cur_models = set()
-        cur_last = ts
-        cur_counts.add_call(
-            turn.input_tokens,
-            turn.cache_read_tokens,
-            turn.cache_write_tokens,
-            turn.output_tokens,
-            turn.cost,
-        )
-        cur_cids.add(cid)
-        if turn.model not in ("compaction", "unknown"):
-            cur_models.add(turn.model)
-    _flush()
-    return blocks
 
 
 def _fmt_countdown(secs: int) -> str:
@@ -1123,8 +2153,8 @@ class IncrementalScanner:
     """In-memory mtime/size cached read-only scanner for low-CPU live polling.
 
     Never writes to disk; caches parsed immutable per-file results in RAM only.
-    Supports multi-directory Antigravity scanning (CLI / 2.0 App / IDE) and read-only
-    backfill from an optional local `archive.json`.
+    Supports multi-agent read-only scanning (Antigravity CLI/App/IDE, Claude Code,
+    OpenAI Codex CLI, Gemini CLI) and optional read-only backfill from `archive.json`.
     """
 
     def __init__(
@@ -1133,21 +2163,38 @@ class IncrementalScanner:
         pricing_path: pathlib.Path | None = DEFAULT_PRICING_PATH,
         extra_dirs: Sequence[pathlib.Path] | None = None,
         archive_path: pathlib.Path | None = None,
+        sources: Sequence[SourceSpec] | None = None,
+        agent_filter: set[str] | None = None,
     ) -> None:
-        self.data_dir = data_dir.expanduser()
-        dirs: list[pathlib.Path] = [self.data_dir]
-        if extra_dirs:
-            for d in extra_dirs:
-                ep = d.expanduser()
-                if ep not in dirs:
-                    dirs.append(ep)
-        self.data_dirs = dirs
+        self.agent_filter = set(agent_filter) if agent_filter is not None else None
+        if sources is not None:
+            specs = [
+                SourceSpec(s.kind, s.root.expanduser(), s.source_name)
+                for s in sources
+            ]
+            self.sources = specs
+            self.data_dirs = [s.root for s in specs]
+            self.data_dir = specs[0].root if specs else data_dir.expanduser()
+        else:
+            self.data_dir = data_dir.expanduser()
+            dirs: list[pathlib.Path] = [self.data_dir]
+            if extra_dirs:
+                for d in extra_dirs:
+                    ep = d.expanduser()
+                    if ep not in dirs:
+                        dirs.append(ep)
+            self.data_dirs = dirs
+            self.sources = [
+                SourceSpec("antigravity", d, _infer_source_name(d)) for d in dirs
+            ]
         self.pricing = PricingCatalog(pricing_path)
         self.archive_path = archive_path
         self._transcript_cache: dict[str, tuple[int, int, list[TurnRecord], str, str | None, str, int]] = {}
+        self._agent_file_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
         self._ann_cache: dict[str, tuple[int, int, str]] = {}
         self._meta_sigs: dict[str, tuple[int, int]] = {}
         self._meta_caches: dict[str, dict[str, dict[str, Any]]] = {}
+        self._aux_json_cache: dict[str, tuple[int, int, Any]] = {}
 
     def _get_metadata_cache(self, root_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
         rk = str(root_dir)
@@ -1184,9 +2231,91 @@ class IncrementalScanner:
         self._ann_cache[key] = (mtime_ns, size, title)
         return title
 
+    def _get_cached_aux(
+        self, path: pathlib.Path, loader: Any, default_val: Any
+    ) -> Any:
+        key = str(path)
+        if path.is_symlink() or not path.is_file():
+            self._aux_json_cache.pop(key, None)
+            return default_val
+        try:
+            st = path.stat()
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return default_val
+        cached = self._aux_json_cache.get(key)
+        if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+            return cached[2]
+        val = loader()
+        self._aux_json_cache[key] = (sig[0], sig[1], val)
+        return val
+
+    def _filter_and_price_turns(
+        self,
+        raw_turns: Sequence[TurnRecord],
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+    ) -> list[TurnRecord]:
+        real_totals: dict[str, int] = defaultdict(int)
+        for t in raw_turns:
+            if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
+                real_totals[t.model] += t.total_tokens
+        fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
+        last_real_model = ""
+
+        filtered_turns: list[TurnRecord] = []
+        for turn in raw_turns:
+            is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
+            if not is_cp and turn.model not in ("compaction", "unknown"):
+                last_real_model = turn.model
+                eff_model = turn.model
+            elif turn.model not in ("compaction", "unknown"):
+                eff_model = turn.model
+            else:
+                eff_model = last_real_model or fallback_model or turn.model
+
+            local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
+            if since is not None and (local_ts is None or local_ts.date() < since):
+                continue
+            if until is not None and (local_ts is None or local_ts.date() > until):
+                continue
+            if model_needle and model_needle not in turn.model.lower():
+                continue
+            turn_cost = self.pricing.price_turn(
+                eff_model,
+                turn.input_tokens,
+                turn.cache_read_tokens,
+                turn.cache_write_tokens,
+                turn.output_tokens,
+                local_ts.date() if local_ts is not None else None,
+                cache_write_1h_tokens=turn.cache_write_1h_tokens,
+            )
+            filtered_turns.append(
+                TurnRecord(
+                    conversation_id=turn.conversation_id,
+                    step_index=turn.step_index,
+                    timestamp=local_ts,
+                    model=turn.model,
+                    step_type=turn.step_type,
+                    status=turn.status,
+                    input_tokens=turn.input_tokens,
+                    cache_read_tokens=turn.cache_read_tokens,
+                    cache_write_tokens=turn.cache_write_tokens,
+                    output_tokens=turn.output_tokens,
+                    tool_names=turn.tool_names,
+                    thinking_chars=turn.thinking_chars,
+                    reasoning_tokens=turn.reasoning_tokens,
+                    cache_write_1h_tokens=turn.cache_write_1h_tokens,
+                    cost=turn_cost,
+                )
+            )
+        return filtered_turns
+
     def _load_archived_backfill(
         self,
-        live_ids: set[str],
+        live_keys: set[tuple[str, str]],
         tz: dt.tzinfo,
         since: dt.date | None,
         until: dt.date | None,
@@ -1197,8 +2326,23 @@ class IncrementalScanner:
         if not raw or not isinstance(raw.get("sessions"), dict):
             return []
         out: list[SessionInfo] = []
-        for cid, s_obj in raw["sessions"].items():
-            if cid in live_ids or not isinstance(s_obj, dict):
+        for raw_key, s_obj in raw["sessions"].items():
+            if not isinstance(s_obj, dict):
+                continue
+            raw_src = str(s_obj.get("source") or "cli")
+            src = _normalize_source_name(raw_src)
+            fam = source_to_agent_family(src)
+            explicit_cid = str(s_obj.get("conversation_id") or "").strip()
+            if explicit_cid:
+                cid = explicit_cid
+            elif ":" in raw_key:
+                pfx, rest = raw_key.split(":", 1)
+                cid = rest.strip() if (pfx.strip().lower() in _AGENT_ALIASES and rest.strip()) else raw_key
+            else:
+                cid = raw_key
+            if self.agent_filter is not None and fam not in self.agent_filter:
+                continue
+            if (fam, cid) in live_keys:
                 continue
             if session_needle and not cid.lower().startswith(session_needle):
                 continue
@@ -1214,6 +2358,8 @@ class IncrementalScanner:
                 model = str(t_obj.get("m") or ("compaction" if is_cp else "unknown"))
                 tools_raw = t_obj.get("tools")
                 tools = tuple(str(x) for x in tools_raw if isinstance(x, str)) if isinstance(tools_raw, list) else ()
+                cw = _to_non_neg_int(t_obj.get("cw"))
+                cw1h = min(_to_non_neg_int(t_obj.get("cw1h")), cw)
                 parsed_turns.append(
                     TurnRecord(
                         conversation_id=cid,
@@ -1224,67 +2370,24 @@ class IncrementalScanner:
                         status="DONE",
                         input_tokens=_to_non_neg_int(t_obj.get("in")),
                         cache_read_tokens=_to_non_neg_int(t_obj.get("cr")),
-                        cache_write_tokens=_to_non_neg_int(t_obj.get("cw")),
+                        cache_write_tokens=cw,
                         output_tokens=_to_non_neg_int(t_obj.get("out")),
                         tool_names=tools,
                         thinking_chars=_to_non_neg_int(t_obj.get("th")),
+                        reasoning_tokens=_to_non_neg_int(t_obj.get("rt")),
+                        cache_write_1h_tokens=cw1h,
                     )
                 )
-            real_totals: dict[str, int] = defaultdict(int)
-            for t in parsed_turns:
-                if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
-                    real_totals[t.model] += t.total_tokens
-            fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
-            last_real = ""
-            filtered_turns: list[TurnRecord] = []
-            for turn in parsed_turns:
-                is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
-                if not is_cp and turn.model not in ("compaction", "unknown"):
-                    last_real = turn.model
-                    eff_model = turn.model
-                elif turn.model not in ("compaction", "unknown"):
-                    eff_model = turn.model
-                else:
-                    eff_model = last_real or fallback_model or turn.model
-                local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
-                if since is not None and (local_ts is None or local_ts.date() < since):
-                    continue
-                if until is not None and (local_ts is None or local_ts.date() > until):
-                    continue
-                if model_needle and model_needle not in turn.model.lower():
-                    continue
-                turn_cost = self.pricing.price_turn(
-                    eff_model,
-                    turn.input_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_write_tokens,
-                    turn.output_tokens,
-                    local_ts.date() if local_ts is not None else None,
-                )
-                filtered_turns.append(
-                    TurnRecord(
-                        conversation_id=cid,
-                        step_index=turn.step_index,
-                        timestamp=local_ts,
-                        model=turn.model,
-                        step_type=turn.step_type,
-                        status=turn.status,
-                        input_tokens=turn.input_tokens,
-                        cache_read_tokens=turn.cache_read_tokens,
-                        cache_write_tokens=turn.cache_write_tokens,
-                        output_tokens=turn.output_tokens,
-                        tool_names=turn.tool_names,
-                        thinking_chars=turn.thinking_chars,
-                        cost=turn_cost,
-                    )
-                )
+            filtered_turns = self._filter_and_price_turns(
+                parsed_turns, tz, since, until, model_needle
+            )
             if not filtered_turns:
                 continue
             sess = SessionInfo(
                 conversation_id=cid,
                 title=str(s_obj.get("title") or "(archived)"),
                 workspace=str(s_obj.get("workspace") or "(unknown)"),
-                source=str(s_obj.get("source") or "cli"),
+                source=src,
                 is_archived=True,
                 is_subagent=bool(s_obj.get("is_subagent")),
                 parent_id=str(s_obj["parent_id"]) if s_obj.get("parent_id") else None,
@@ -1294,6 +2397,603 @@ class IncrementalScanner:
                 sess.add_turn(t)
             out.append(sess)
         return out
+
+    def _scan_antigravity_source(
+        self,
+        spec: SourceSpec,
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+        session_needle: str | None,
+        sessions_by_key: dict[tuple[str, str], SessionInfo],
+        seen_agy_keys: set[str],
+        warnings: list[str],
+    ) -> tuple[bool, int, int, int, int]:
+        root_dir = spec.root
+        if root_dir.is_symlink() or not root_dir.exists() or not root_dir.is_dir():
+            return False, 0, 0, 0, 0
+        brain_dir = root_dir / "brain"
+        if brain_dir.is_symlink() or not brain_dir.exists() or not brain_dir.is_dir():
+            return False, 0, 0, 0, 0
+
+        source_name = spec.source_name
+        meta_cache = self._get_metadata_cache(root_dir)
+        skipped_empty = 0
+        skipped_lines = 0
+        files_cached = 0
+        files_reparsed = 0
+
+        try:
+            conv_dirs = sorted(brain_dir.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            warnings.append(f"Failed to list {brain_dir}: {exc}")
+            return True, 0, 0, 0, 0
+
+        for conv_dir in conv_dirs:
+            if conv_dir.is_symlink() or not conv_dir.is_dir():
+                continue
+            cid = conv_dir.name
+            if session_needle and not cid.lower().startswith(session_needle):
+                continue
+
+            logs_dir = conv_dir / ".system_generated" / "logs"
+            transcript_path = logs_dir / "transcript.jsonl"
+            if not transcript_path.is_file() or transcript_path.is_symlink():
+                fallback = logs_dir / "transcript_full.jsonl"
+                if fallback.is_file() and not fallback.is_symlink():
+                    transcript_path = fallback
+                else:
+                    skipped_empty += 1
+                    continue
+
+            if not _is_within_dir(transcript_path, root_dir):
+                continue
+
+            cache_key = str(transcript_path)
+            seen_agy_keys.add(cache_key)
+            try:
+                st = transcript_path.stat()
+                mtime_ns, size = st.st_mtime_ns, st.st_size
+            except OSError as exc:
+                warnings.append(f"Could not stat {transcript_path}: {exc}")
+                continue
+
+            cached = self._transcript_cache.get(cache_key)
+            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                    cached[2],
+                    cached[3],
+                    cached[4],
+                    cached[5],
+                    cached[6],
+                )
+                files_cached += 1
+            else:
+                try:
+                    raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                        _parse_transcript_file(transcript_path, cid)
+                    )
+                except OSError as exc:
+                    warnings.append(f"Could not read {transcript_path}: {exc}")
+                    continue
+                self._transcript_cache[cache_key] = (
+                    mtime_ns,
+                    size,
+                    raw_turns,
+                    first_user_preview,
+                    subagent_parent_id,
+                    subagent_preview,
+                    file_skipped,
+                )
+                files_reparsed += 1
+
+            skipped_lines += file_skipped
+            filtered_turns = self._filter_and_price_turns(raw_turns, tz, since, until, model_needle)
+            if not filtered_turns:
+                skipped_empty += 1
+                continue
+
+            ann_title = self._get_annotation_title(root_dir, cid)
+            meta = meta_cache.get(cid)
+            if meta is not None:
+                is_subagent = bool(meta.get("is_internal"))
+            else:
+                is_subagent = subagent_parent_id is not None
+            parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
+            meta_dict = meta or {}
+            title = (
+                ann_title
+                or str(meta_dict.get("title") or "")
+                or str(meta_dict.get("preview") or "")
+                or first_user_preview
+                or (subagent_preview if is_subagent else "")
+                or ("(subagent)" if is_subagent else "(untitled)")
+            )
+            workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
+
+            session = SessionInfo(
+                conversation_id=cid,
+                title=title,
+                workspace=workspace,
+                transcript_path=cache_key,
+                source=source_name,
+                is_subagent=is_subagent,
+                parent_id=parent_id,
+            )
+            for t in filtered_turns:
+                session.add_turn(t)
+
+            skey = ("antigravity", cid)
+            prev = sessions_by_key.get(skey)
+            if prev is None or len(session.turns) > len(prev.turns):
+                sessions_by_key[skey] = session
+
+        return True, skipped_empty, skipped_lines, files_cached, files_reparsed
+
+    def _scan_claude_source(
+        self,
+        spec: SourceSpec,
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+        session_needle: str | None,
+        sessions_by_key: dict[tuple[str, str], SessionInfo],
+        seen_agent_keys: set[str],
+        claude_parent_meta: dict[str, tuple[str, str]],
+        warnings: list[str],
+    ) -> tuple[bool, int, int, int, int]:
+        root_dir = spec.root
+        if root_dir.is_symlink() or not root_dir.is_dir():
+            return False, 0, 0, 0, 0
+        projects_dir = root_dir / "projects"
+        if projects_dir.is_symlink() or not projects_dir.is_dir():
+            return False, 0, 0, 0, 0
+
+        skipped_empty = 0
+        skipped_lines = 0
+        files_cached = 0
+        files_reparsed = 0
+
+        try:
+            proj_dirs = sorted(projects_dir.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            warnings.append(f"Failed to list {projects_dir}: {exc}")
+            return True, 0, 0, 0, 0
+
+        for proj_dir in proj_dirs:
+            if proj_dir.is_symlink() or not proj_dir.is_dir():
+                continue
+            if not _is_within_dir(proj_dir, root_dir):
+                continue
+
+            idx_path = proj_dir / "sessions-index.json"
+            sess_index: dict[str, dict[str, str]] = self._get_cached_aux(
+                idx_path,
+                lambda p=idx_path, r=root_dir: _load_claude_sessions_index(p, r),
+                {},
+            )
+            for sid, info in sess_index.items():
+                if info.get("title") or info.get("workspace"):
+                    claude_parent_meta.setdefault(sid, (info.get("title", ""), info.get("workspace", "")))
+
+            # Collect main session JSONL files and subagent JSONL files strictly under projects/<proj>/
+            file_jobs: list[tuple[pathlib.Path, bool, str | None, str]] = []
+            try:
+                children = sorted(proj_dir.iterdir(), key=lambda p: p.name)
+            except OSError as exc:
+                warnings.append(f"Failed to list {proj_dir}: {exc}")
+                continue
+
+            for child in children:
+                if child.is_symlink():
+                    continue
+                if child.is_file() and child.suffix.lower() == ".jsonl":
+                    if _is_allowed_claude_session_stem(child.stem):
+                        file_jobs.append((child, False, None, ""))
+                elif child.is_dir() and _is_allowed_claude_session_stem(child.name):
+                    sub_dir = child / "subagents"
+                    if sub_dir.is_symlink() or not sub_dir.is_dir():
+                        continue
+                    try:
+                        sub_files = sorted(sub_dir.iterdir(), key=lambda p: p.name)
+                    except OSError:
+                        continue
+                    for sf in sub_files:
+                        if (
+                            not sf.is_symlink()
+                            and sf.is_file()
+                            and sf.name.startswith("agent-")
+                            and sf.suffix.lower() == ".jsonl"
+                        ):
+                            aid_hint = sf.stem[len("agent-") :]
+                            if _is_allowed_claude_agent_id(aid_hint):
+                                file_jobs.append((sf, True, child.name, aid_hint))
+
+            for fpath, is_sub, parent_hint, aid_hint in file_jobs:
+                if not _is_within_dir(fpath, root_dir):
+                    continue
+                cache_key = f"claude:{fpath}"
+                seen_agent_keys.add(cache_key)
+                try:
+                    st = fpath.stat()
+                    mtime_ns, size = st.st_mtime_ns, st.st_size
+                except OSError as exc:
+                    warnings.append(f"Could not stat {fpath}: {exc}")
+                    continue
+
+                cached = self._agent_file_cache.get(cache_key)
+                if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                    parsed = cached[2]
+                    files_cached += 1
+                else:
+                    try:
+                        parsed = _parse_claude_jsonl(
+                            fpath,
+                            fallback_cid=fpath.stem,
+                            is_subagent=is_sub,
+                            parent_uuid_hint=parent_hint,
+                            agent_id_hint=aid_hint,
+                        )
+                    except OSError as exc:
+                        warnings.append(f"Could not read {fpath}: {exc}")
+                        continue
+                    self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
+                    files_reparsed += 1
+
+                skipped_lines += int(parsed.get("skipped_lines", 0))
+                cid = str(parsed["cid"])
+                if not is_sub and (parsed.get("title_hint") or parsed.get("cwd")):
+                    prev_pm = claude_parent_meta.get(cid, ("", ""))
+                    claude_parent_meta[cid] = (
+                        prev_pm[0] or str(parsed.get("title_hint") or ""),
+                        prev_pm[1] or str(parsed.get("cwd") or ""),
+                    )
+
+                if session_needle and not cid.lower().startswith(session_needle):
+                    continue
+
+                raw_turns: list[TurnRecord] = parsed["turns"]
+                filtered_turns = self._filter_and_price_turns(raw_turns, tz, since, until, model_needle)
+                if not filtered_turns:
+                    skipped_empty += 1
+                    continue
+
+                parent_id: str | None = parsed.get("parent_id")
+                idx_info = sess_index.get(parent_id or cid, {}) if is_sub else sess_index.get(cid, {})
+                title = ""
+                if is_sub:
+                    meta_path = fpath.with_name(f"{fpath.stem}.meta.json")
+                    agent_type, desc = self._get_cached_aux(
+                        meta_path,
+                        lambda p=meta_path, r=root_dir: _parse_claude_agent_meta(p, r),
+                        ("", ""),
+                    )
+                    if agent_type and desc:
+                        title = _clean_single_line(f"[{agent_type}] {desc}")
+                    elif desc:
+                        title = desc
+                    elif parsed.get("title_hint"):
+                        title = str(parsed["title_hint"])
+                    elif agent_type:
+                        title = f"{agent_type} subagent"
+                    else:
+                        title = "(subagent)"
+                else:
+                    title = (
+                        str(parsed.get("title_hint") or "")
+                        or str(idx_info.get("title") or "")
+                        or "(untitled)"
+                    )
+
+                workspace = (
+                    str(parsed.get("cwd") or "")
+                    or str(idx_info.get("workspace") or "")
+                    or "(unknown)"
+                )
+
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=title,
+                    workspace=workspace,
+                    transcript_path=str(fpath),
+                    source="claude",
+                    is_subagent=is_sub,
+                    parent_id=parent_id,
+                )
+                for t in filtered_turns:
+                    session.add_turn(t)
+
+                skey = ("claude", cid)
+                prev = sessions_by_key.get(skey)
+                if prev is None or len(session.turns) > len(prev.turns):
+                    sessions_by_key[skey] = session
+
+        return True, skipped_empty, skipped_lines, files_cached, files_reparsed
+
+    def _scan_codex_source(
+        self,
+        spec: SourceSpec,
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+        session_needle: str | None,
+        sessions_by_key: dict[tuple[str, str], SessionInfo],
+        seen_agent_keys: set[str],
+        codex_parent_meta: dict[str, tuple[str, str]],
+        warnings: list[str],
+    ) -> tuple[bool, int, int, int, int]:
+        root_dir = spec.root
+        if root_dir.is_symlink() or not root_dir.is_dir():
+            return False, 0, 0, 0, 0
+        sessions_dir = root_dir / "sessions"
+        archived_dir = root_dir / "archived_sessions"
+        has_sessions = sessions_dir.is_dir() and not sessions_dir.is_symlink()
+        has_archived = archived_dir.is_dir() and not archived_dir.is_symlink()
+        if not has_sessions and not has_archived:
+            return False, 0, 0, 0, 0
+
+        idx_path = root_dir / "session_index.jsonl"
+        index_titles: dict[str, str] = self._get_cached_aux(
+            idx_path,
+            lambda r=root_dir: _load_codex_session_index(r),
+            {},
+        )
+        for sid, t_val in index_titles.items():
+            codex_parent_meta.setdefault(sid, (t_val, ""))
+
+        rollout_files: list[pathlib.Path] = []
+        if has_sessions:
+            try:
+                year_dirs = sorted(sessions_dir.iterdir(), key=lambda p: p.name)
+            except OSError as exc:
+                warnings.append(f"Failed to list {sessions_dir}: {exc}")
+                year_dirs = []
+            for y_dir in year_dirs:
+                if y_dir.is_symlink() or not y_dir.is_dir():
+                    continue
+                try:
+                    month_dirs = sorted(y_dir.iterdir(), key=lambda p: p.name)
+                except OSError:
+                    continue
+                for m_dir in month_dirs:
+                    if m_dir.is_symlink() or not m_dir.is_dir():
+                        continue
+                    try:
+                        day_dirs = sorted(m_dir.iterdir(), key=lambda p: p.name)
+                    except OSError:
+                        continue
+                    for d_dir in day_dirs:
+                        if d_dir.is_symlink() or not d_dir.is_dir():
+                            continue
+                        try:
+                            files = sorted(d_dir.iterdir(), key=lambda p: p.name)
+                        except OSError:
+                            continue
+                        for f in files:
+                            if (
+                                not f.is_symlink()
+                                and f.is_file()
+                                and f.name.startswith("rollout-")
+                                and f.suffix.lower() == ".jsonl"
+                            ):
+                                rollout_files.append(f)
+
+        if has_archived:
+            try:
+                a_files = sorted(archived_dir.iterdir(), key=lambda p: p.name)
+            except OSError as exc:
+                warnings.append(f"Failed to list {archived_dir}: {exc}")
+                a_files = []
+            for f in a_files:
+                if (
+                    not f.is_symlink()
+                    and f.is_file()
+                    and f.name.startswith("rollout-")
+                    and f.suffix.lower() == ".jsonl"
+                ):
+                    rollout_files.append(f)
+
+        skipped_empty = 0
+        skipped_lines = 0
+        files_cached = 0
+        files_reparsed = 0
+
+        for fpath in rollout_files:
+            if not _is_within_dir(fpath, root_dir):
+                continue
+            cache_key = f"codex:{fpath}"
+            seen_agent_keys.add(cache_key)
+            try:
+                st = fpath.stat()
+                mtime_ns, size = st.st_mtime_ns, st.st_size
+            except OSError as exc:
+                warnings.append(f"Could not stat {fpath}: {exc}")
+                continue
+
+            cached = self._agent_file_cache.get(cache_key)
+            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                parsed = cached[2]
+                files_cached += 1
+            else:
+                try:
+                    parsed = _parse_codex_jsonl(fpath)
+                except OSError as exc:
+                    warnings.append(f"Could not read {fpath}: {exc}")
+                    continue
+                self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
+                files_reparsed += 1
+
+            skipped_lines += int(parsed.get("skipped_lines", 0))
+            cid = str(parsed["cid"])
+            is_sub = bool(parsed.get("is_subagent"))
+            idx_title = index_titles.get(cid, "")
+            title = (
+                idx_title
+                or str(parsed.get("title_hint") or "")
+                or ("(subagent)" if is_sub else "(untitled)")
+            )
+            workspace = str(parsed.get("cwd") or "") or "(unknown)"
+            if not is_sub and (title not in ("(untitled)", "") or workspace != "(unknown)"):
+                codex_parent_meta[cid] = (title, workspace)
+
+            if session_needle and not cid.lower().startswith(session_needle):
+                continue
+
+            filtered_turns = self._filter_and_price_turns(
+                parsed["turns"], tz, since, until, model_needle
+            )
+            if not filtered_turns:
+                skipped_empty += 1
+                continue
+
+            session = SessionInfo(
+                conversation_id=cid,
+                title=title,
+                workspace=workspace,
+                transcript_path=str(fpath),
+                source="codex",
+                is_subagent=is_sub,
+                parent_id=parsed.get("parent_id"),
+            )
+            for t in filtered_turns:
+                session.add_turn(t)
+
+            skey = ("codex", cid)
+            prev = sessions_by_key.get(skey)
+            if prev is None or len(session.turns) > len(prev.turns):
+                sessions_by_key[skey] = session
+
+        return True, skipped_empty, skipped_lines, files_cached, files_reparsed
+
+    def _scan_gemini_source(
+        self,
+        spec: SourceSpec,
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+        session_needle: str | None,
+        sessions_by_key: dict[tuple[str, str], SessionInfo],
+        seen_agent_keys: set[str],
+        warnings: list[str],
+    ) -> tuple[bool, int, int, int, int]:
+        root = spec.root
+        if root.is_symlink() or not root.is_dir():
+            return False, 0, 0, 0, 0
+        if (root / "tmp").is_dir() and not (root / "tmp").is_symlink():
+            tmp_dir = root / "tmp"
+            home_root = root
+        else:
+            tmp_dir = root
+            home_root = root.parent
+
+        proj_json_path = home_root / "projects.json"
+        projects_map: dict[str, str] = self._get_cached_aux(
+            proj_json_path,
+            lambda hr=home_root: _load_gemini_projects_map(hr),
+            {},
+        )
+
+        try:
+            proj_dirs = sorted(tmp_dir.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            warnings.append(f"Failed to list {tmp_dir}: {exc}")
+            return True, 0, 0, 0, 0
+
+        skipped_empty = 0
+        skipped_lines = 0
+        files_cached = 0
+        files_reparsed = 0
+
+        for proj_dir in proj_dirs:
+            if proj_dir.is_symlink() or not proj_dir.is_dir():
+                continue
+            if not _is_within_dir(proj_dir, tmp_dir):
+                continue
+            chats_dir = proj_dir / "chats"
+            if chats_dir.is_symlink() or not chats_dir.is_dir():
+                continue
+
+            pr_path = proj_dir / ".project_root"
+            proj_root_txt: str = self._get_cached_aux(
+                pr_path,
+                lambda p=pr_path, r=tmp_dir: (_safe_read_text(p, r) or "").strip(),
+                "",
+            )
+            workspace = proj_root_txt or projects_map.get(proj_dir.name, "") or "(unknown)"
+
+            try:
+                chat_files = sorted(chats_dir.iterdir(), key=lambda p: p.name)
+            except OSError as exc:
+                warnings.append(f"Failed to list {chats_dir}: {exc}")
+                continue
+
+            for fpath in chat_files:
+                if (
+                    fpath.is_symlink()
+                    or not fpath.is_file()
+                    or not fpath.name.startswith("session-")
+                    or fpath.suffix.lower() not in (".json", ".jsonl")
+                ):
+                    continue
+                if not _is_within_dir(fpath, tmp_dir):
+                    continue
+
+                cache_key = f"gemini:{fpath}"
+                seen_agent_keys.add(cache_key)
+                try:
+                    st = fpath.stat()
+                    mtime_ns, size = st.st_mtime_ns, st.st_size
+                except OSError as exc:
+                    warnings.append(f"Could not stat {fpath}: {exc}")
+                    continue
+
+                cached = self._agent_file_cache.get(cache_key)
+                if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                    parsed = cached[2]
+                    files_cached += 1
+                else:
+                    try:
+                        parsed = _parse_gemini_session_file(fpath)
+                    except OSError as exc:
+                        warnings.append(f"Could not read {fpath}: {exc}")
+                        continue
+                    self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
+                    files_reparsed += 1
+
+                skipped_lines += int(parsed.get("skipped_lines", 0))
+                cid = str(parsed["cid"])
+                if session_needle and not cid.lower().startswith(session_needle):
+                    continue
+
+                filtered_turns = self._filter_and_price_turns(
+                    parsed["turns"], tz, since, until, model_needle
+                )
+                if not filtered_turns:
+                    skipped_empty += 1
+                    continue
+
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=str(parsed.get("title_hint") or "") or "(untitled)",
+                    workspace=workspace,
+                    transcript_path=str(fpath),
+                    source="gemini",
+                    is_subagent=False,
+                    parent_id=None,
+                )
+                for t in filtered_turns:
+                    session.add_turn(t)
+
+                skey = ("gemini", cid)
+                prev = sessions_by_key.get(skey)
+                if prev is None or len(session.turns) > len(prev.turns):
+                    sessions_by_key[skey] = session
+
+        return True, skipped_empty, skipped_lines, files_cached, files_reparsed
 
     def scan(
         self,
@@ -1307,203 +3007,79 @@ class IncrementalScanner:
         t0 = time.perf_counter()
         self.pricing.refresh()
         warnings: list[str] = []
-        sessions_by_id: dict[str, SessionInfo] = {}
+        sessions_by_key: dict[tuple[str, str], SessionInfo] = {}
         skipped_empty = 0
         skipped_lines = 0
         files_cached = 0
         files_reparsed = 0
-        found_any_brain = False
+        found_any_source = False
 
         model_needle = model_filter.lower().strip() if model_filter else None
         session_needle = session_filter.lower().strip() if session_filter else None
         workspace_needle = workspace_filter.lower().strip() if workspace_filter else None
-        seen_keys: set[str] = set()
+        seen_agy_keys: set[str] = set()
+        seen_agent_keys: set[str] = set()
+        claude_parent_meta: dict[str, tuple[str, str]] = {}
+        codex_parent_meta: dict[str, tuple[str, str]] = {}
 
-        for root_dir in self.data_dirs:
-            if not root_dir.exists() or not root_dir.is_dir():
+        for spec in self.sources:
+            if self.agent_filter is not None and spec.kind not in self.agent_filter:
                 continue
-            brain_dir = root_dir / "brain"
-            if not brain_dir.exists() or not brain_dir.is_dir():
-                continue
-            found_any_brain = True
-            source_name = _infer_source_name(root_dir)
-            meta_cache = self._get_metadata_cache(root_dir)
-
-            try:
-                conv_dirs = sorted(brain_dir.iterdir(), key=lambda p: p.name)
-            except OSError as exc:
-                warnings.append(f"Failed to list {brain_dir}: {exc}")
-                continue
-
-            for conv_dir in conv_dirs:
-                if conv_dir.is_symlink() or not conv_dir.is_dir():
-                    continue
-                cid = conv_dir.name
-                if session_needle and not cid.lower().startswith(session_needle):
-                    continue
-
-                logs_dir = conv_dir / ".system_generated" / "logs"
-                transcript_path = logs_dir / "transcript.jsonl"
-                if not transcript_path.is_file() or transcript_path.is_symlink():
-                    fallback = logs_dir / "transcript_full.jsonl"
-                    if fallback.is_file() and not fallback.is_symlink():
-                        transcript_path = fallback
-                    else:
-                        skipped_empty += 1
-                        continue
-
-                if not _is_within_dir(transcript_path, root_dir):
-                    continue
-
-                cache_key = str(transcript_path)
-                seen_keys.add(cache_key)
-                try:
-                    st = transcript_path.stat()
-                    mtime_ns, size = st.st_mtime_ns, st.st_size
-                except OSError as exc:
-                    warnings.append(f"Could not stat {transcript_path}: {exc}")
-                    continue
-
-                cached = self._transcript_cache.get(cache_key)
-                if cached is not None and cached[0] == mtime_ns and cached[1] == size:
-                    raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
-                        cached[2],
-                        cached[3],
-                        cached[4],
-                        cached[5],
-                        cached[6],
-                    )
-                    files_cached += 1
-                else:
-                    try:
-                        raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
-                            _parse_transcript_file(transcript_path, cid)
-                        )
-                    except OSError as exc:
-                        warnings.append(f"Could not read {transcript_path}: {exc}")
-                        continue
-                    self._transcript_cache[cache_key] = (
-                        mtime_ns,
-                        size,
-                        raw_turns,
-                        first_user_preview,
-                        subagent_parent_id,
-                        subagent_preview,
-                        file_skipped,
-                    )
-                    files_reparsed += 1
-
-                skipped_lines += file_skipped
-
-                real_totals: dict[str, int] = defaultdict(int)
-                for t in raw_turns:
-                    if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
-                        real_totals[t.model] += t.total_tokens
-                fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
-                last_real_model = ""
-
-                filtered_turns: list[TurnRecord] = []
-                for turn in raw_turns:
-                    is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
-                    if not is_cp and turn.model not in ("compaction", "unknown"):
-                        last_real_model = turn.model
-                        eff_model = turn.model
-                    elif turn.model not in ("compaction", "unknown"):
-                        eff_model = turn.model
-                    else:
-                        eff_model = last_real_model or fallback_model or turn.model
-
-                    local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
-                    if since is not None and (local_ts is None or local_ts.date() < since):
-                        continue
-                    if until is not None and (local_ts is None or local_ts.date() > until):
-                        continue
-                    if model_needle and model_needle not in turn.model.lower():
-                        continue
-                    turn_cost = self.pricing.price_turn(
-                        eff_model,
-                        turn.input_tokens,
-                        turn.cache_read_tokens,
-                        turn.cache_write_tokens,
-                        turn.output_tokens,
-                        local_ts.date() if local_ts is not None else None,
-                    )
-                    filtered_turns.append(
-                        TurnRecord(
-                            conversation_id=turn.conversation_id,
-                            step_index=turn.step_index,
-                            timestamp=local_ts,
-                            model=turn.model,
-                            step_type=turn.step_type,
-                            status=turn.status,
-                            input_tokens=turn.input_tokens,
-                            cache_read_tokens=turn.cache_read_tokens,
-                            cache_write_tokens=turn.cache_write_tokens,
-                            output_tokens=turn.output_tokens,
-                            tool_names=turn.tool_names,
-                            thinking_chars=turn.thinking_chars,
-                            cost=turn_cost,
-                        )
-                    )
-
-                if not filtered_turns:
-                    skipped_empty += 1
-                    continue
-
-                ann_title = self._get_annotation_title(root_dir, cid)
-                meta = meta_cache.get(cid)
-                if meta is not None:
-                    is_subagent = bool(meta.get("is_internal"))
-                else:
-                    is_subagent = subagent_parent_id is not None
-                parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
-                meta_dict = meta or {}
-                title = (
-                    ann_title
-                    or str(meta_dict.get("title") or "")
-                    or str(meta_dict.get("preview") or "")
-                    or first_user_preview
-                    or (subagent_preview if is_subagent else "")
-                    or ("(subagent)" if is_subagent else "(untitled)")
+            if spec.kind == "antigravity":
+                found, se, sl, fc, fr = self._scan_antigravity_source(
+                    spec, tz, since, until, model_needle, session_needle,
+                    sessions_by_key, seen_agy_keys, warnings,
                 )
-                workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
-
-                session = SessionInfo(
-                    conversation_id=cid,
-                    title=title,
-                    workspace=workspace,
-                    transcript_path=cache_key,
-                    source=source_name,
-                    is_subagent=is_subagent,
-                    parent_id=parent_id,
+            elif spec.kind == "claude":
+                found, se, sl, fc, fr = self._scan_claude_source(
+                    spec, tz, since, until, model_needle, session_needle,
+                    sessions_by_key, seen_agent_keys, claude_parent_meta, warnings,
                 )
-                for t in filtered_turns:
-                    session.add_turn(t)
+            elif spec.kind == "codex":
+                found, se, sl, fc, fr = self._scan_codex_source(
+                    spec, tz, since, until, model_needle, session_needle,
+                    sessions_by_key, seen_agent_keys, codex_parent_meta, warnings,
+                )
+            elif spec.kind == "gemini":
+                found, se, sl, fc, fr = self._scan_gemini_source(
+                    spec, tz, since, until, model_needle, session_needle,
+                    sessions_by_key, seen_agent_keys, warnings,
+                )
+            else:
+                continue
+            found_any_source = found_any_source or found
+            skipped_empty += se
+            skipped_lines += sl
+            files_cached += fc
+            files_reparsed += fr
 
-                prev = sessions_by_id.get(cid)
-                if prev is None or len(session.turns) > len(prev.turns):
-                    sessions_by_id[cid] = session
+        sessions = list(sessions_by_key.values())
 
-        sessions = list(sessions_by_id.values())
-
-        # Link subagent sessions to their parent so they inherit workspace and parent title.
-        parent_lookup: dict[str, tuple[str, str]] = {
-            s.conversation_id: (s.title, s.workspace) for s in sessions
+        # Link subagent sessions to their parent within the same agent family.
+        parent_lookup: dict[tuple[str, str], tuple[str, str]] = {
+            (s.agent_family, s.conversation_id): (s.title, s.workspace) for s in sessions
         }
+        agy_roots = [s.root for s in self.sources if s.kind == "antigravity"]
         for s in sessions:
             if not s.is_subagent or not s.parent_id:
                 continue
+            fam = s.agent_family
             pid = s.parent_id
-            resolved = parent_lookup.get(pid)
+            resolved = parent_lookup.get((fam, pid))
             if resolved is None:
-                for root_dir in self.data_dirs:
-                    p_ann = self._get_annotation_title(root_dir, pid)
-                    p_meta = self._meta_caches.get(str(root_dir), {}).get(pid, {})
-                    ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
-                    pws = str(p_meta.get("workspace") or "")
-                    if ptitle or pws:
-                        resolved = (ptitle, pws)
-                        break
+                if fam == "antigravity":
+                    for root_dir in agy_roots:
+                        p_ann = self._get_annotation_title(root_dir, pid)
+                        p_meta = self._meta_caches.get(str(root_dir), {}).get(pid, {})
+                        ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
+                        pws = str(p_meta.get("workspace") or "")
+                        if ptitle or pws:
+                            resolved = (ptitle, pws)
+                            break
+                elif fam == "claude":
+                    resolved = claude_parent_meta.get(pid)
+                elif fam == "codex":
+                    resolved = codex_parent_meta.get(pid)
             if resolved is not None:
                 ptitle, pws = resolved
                 if ptitle:
@@ -1514,7 +3090,7 @@ class IncrementalScanner:
                     s.title = f"subtask · {ptitle}"
 
         archived_backfill = self._load_archived_backfill(
-            set(sessions_by_id.keys()),
+            set(sessions_by_key.keys()),
             tz,
             since,
             until,
@@ -1526,18 +3102,21 @@ class IncrementalScanner:
         if workspace_needle:
             sessions = [s for s in sessions if workspace_needle in s.workspace.lower()]
 
-        if not found_any_brain and not archived_backfill:
+        if not found_any_source and not archived_backfill:
             warnings.append(f"Data directory not found: {self.data_dir}")
 
         if not session_needle:
             for stale_key in list(self._transcript_cache.keys()):
-                if stale_key not in seen_keys:
+                if stale_key not in seen_agy_keys:
                     self._transcript_cache.pop(stale_key, None)
+            for stale_key in list(self._agent_file_cache.keys()):
+                if stale_key not in seen_agent_keys:
+                    self._agent_file_cache.pop(stale_key, None)
 
         if skipped_lines > 0:
             warnings.append(
                 f"Skipped {skipped_lines} malformed/incomplete JSONL line(s) "
-                "(normal if an agy CLI session is actively writing)."
+                "(normal if an agent session is actively writing)."
             )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1566,12 +3145,16 @@ def scan_usage(
     pricing_path: pathlib.Path | None = DEFAULT_PRICING_PATH,
     extra_dirs: Sequence[pathlib.Path] | None = None,
     archive_path: pathlib.Path | None = None,
+    sources: Sequence[SourceSpec] | None = None,
+    agent_filter: set[str] | None = None,
 ) -> ScanReport:
     return IncrementalScanner(
         data_dir,
         pricing_path=pricing_path,
         extra_dirs=extra_dirs,
         archive_path=archive_path,
+        sources=sources,
+        agent_filter=agent_filter,
     ).scan(
         tz=tz,
         since=since,
@@ -1742,6 +3325,8 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
     by_tool: dict[str, int] = defaultdict(int)
     by_source: dict[str, TokenCounts] = defaultdict(TokenCounts)
     source_sessions: dict[str, int] = defaultdict(int)
+    by_agent: dict[str, TokenCounts] = defaultdict(TokenCounts)
+    agent_sessions: dict[str, int] = defaultdict(int)
     total_thinking_turns = 0
     total_active_secs = 0
 
@@ -1752,8 +3337,11 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
         workspace_sessions[s.workspace] += 1
         by_source[s.source].merge(s.counts)
         source_sessions[s.source] += 1
+        fam = s.agent_family
+        by_agent[fam].merge(s.counts)
+        agent_sessions[fam] += 1
         for t in s.turns:
-            if t.thinking_chars > 0:
+            if t.has_thinking:
                 total_thinking_turns += 1
             for tool_name in t.tool_names:
                 by_tool[tool_name] += 1
@@ -1795,6 +3383,8 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
         "by_tool": dict(by_tool),
         "by_source": by_source,
         "source_sessions": source_sessions,
+        "by_agent": by_agent,
+        "agent_sessions": agent_sessions,
         "total_thinking_turns": total_thinking_turns,
         "total_active_secs": total_active_secs,
     }
@@ -1889,12 +3479,20 @@ def _alpha_label(idx: int) -> str:
     return "".join(reversed(chars))
 
 
+_WARN_PATH_TAIL_RE = re.compile(
+    r"((?:<redacted>|~/\.(?:claude|config/claude|codex|gemini/(?:antigravity-cli|antigravity-ide|antigravity|tmp))))[/\\][^\s:]+"
+)
+
+
 def _redact_data_dir(path: pathlib.Path) -> str:
     norm = str(path).replace("\\", "/").rstrip("/")
     lower = norm.lower()
-    for suffix in ("antigravity-cli", "antigravity", "antigravity-ide"):
+    for suffix in ("antigravity-cli", "antigravity", "antigravity-ide", "tmp"):
         if lower == f".gemini/{suffix}" or lower.endswith(f"/.gemini/{suffix}"):
             return f"~/.gemini/{suffix}"
+    for suffix in (".config/claude", ".claude", ".codex"):
+        if lower == suffix or lower.endswith(f"/{suffix}"):
+            return f"~/{suffix}"
     return "<redacted>"
 
 
@@ -1903,13 +3501,37 @@ def _redact_pricing_path(path: pathlib.Path | None) -> str:
     return f"./{name}"
 
 
-def _redact_warning(msg: str, data_dir: pathlib.Path) -> str:
-    redacted_dir = _redact_data_dir(data_dir)
-    out = msg.replace(str(data_dir), redacted_dir)
-    out = out.replace(str(data_dir).replace("\\", "/"), redacted_dir)
-    home = str(pathlib.Path.home())
-    if home:
-        out = out.replace(home, "~").replace(home.replace("\\", "/"), "~")
+def _redact_warning(
+    msg: str,
+    data_dir: pathlib.Path,
+    data_dirs: Sequence[pathlib.Path] | None = None,
+) -> str:
+    out = msg
+    all_dirs: list[pathlib.Path] = [data_dir]
+    if data_dirs:
+        for d in data_dirs:
+            if d not in all_dirs:
+                all_dirs.append(d)
+    for d in sorted(all_dirs, key=lambda p: len(str(p)), reverse=True):
+        redacted_dir = _redact_data_dir(d)
+        raw_s = str(d)
+        out = out.replace(raw_s, redacted_dir).replace(raw_s.replace("\\", "/"), redacted_dir)
+    home = pathlib.Path.home()
+    for sub, label in (
+        (home / ".gemini" / "antigravity-cli", "~/.gemini/antigravity-cli"),
+        (home / ".gemini" / "antigravity-ide", "~/.gemini/antigravity-ide"),
+        (home / ".gemini" / "antigravity", "~/.gemini/antigravity"),
+        (home / ".gemini" / "tmp", "~/.gemini/tmp"),
+        (home / ".config" / "claude", "~/.config/claude"),
+        (home / ".claude", "~/.claude"),
+        (home / ".codex", "~/.codex"),
+    ):
+        raw_s = str(sub)
+        out = out.replace(raw_s, label).replace(raw_s.replace("\\", "/"), label)
+    home_s = str(home)
+    if home_s:
+        out = out.replace(home_s, "~").replace(home_s.replace("\\", "/"), "~")
+    out = _WARN_PATH_TAIL_RE.sub(r"\1/<redacted-path>", out)
     return out
 
 
@@ -2014,12 +3636,12 @@ def _group_sessions_for_display(
             rows.append((s, s.counts, s.last_time, set(s.models), _primary_model(s), 0))
         return rows
 
-    present_ids = {s.conversation_id for s in sessions}
-    children_by_parent: dict[str, list[SessionInfo]] = defaultdict(list)
+    present_keys = {(s.agent_family, s.conversation_id) for s in sessions}
+    children_by_parent: dict[tuple[str, str], list[SessionInfo]] = defaultdict(list)
     roots: list[SessionInfo] = []
     for s in sessions:
-        if s.is_subagent and s.parent_id and s.parent_id in present_ids:
-            children_by_parent[s.parent_id].append(s)
+        if s.is_subagent and s.parent_id and (s.agent_family, s.parent_id) in present_keys:
+            children_by_parent[(s.agent_family, s.parent_id)].append(s)
         else:
             roots.append(s)
 
@@ -2029,7 +3651,7 @@ def _group_sessions_for_display(
         counts.merge(s.counts)
         last_time = s.last_time
         models = set(s.models)
-        kids = children_by_parent.get(s.conversation_id, [])
+        kids = children_by_parent.get((s.agent_family, s.conversation_id), [])
         for k in kids:
             counts.merge(k.counts)
             models.update(k.models)
@@ -2064,7 +3686,7 @@ def render_text(
     show_subagents: bool = False,
     redact: bool = False,
     statusline: dict[str, Any] | None = None,
-    blocks: Sequence[dict[str, Any]] | None = None,
+    agent_filter: set[str] | None = None,
 ) -> str:
     total: TokenCounts = agg["total"]
     include_cw = total.cache_write_tokens > 0
@@ -2081,6 +3703,8 @@ def render_text(
     filters: list[str] = [f"TZ={tz_label}"]
     if since or until:
         filters.append(f"Date={since or '*'}..{until or '*'}")
+    if agent_filter:
+        filters.append(f"Agents={','.join(sorted(agent_filter))}")
     if model_filter:
         filters.append(f"Model~={model_filter}")
     if session_filter:
@@ -2132,16 +3756,6 @@ def render_text(
             f"  Activity         : Active ~{_fmt_duration(agg['total_active_secs'])}"
             f" | Thinking Turns: {think_turns}/{total.calls} | Tool Calls: {tool_total:,}"
         )
-    all_blocks = list(blocks) if blocks is not None else compute_billing_blocks(report.sessions)
-    active_blk = next((b for b in reversed(all_blocks) if b["is_active"]), None)
-    if active_blk is not None:
-        bc: TokenCounts = active_blk["counts"]
-        overview_lines.append(
-            f"  Active 5h Block  : {_fmt_num(bc.total_tokens, human)} tok / {_fmt_cost(bc.cost, bc.calls, human)}"
-            f" | Rate {_fmt_usd(active_blk['usd_per_hour'], True)}/h ({_fmt_num(int(active_blk['tokens_per_min']), True)}/m)"
-            f" | Proj {_fmt_usd(active_blk['projected_usd'], True)}"
-            f" | Left {_fmt_countdown(active_blk['remaining_secs'])} ({active_blk['time_progress_pct']:.0f}% elapsed)"
-        )
     if statusline and statusline.get("buckets"):
         prov = statusline.get("provenance", "official")
         b_strs = []
@@ -2173,6 +3787,7 @@ def render_text(
         ws_disp = redactor.workspace(s.workspace) if redactor else s.workspace
         out.append(_style(f"Session Detail: {sid_disp}", "1;33", color))
         out.append(f"  Title     : {title_disp}")
+        out.append(f"  Source    : {source_display_label(s.source)}")
         if s.is_subagent and s.parent_id:
             if redactor:
                 pid_disp = redactor.parent_id(s.parent_id) or "P-???"
@@ -2246,34 +3861,44 @@ def render_text(
     show_hourly = view in ("all", "hourly")
     show_workspace = view in ("all", "workspace")
     show_sessions = view in ("summary", "all", "session")
-    show_blocks = view in ("all", "blocks")
     show_tools = view in ("all", "tools")
+    show_sources = view in ("all", "sources")
 
-    if show_blocks and all_blocks:
+    if show_sources and agg.get("by_source"):
         out.append("")
-        out.append(_style("5-Hour Rolling Blocks", "1;33", color))
-        b_headers = ["Window (Local)", "Status", "Calls", "Tokens", "Cost($)", "Rate($/h)", "Proj($)", "Remaining"]
-        b_aligns = ["left", "left", "right", "right", "right", "right", "right", "right"]
-        shown_b = list(reversed(all_blocks))
-        if limit > 0 and view != "blocks":
-            shown_b = shown_b[:limit]
-        b_rows = []
-        for b in shown_b:
-            bc = b["counts"]
-            s_local = b["start_utc"].astimezone()
-            e_local = b["end_utc"].astimezone()
-            win_lbl = f"{s_local.strftime('%m-%d %H:%M')}..{e_local.strftime('%H:%M')}"
-            b_rows.append([
-                win_lbl,
-                "ACTIVE" if b["is_active"] else "closed",
-                str(bc.calls),
-                _fmt_num(bc.total_tokens, human),
-                _fmt_cost(bc.cost, bc.calls, human),
-                _fmt_usd(b["usd_per_hour"], human),
-                _fmt_usd(b["projected_usd"], human) if b["is_active"] else "-",
-                _fmt_countdown(b["remaining_secs"]) if b["is_active"] else "-",
+        out.append(_style("By Source", "1;33", color))
+        src_headers = ["Source", "Agent", "Sessions", "Calls", "Input(new)", "CacheRead"]
+        src_aligns = ["left", "left", "right", "right", "right", "right"]
+        if include_cw:
+            src_headers.append("CacheWrite")
+            src_aligns.append("right")
+        src_headers.extend(["Output", "Total", "Cost($)", "Hit%", "PeakCtx"])
+        src_aligns.extend(["right", "right", "right", "right", "right"])
+        src_items = sorted(
+            agg["by_source"].items(),
+            key=lambda kv: (-kv[1].total_tokens, kv[0]),
+        )
+        src_rows = []
+        for sk, c in src_items:
+            row = [
+                sk,
+                agent_display_label(source_to_agent_family(sk)),
+                str(agg["source_sessions"][sk]),
+                str(c.calls),
+                _fmt_num(c.input_tokens, human),
+                _fmt_num(c.cache_read_tokens, human),
+            ]
+            if include_cw:
+                row.append(_fmt_num(c.cache_write_tokens, human))
+            row.extend([
+                _fmt_num(c.output_tokens, human),
+                _fmt_num(c.total_tokens, human),
+                _fmt_cost(c.cost, c.calls, human),
+                _fmt_pct(c.cache_hit_rate),
+                _fmt_num(c.peak_context, human),
             ])
-        out.append(_render_table(b_headers, b_rows, b_aligns))
+            src_rows.append(row)
+        out.append(_render_table(src_headers, src_rows, src_aligns))
 
     if show_tools and agg.get("by_tool"):
         out.append("")
@@ -2391,8 +4016,15 @@ def render_text(
         out.append("")
         title_suffix = f" (showing {len(shown)}/{total_cnt}, sort={sort_by})" if len(shown) < total_cnt else f" ({total_cnt}, sort={sort_by})"
         out.append(_style(f"Sessions{title_suffix}", "1;33", color))
-        s_headers = ["ID", "Last Active", "Calls", "Model", "Hit%", "Input(new)", "CacheRead", "Output", "Total", "Cost($)", "PeakCtx", "Title"]
-        s_aligns = ["left", "left", "right", "left", "right", "right", "right", "right", "right", "right", "right", "left"]
+        has_non_agy = any(s.agent_family != "antigravity" for s in report.sessions)
+        if has_non_agy:
+            s_headers = ["ID", "Src", "Last Active", "Calls", "Model", "Hit%", "Input(new)", "CacheRead", "Output", "Total", "Cost($)", "PeakCtx", "Title"]
+            s_aligns = ["left", "left", "left", "right", "left", "right", "right", "right", "right", "right", "right", "right", "left"]
+            s_max_widths: list[int | None] = [8, 6, 16, None, None, None, None, None, None, None, None, None, 42]
+        else:
+            s_headers = ["ID", "Last Active", "Calls", "Model", "Hit%", "Input(new)", "CacheRead", "Output", "Total", "Cost($)", "PeakCtx", "Title"]
+            s_aligns = ["left", "left", "right", "left", "right", "right", "right", "right", "right", "right", "right", "left"]
+            s_max_widths = [8, 16, None, None, None, None, None, None, None, None, None, 42]
         s_rows = []
         for s, counts, last_time, models, primary, sub_count in shown:
             real_models = [m for m in sorted(models) if m != "compaction"]
@@ -2405,9 +4037,11 @@ def render_text(
                 title_cell = f"↳ {raw_or_redacted_title}"
             else:
                 title_cell = raw_or_redacted_title
-            s_rows.append(
+            row_cells = [redactor.session_id(s.conversation_id) if redactor else s.conversation_id[:8]]
+            if has_non_agy:
+                row_cells.append(source_badge(s.source))
+            row_cells.extend(
                 [
-                    redactor.session_id(s.conversation_id) if redactor else s.conversation_id[:8],
                     _fmt_time(last_time),
                     str(counts.calls),
                     models_str,
@@ -2421,12 +4055,13 @@ def render_text(
                     title_cell,
                 ]
             )
+            s_rows.append(row_cells)
         out.append(
             _render_table(
                 s_headers,
                 s_rows,
                 s_aligns,
-                max_widths=[8, 16, None, None, None, None, None, None, None, None, None, 42],
+                max_widths=s_max_widths,
             )
         )
 
@@ -2439,19 +4074,10 @@ def render_compact(
     *,
     tz: dt.tzinfo,
     statusline: dict[str, Any] | None = None,
-    blocks: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     today_key = dt.datetime.now(tz).strftime("%Y-%m-%d")
     tc: TokenCounts = agg["by_day"].get(today_key, TokenCounts())
     parts = [f"AGY today={_fmt_num(tc.total_tokens, True)} ({_fmt_cost(tc.cost, tc.calls, True)})"]
-    all_blocks = list(blocks) if blocks is not None else compute_billing_blocks(report.sessions)
-    active = next((b for b in reversed(all_blocks) if b["is_active"]), None)
-    if active is not None:
-        bc: TokenCounts = active["counts"]
-        parts.append(
-            f"5h={_fmt_num(bc.total_tokens, True)} ({_fmt_cost(bc.cost, bc.calls, True)}, "
-            f"{_fmt_countdown(active['remaining_secs'])} left)"
-        )
     if statusline and statusline.get("buckets"):
         b0 = next((b for b in statusline["buckets"] if not b.get("disabled") and b.get("remaining_pct") is not None), None)
         if b0 is not None:
@@ -2461,17 +4087,17 @@ def render_compact(
 
 def evaluate_budget_exit_code(
     agg: dict[str, Any],
-    blocks: Sequence[dict[str, Any]],
     *,
     tz: dt.tzinfo,
     daily_usd: float = 0.0,
-    block_5h_usd: float = 0.0,
+    weekly_usd: float = 0.0,
     warn_pct: float = 70.0,
     crit_pct: float = 90.0,
 ) -> tuple[int, list[str]]:
     code = 0
     notes: list[str] = []
-    today_key = dt.datetime.now(tz).strftime("%Y-%m-%d")
+    now_date = dt.datetime.now(tz).date()
+    today_key = now_date.strftime("%Y-%m-%d")
     today_cost = agg["by_day"].get(today_key, TokenCounts()).total_cost_usd
     if daily_usd > 0:
         pct = (today_cost / daily_usd) * 100.0
@@ -2481,16 +4107,17 @@ def evaluate_budget_exit_code(
         elif pct >= warn_pct:
             code = max(code, 10)
             notes.append(f"WARN: daily ${today_cost:.2f} / ${daily_usd:.2f} ({pct:.0f}%)")
-    active = next((b for b in reversed(blocks) if b["is_active"]), None)
-    if block_5h_usd > 0 and active is not None:
-        b_cost = active["counts"].total_cost_usd
-        pct = (b_cost / block_5h_usd) * 100.0
+    if weekly_usd > 0:
+        iso = now_date.isocalendar()
+        week_key = f"{iso.year:04d}-W{iso.week:02d}"
+        week_cost = agg["by_week"].get(week_key, TokenCounts()).total_cost_usd
+        pct = (week_cost / weekly_usd) * 100.0
         if pct >= crit_pct:
             code = max(code, 20)
-            notes.append(f"CRITICAL: 5h block ${b_cost:.2f} / ${block_5h_usd:.2f} ({pct:.0f}%)")
+            notes.append(f"CRITICAL: weekly ${week_cost:.2f} / ${weekly_usd:.2f} ({pct:.0f}%)")
         elif pct >= warn_pct:
             code = max(code, 10)
-            notes.append(f"WARN: 5h block ${b_cost:.2f} / ${block_5h_usd:.2f} ({pct:.0f}%)")
+            notes.append(f"WARN: weekly ${week_cost:.2f} / ${weekly_usd:.2f} ({pct:.0f}%)")
     return code, notes
 
 
@@ -2503,7 +4130,6 @@ def render_json(
     include_turns: bool,
     redact: bool = False,
     statusline: dict[str, Any] | None = None,
-    blocks: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     redactor = Redactor(report.sessions, agg) if redact else None
     ordered = _sort_sessions(report.sessions, sort_by)
@@ -2526,6 +4152,7 @@ def render_json(
             "title": title_val,
             "workspace": ws_val,
             "source": s.source,
+            "agent": s.agent_family,
             "is_archived": s.is_archived,
             "is_subagent": s.is_subagent,
             "parent_id": pid_val,
@@ -2549,8 +4176,10 @@ def render_json(
                     "input_tokens": t.input_tokens,
                     "cache_read_tokens": t.cache_read_tokens,
                     "cache_write_tokens": t.cache_write_tokens,
+                    "cache_write_1h_tokens": t.cache_write_1h_tokens,
                     "total_input_tokens": t.total_input_tokens,
                     "output_tokens": t.output_tokens,
+                    "reasoning_tokens": t.reasoning_tokens,
                     "total_tokens": t.total_tokens,
                     "cache_hit_rate_pct": round(t.cache_hit_rate, 2),
                     "cost_usd": round(t.cost.total_usd, 6),
@@ -2563,26 +4192,6 @@ def render_json(
     for k, v in sorted(agg["by_workspace"].items()):
         ws_key = redactor.workspace(k) if redactor else k
         by_ws_json[ws_key] = {"sessions": agg["workspace_sessions"][k], **v.to_dict()}
-
-    all_blocks = list(blocks) if blocks is not None else compute_billing_blocks(report.sessions)
-    blocks_json = [
-        {
-            "start_utc": b["start_utc"].isoformat(),
-            "end_utc": b["end_utc"].isoformat(),
-            "is_active": b["is_active"],
-            "elapsed_secs": b["elapsed_secs"],
-            "remaining_secs": b["remaining_secs"],
-            "time_progress_pct": b["time_progress_pct"],
-            "tokens_per_min": b["tokens_per_min"],
-            "usd_per_hour": b["usd_per_hour"],
-            "projected_tokens": b["projected_tokens"],
-            "projected_usd": b["projected_usd"],
-            "sessions": b["sessions"],
-            "models": b["models"],
-            **b["counts"].to_dict(),
-        }
-        for b in all_blocks[-24:]
-    ]
 
     payload: dict[str, Any] = {
         "data_dir": _redact_data_dir(report.data_dir) if redact else str(report.data_dir),
@@ -2597,11 +4206,14 @@ def render_json(
             "thinking_turns": agg.get("total_thinking_turns", 0),
         },
         "official_quota": statusline,
-        "blocks_5h": blocks_json,
         "by_tool": dict(sorted(agg.get("by_tool", {}).items(), key=lambda kv: (-kv[1], kv[0]))),
         "by_source": {
             k: {"sessions": agg["source_sessions"][k], **v.to_dict()}
             for k, v in sorted(agg.get("by_source", {}).items())
+        },
+        "by_agent": {
+            k: {"sessions": agg["agent_sessions"][k], **v.to_dict()}
+            for k, v in sorted(agg.get("by_agent", {}).items())
         },
         "by_model": {k: v.to_dict() for k, v in sorted(agg["by_model"].items())},
         "by_date": {k: v.to_dict() for k, v in sorted(agg["by_day"].items())},
@@ -2617,7 +4229,9 @@ def render_json(
         "by_hour": {f"{h:02d}": v.to_dict() for h, v in sorted(agg["by_hour"].items()) if v.calls > 0},
         "by_workspace": by_ws_json,
         "sessions": sessions_json,
-        "warnings": [_redact_warning(w, report.data_dir) for w in report.warnings] if redact else report.warnings,
+        "warnings": [
+            _redact_warning(w, report.data_dir, report.data_dirs) for w in report.warnings
+        ] if redact else report.warnings,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -2654,6 +4268,10 @@ def render_csv(
         writer.writerow([key_col, "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
         for k, c in items:
             writer.writerow([k, c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
+    elif view == "sources":
+        writer.writerow(["source", "agent", "sessions", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
+        for k, c in sorted(agg.get("by_source", {}).items(), key=lambda kv: (-kv[1].total_tokens, kv[0])):
+            writer.writerow([k, source_to_agent_family(k), agg["source_sessions"][k], c.calls, c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.total_input_tokens, c.output_tokens, c.total_tokens, c.non_cached_tokens, round(c.cache_hit_rate, 2), c.peak_context, round(c.cost.total_usd, 6), round(c.cost.cache_saved_usd, 6)])
     elif view == "workspace":
         writer.writerow(["workspace", "sessions", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "total_input_tokens", "output_tokens", "total_tokens", "non_cached_tokens", "cache_hit_rate_pct", "peak_context", "cost_usd", "cache_saved_usd"])
         for k, c in sorted(agg["by_workspace"].items(), key=lambda kv: kv[1].total_tokens, reverse=True):
@@ -2742,32 +4360,45 @@ def render_pricing_table(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agy_token_stats.py",
-        description="Strictly read-only token usage analyzer for Antigravity CLI (agy).",
+        description="Strictly read-only multi-agent token usage analyzer (Antigravity, Claude Code, Codex CLI, Gemini CLI).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python agy_token_stats.py                     # Overview + model + daily + recent sessions\n"
-            "  python agy_token_stats.py --today             # Only today's usage (local time)\n"
-            "  python agy_token_stats.py --days 7 --human    # Last 7 days in K/M format\n"
-            "  python agy_token_stats.py --session e54a0f44  # Turn-by-turn breakdown for one session\n"
-            "  python agy_token_stats.py --view all          # Include monthly & workspace tables\n"
-            "  python agy_token_stats.py --format json       # Export structured JSON to stdout\n"
+            "  python agy_token_stats.py                        # Auto-discover all installed Tier-1 agents\n"
+            "  python agy_token_stats.py --today --human        # Only today's usage in K/M format\n"
+            "  python agy_token_stats.py --agy-only             # Antigravity (CLI/App/IDE) sources only\n"
+            "  python agy_token_stats.py --agents claude,codex  # Specific agent families only\n"
+            "  python agy_token_stats.py --view sources         # Breakdown by agent source\n"
+            "  python agy_token_stats.py --format json          # Export structured JSON to stdout\n"
         ),
     )
     parser.add_argument(
         "--data-dir",
         type=pathlib.Path,
         default=None,
-        help=f"Single Antigravity data directory (default: auto-discover CLI/App/IDE under ~/.gemini)",
+        help="Single Antigravity data directory (overrides auto-discovery)",
     )
     parser.add_argument(
         "--single-source",
         action="store_true",
-        help="Scan only ~/.gemini/antigravity-cli instead of all Antigravity surfaces",
+        help="Scan only ~/.gemini/antigravity-cli instead of all installed agents",
+    )
+    parser.add_argument(
+        "--agy-only",
+        action="store_true",
+        help="Scan only Antigravity sources (CLI/App/IDE), skipping Claude Code, Codex CLI, and Gemini CLI",
+    )
+    parser.add_argument(
+        "--agent",
+        "--agents",
+        dest="agents",
+        action="append",
+        default=None,
+        help="Comma-separated agent filter: agy/antigravity, claude, codex, gemini (default: all installed Tier-1 agents)",
     )
     parser.add_argument(
         "--view",
-        choices=("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace", "blocks", "tools", "pricing"),
+        choices=("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace", "tools", "sources", "pricing"),
         default="summary",
         help="Report sections to display (default: summary)",
     )
@@ -2780,7 +4411,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compact",
         action="store_true",
-        help="Print a single-line prompt-ready summary (today + active 5h block + official quota)",
+        help="Print a single-line prompt-ready summary (today + official quota)",
     )
     parser.add_argument(
         "--no-archive",
@@ -2800,10 +4431,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Daily USD budget threshold for --check-budget (overrides budget.json)",
     )
     parser.add_argument(
-        "--budget-5h",
+        "--budget-weekly",
         type=float,
         default=None,
-        help="5-hour rolling block USD budget threshold for --check-budget (overrides budget.json)",
+        help="Weekly USD budget threshold for --check-budget (overrides budget.json)",
     )
     parser.add_argument(
         "--warn-pct",
@@ -2942,16 +4573,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"--since ({since}) cannot be after --until ({until}).")
 
     pricing_path = args.pricing.expanduser() if args.pricing else None
+    try:
+        agent_filter = parse_agent_filter(args.agents)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.agy_only:
+        agent_filter = {"antigravity"}
+
+    sources: list[SourceSpec] | None = None
+    extra_dirs: list[pathlib.Path] = []
     if args.data_dir is not None:
         primary_dir = args.data_dir.expanduser()
-        extra_dirs: list[pathlib.Path] = []
+        sources = [SourceSpec("antigravity", primary_dir, _infer_source_name(primary_dir))]
     elif args.single_source:
         primary_dir = DEFAULT_DATA_DIR
-        extra_dirs = []
+        sources = [SourceSpec("antigravity", primary_dir, "cli")]
     else:
-        discovered = default_data_dirs()
-        primary_dir = discovered[0]
-        extra_dirs = discovered[1:]
+        sources = discover_default_sources(agent_filter)
+        primary_dir = sources[0].root if sources else DEFAULT_DATA_DIR
 
     archive_path = None if args.no_archive else DEFAULT_ARCHIVE_PATH
     report = scan_usage(
@@ -2965,9 +4604,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         pricing_path=pricing_path,
         extra_dirs=extra_dirs,
         archive_path=archive_path,
+        sources=sources,
+        agent_filter=agent_filter,
     )
     agg = _aggregate(report.sessions)
-    blocks = compute_billing_blocks(report.sessions)
     sl_path = args.statusline_state.expanduser() if args.statusline_state else None
     statusline = load_statusline_state(sl_path)
 
@@ -2992,7 +4632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.compact:
-        print(render_compact(report, agg, tz=tz, statusline=statusline, blocks=blocks))
+        print(render_compact(report, agg, tz=tz, statusline=statusline))
     elif args.format == "json":
         include_turns = bool(args.session)
         print(
@@ -3004,7 +4644,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 include_turns=include_turns,
                 redact=args.redact,
                 statusline=statusline,
-                blocks=blocks,
             )
         )
     elif args.format == "csv":
@@ -3027,26 +4666,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 show_subagents=args.show_subagents,
                 redact=args.redact,
                 statusline=statusline,
-                blocks=blocks,
+                agent_filter=agent_filter,
             )
         )
 
     for warn in report.warnings:
-        w_out = _redact_warning(warn, report.data_dir) if args.redact else warn
+        w_out = _redact_warning(warn, report.data_dir, report.data_dirs) if args.redact else warn
         print(f"Note: {w_out}", file=sys.stderr)
 
-    if args.check_budget or args.budget_daily is not None or args.budget_5h is not None:
+    if args.check_budget or args.budget_daily is not None or args.budget_weekly is not None:
         bcfg = load_budget_config(DEFAULT_BUDGET_PATH)
         daily_lim = args.budget_daily if args.budget_daily is not None else bcfg["daily_usd"]
-        b5h_lim = args.budget_5h if args.budget_5h is not None else bcfg["block_5h_usd"]
+        weekly_lim = args.budget_weekly if args.budget_weekly is not None else bcfg["weekly_usd"]
         warn_p = args.warn_pct if args.warn_pct is not None else bcfg["warn_pct"]
         crit_p = args.crit_pct if args.crit_pct is not None else bcfg["critical_pct"]
         exit_code, notes = evaluate_budget_exit_code(
             agg,
-            blocks,
             tz=tz,
             daily_usd=daily_lim,
-            block_5h_usd=b5h_lim,
+            weekly_usd=weekly_lim,
             warn_pct=warn_p,
             crit_pct=crit_p,
         )

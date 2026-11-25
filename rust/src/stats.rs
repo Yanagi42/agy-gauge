@@ -1,33 +1,97 @@
-//! Strictly read-only incremental scanner & aggregator for Antigravity CLI (`agy`) transcripts.
+//! Strictly read-only multi-agent incremental scanner & aggregator for `agy-gauge`.
 //!
-//! Only opens whitelisted plain-text files with read-only handles:
-//!   - `<data_dir>/brain/<id>/.system_generated/logs/transcript.jsonl`
-//!     (fallback to `transcript_full.jsonl` only if absent)
-//!   - `<data_dir>/annotations/<id>.pbtxt`
-//!   - `<data_dir>/cache/conversation_metadata.json`
+//! Supported Tier-1 pure-text agents (via `crate::sources` adapters):
+//!   - Antigravity (`agy` CLI / 2.0 App / IDE)
+//!   - Claude Code (`~/.claude/projects`, `$CLAUDE_CONFIG_DIR`)
+//!   - OpenAI Codex CLI (`~/.codex/sessions`, `$CODEX_HOME`, pure JSONL rollouts only)
+//!   - Gemini CLI (`~/.gemini/tmp`, `$GEMINI_CLI_HOME`)
 //!
-//! Never writes to disk, never touches SQLite databases, never reads credentials.
+//! Never writes inside agent directories, never touches SQLite databases, never reads credentials.
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
-use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::archive::UsageArchive;
 use crate::pricing::{CostBreakdown, ModelRate, PricingCatalog, PricingTableRow};
-use crate::quota::{
-    compute_billing_blocks, BillingBlock, BudgetConfig, BudgetStore, StatuslineReader,
-    StatuslineSnapshot,
+use crate::quota::{BudgetConfig, BudgetStore, StatuslineReader, StatuslineSnapshot};
+use crate::session_meta::{SessionMetaStore, SessionUserMeta};
+use crate::sources::{
+    build_adapter, default_antigravity_cli_dir, discover_antigravity_sources,
+    discover_default_sources, SourceAdapter,
 };
+
+pub use crate::sources::antigravity::parse_pbtxt_title;
+pub use crate::sources::{
+    compute_running_hint, SourceDiscoveryFilter, ACTIVE_MTIME_WINDOW_SECS, RUNNING_STEP_STALE_SECS,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AgentFamily {
+    Antigravity,
+    ClaudeCode,
+    Codex,
+    GeminiCli,
+}
+
+impl AgentFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentFamily::Antigravity => "antigravity",
+            AgentFamily::ClaudeCode => "claude-code",
+            AgentFamily::Codex => "codex",
+            AgentFamily::GeminiCli => "gemini-cli",
+        }
+    }
+
+    pub fn label_short(self) -> &'static str {
+        match self {
+            AgentFamily::Antigravity => "AGY",
+            AgentFamily::ClaudeCode => "Claude",
+            AgentFamily::Codex => "Codex",
+            AgentFamily::GeminiCli => "Gemini",
+        }
+    }
+
+    pub fn label_full(self) -> &'static str {
+        match self {
+            AgentFamily::Antigravity => "Antigravity",
+            AgentFamily::ClaudeCode => "Claude Code",
+            AgentFamily::Codex => "Codex CLI",
+            AgentFamily::GeminiCli => "Gemini CLI",
+        }
+    }
+
+    pub fn search_aliases(self) -> &'static [&'static str] {
+        match self {
+            AgentFamily::Antigravity => &["agy", "antigravity", "cli", "app", "ide"],
+            AgentFamily::ClaudeCode => &["claude", "claude-code", "claudecode"],
+            AgentFamily::Codex => &["codex", "codex-cli", "openai-codex"],
+            AgentFamily::GeminiCli => &["gemini", "gemini-cli", "geminicli"],
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "agy" | "antigravity" | "antigravity-cli" | "antigravity-ide" | "cli" | "app"
+            | "ide" => Some(AgentFamily::Antigravity),
+            "claude" | "claude-code" | "claudecode" | "cc" => Some(AgentFamily::ClaudeCode),
+            "codex" | "codex-cli" | "openai-codex" => Some(AgentFamily::Codex),
+            "gemini" | "gemini-cli" | "geminicli" => Some(AgentFamily::GeminiCli),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SourceKind {
     Cli,
     App,
     Ide,
+    ClaudeCode,
+    Codex,
+    GeminiCli,
     Custom,
 }
 
@@ -37,6 +101,9 @@ impl SourceKind {
             SourceKind::Cli => "cli",
             SourceKind::App => "app",
             SourceKind::Ide => "ide",
+            SourceKind::ClaudeCode => "claude-code",
+            SourceKind::Codex => "codex",
+            SourceKind::GeminiCli => "gemini-cli",
             SourceKind::Custom => "custom",
         }
     }
@@ -46,17 +113,42 @@ impl SourceKind {
             SourceKind::Cli => "CLI",
             SourceKind::App => "App",
             SourceKind::Ide => "IDE",
+            SourceKind::ClaudeCode => "Claude",
+            SourceKind::Codex => "Codex",
+            SourceKind::GeminiCli => "Gemini",
             SourceKind::Custom => "自定义",
         }
     }
 
+    pub fn agent_family(self) -> AgentFamily {
+        match self {
+            SourceKind::Cli | SourceKind::App | SourceKind::Ide | SourceKind::Custom => {
+                AgentFamily::Antigravity
+            }
+            SourceKind::ClaudeCode => AgentFamily::ClaudeCode,
+            SourceKind::Codex => AgentFamily::Codex,
+            SourceKind::GeminiCli => AgentFamily::GeminiCli,
+        }
+    }
+
+    pub fn family_label(self) -> &'static str {
+        self.agent_family().label_full()
+    }
+
     pub fn from_str_loose(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "cli" | "antigravity-cli" => SourceKind::Cli,
-            "app" | "antigravity" => SourceKind::App,
-            "ide" | "antigravity-ide" => SourceKind::Ide,
+            "cli" | "antigravity-cli" | "agy-cli" | "agy" => SourceKind::Cli,
+            "app" | "antigravity" | "agy-app" => SourceKind::App,
+            "ide" | "antigravity-ide" | "agy-ide" => SourceKind::Ide,
+            "claude-code" | "claude" | "claudecode" => SourceKind::ClaudeCode,
+            "codex" | "codex-cli" | "openai-codex" => SourceKind::Codex,
+            "gemini-cli" | "gemini" | "geminicli" => SourceKind::GeminiCli,
             _ => SourceKind::Custom,
         }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        Self::from_str_loose(s)
     }
 
     pub fn infer_from_path(path: &Path) -> Self {
@@ -66,11 +158,44 @@ impl SourceKind {
             .unwrap_or("")
             .to_ascii_lowercase();
         match name.as_str() {
-            "antigravity-cli" => SourceKind::Cli,
-            "antigravity" => SourceKind::App,
-            "antigravity-ide" => SourceKind::Ide,
-            _ => SourceKind::Custom,
+            "antigravity-cli" => return SourceKind::Cli,
+            "antigravity" => return SourceKind::App,
+            "antigravity-ide" => return SourceKind::Ide,
+            ".claude" | "claude" => return SourceKind::ClaudeCode,
+            ".codex" | "codex" => return SourceKind::Codex,
+            "gemini-cli" => return SourceKind::GeminiCli,
+            ".gemini" => {
+                if path.join("tmp").is_dir() && !path.join("brain").is_dir() {
+                    return SourceKind::GeminiCli;
+                }
+            }
+            "tmp" => {
+                let parent_is_gemini = path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case(".gemini"))
+                    .unwrap_or(false);
+                if parent_is_gemini {
+                    return SourceKind::GeminiCli;
+                }
+            }
+            _ => {}
         }
+        // Directory layout fallback for non-default custom paths (e.g. `--data-dir <path>`).
+        if path.join("brain").is_dir() {
+            return SourceKind::Custom;
+        }
+        if path.join("projects").is_dir() {
+            return SourceKind::ClaudeCode;
+        }
+        if path.join("sessions").is_dir() || path.join("archived_sessions").is_dir() {
+            return SourceKind::Codex;
+        }
+        if path.join("tmp").is_dir() {
+            return SourceKind::GeminiCli;
+        }
+        SourceKind::Custom
     }
 }
 
@@ -158,11 +283,15 @@ pub struct TurnRecord {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Optional subset of `cache_write_tokens` billed at 1h ephemeral TTL (2.0x base input; NOT additive).
+    pub cache_write_1h_tokens: u64,
     pub output_tokens: u64,
+    /// Optional informational subset of `output_tokens` representing reasoning/thoughts tokens (NOT additive).
+    pub reasoning_tokens: u64,
     pub tool_names: Vec<String>,
     pub thinking_chars: u64,
     /// Estimated wall-clock generation seconds (request start -> last tool call streamed out).
-    /// `None` when not measurable (pure text replies, checkpoints, missing tool steps).
+    /// `None` when not measurable (pure text replies, checkpoints, missing tool steps, non-AGY logs).
     pub gen_secs: Option<u32>,
     pub cost: CostBreakdown,
 }
@@ -173,6 +302,11 @@ pub const TPS_MIN_GEN_SECS: u32 = 3;
 pub const TPS_MIN_OUTPUT_TOKENS: u64 = 64;
 
 impl TurnRecord {
+    /// Whether this turn involved model thinking/reasoning (plaintext chars or token count).
+    pub fn has_thinking(&self) -> bool {
+        self.thinking_chars > 0 || self.reasoning_tokens > 0
+    }
+
     /// End-to-end output speed (tokens/s, thinking included, TTFT included).
     pub fn output_tps(&self) -> Option<f64> {
         let g = self.gen_secs?;
@@ -200,6 +334,35 @@ impl TurnRecord {
     }
 }
 
+/// Prices a `TurnRecord`, honoring `cache_write_1h_tokens` at 2.0x base input when present
+/// while pricing remaining 5m cache write tokens at `rate.cache_write`.
+pub fn price_turn_record(
+    pricing: &PricingCatalog,
+    eff_model: &str,
+    t: &TurnRecord,
+    local_date: Option<NaiveDate>,
+) -> CostBreakdown {
+    let cw_1h = t.cache_write_1h_tokens.min(t.cache_write_tokens);
+    if cw_1h == 0 {
+        return pricing.price_turn(
+            eff_model,
+            t.input_tokens,
+            t.cache_read_tokens,
+            t.cache_write_tokens,
+            t.output_tokens,
+            local_date,
+        );
+    }
+    let ctx = t.total_input();
+    let Some(rate) = pricing.resolve_rate(eff_model, ctx, local_date) else {
+        return CostBreakdown::unpriced();
+    };
+    let cw_5m = t.cache_write_tokens.saturating_sub(cw_1h);
+    let mut cost = rate.calculate(t.input_tokens, t.cache_read_tokens, cw_5m, t.output_tokens);
+    cost.cache_write_usd += (cw_1h as f64 / 1_000_000.0) * (rate.input * 2.0);
+    cost
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -216,6 +379,8 @@ pub struct SessionInfo {
     pub models: BTreeSet<String>,
     pub first_time: Option<DateTime<Local>>,
     pub last_time: Option<DateTime<Local>>,
+    pub last_file_mtime_utc: Option<DateTime<Utc>>,
+    pub is_running_hint: bool,
 }
 
 impl SessionInfo {
@@ -288,7 +453,7 @@ impl SessionInfo {
     }
 
     pub fn thinking_turns(&self) -> usize {
-        self.turns.iter().filter(|t| t.thinking_chars > 0).count()
+        self.turns.iter().filter(|t| t.has_thinking()).count()
     }
 
     pub fn total_thinking_chars(&self) -> u64 {
@@ -391,6 +556,7 @@ pub struct AggregatedStats {
     pub by_workspace: BTreeMap<String, (usize, TokenCounts)>,
     pub by_tool: BTreeMap<String, u64>,
     pub by_source: BTreeMap<SourceKind, (usize, TokenCounts)>,
+    pub by_agent: BTreeMap<AgentFamily, (usize, TokenCounts)>,
     pub total_thinking_turns: u64,
     pub total_active_secs: u64,
 }
@@ -402,13 +568,14 @@ pub struct ScanSnapshot {
     pub data_dirs: Vec<(SourceKind, PathBuf)>,
     pub sessions: Vec<SessionInfo>,
     pub agg: AggregatedStats,
-    pub active_block: Option<BillingBlock>,
-    pub recent_blocks: Vec<BillingBlock>,
     pub statusline: Option<StatuslineSnapshot>,
     pub statusline_changed: bool,
     pub budget: BudgetConfig,
     pub budget_changed: bool,
     pub budget_path: Option<PathBuf>,
+    pub session_meta: HashMap<String, SessionUserMeta>,
+    pub session_meta_changed: bool,
+    pub session_meta_path: Option<PathBuf>,
     pub archived_sessions_count: usize,
     pub archive_enabled: bool,
     pub archive_path: Option<PathBuf>,
@@ -423,6 +590,19 @@ pub struct ScanSnapshot {
     pub files_reparsed: usize,
     pub scan_ms: f64,
     pub warning: Option<String>,
+}
+
+impl ScanSnapshot {
+    /// Returns `true` if any scanned session or configured source belongs to a non-Antigravity agent.
+    pub fn has_non_antigravity(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.source.agent_family() != AgentFamily::Antigravity)
+            || self
+                .data_dirs
+                .iter()
+                .any(|(k, _)| k.agent_family() != AgentFamily::Antigravity)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,43 +647,14 @@ pub enum SessionSort {
     HitRateLow,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileSig {
-    mtime_secs: u64,
-    mtime_nanos: u32,
-    len: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CachedTranscript {
-    sig: FileSig,
-    turns: Vec<TurnRecord>,
-    first_user_preview: String,
-    subagent_parent_id: Option<String>,
-    subagent_preview: String,
-    skipped_lines: usize,
-}
-
-#[derive(Debug, Clone)]
-struct CachedMetaEntry {
-    title: String,
-    preview: String,
-    workspace: String,
-    is_internal: bool,
-}
-
 pub struct IncrementalScanner {
     sources: Vec<(SourceKind, PathBuf)>,
-    canon_roots: Vec<Option<PathBuf>>,
+    adapters: Vec<Box<dyn SourceAdapter>>,
     pricing: PricingCatalog,
     statusline: StatuslineReader,
     budget: BudgetStore,
     archive: UsageArchive,
-    verified_paths: HashSet<PathBuf>,
-    transcript_cache: HashMap<PathBuf, CachedTranscript>,
-    ann_cache: HashMap<PathBuf, (FileSig, String)>,
-    meta_sigs: HashMap<PathBuf, FileSig>,
-    meta_caches: HashMap<PathBuf, HashMap<String, CachedMetaEntry>>,
+    session_meta: SessionMetaStore,
 }
 
 impl IncrementalScanner {
@@ -537,54 +688,38 @@ impl IncrementalScanner {
         } else {
             sources
         };
-        let canon_roots = sources
+        let adapters = sources
             .iter()
-            .map(|(_, p)| fs::canonicalize(p).ok())
+            .map(|(kind, path)| build_adapter(*kind, path.clone()))
             .collect();
         Self {
             sources,
-            canon_roots,
+            adapters,
             pricing: PricingCatalog::new(pricing_override),
             statusline: StatuslineReader::new(statusline_path),
             budget: BudgetStore::new(budget_path),
             archive: UsageArchive::new(archive_path, archive_enabled),
-            verified_paths: HashSet::new(),
-            transcript_cache: HashMap::new(),
-            ann_cache: HashMap::new(),
-            meta_sigs: HashMap::new(),
-            meta_caches: HashMap::new(),
+            session_meta: SessionMetaStore::new(None),
         }
     }
 
     pub fn default_data_dir() -> PathBuf {
-        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-            PathBuf::from(home).join(".gemini").join("antigravity-cli")
-        } else {
-            PathBuf::from(".gemini").join("antigravity-cli")
-        }
+        default_antigravity_cli_dir()
     }
 
-    /// Discovers existing local Antigravity family directories (CLI, 2.0 App, IDE) strictly read-only.
+    /// Discovers all installed local Tier-1 pure-text agent directories (Antigravity + Claude Code + Codex + Gemini CLI).
     pub fn default_data_dirs() -> Vec<(SourceKind, PathBuf)> {
-        let base = if let Some(home) =
-            std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-        {
-            PathBuf::from(home).join(".gemini")
-        } else {
-            PathBuf::from(".gemini")
-        };
-        let candidates = [
-            (SourceKind::Cli, base.join("antigravity-cli")),
-            (SourceKind::App, base.join("antigravity")),
-            (SourceKind::Ide, base.join("antigravity-ide")),
-        ];
-        let mut out = Vec::new();
-        for (idx, (kind, dir)) in candidates.into_iter().enumerate() {
-            if idx == 0 || dir.join("brain").is_dir() {
-                out.push((kind, dir));
-            }
-        }
-        out
+        discover_default_sources(&SourceDiscoveryFilter::All)
+    }
+
+    /// Discovers only Antigravity family directories (CLI, 2.0 App, IDE) — used by `agy-statusline.exe`.
+    pub fn default_antigravity_dirs() -> Vec<(SourceKind, PathBuf)> {
+        discover_antigravity_sources()
+    }
+
+    /// Discovers local Tier-1 agent directories matching `filter` (`All`, `AgyOnly`, or `Families(...)`).
+    pub fn discover_data_dirs(filter: &SourceDiscoveryFilter) -> Vec<(SourceKind, PathBuf)> {
+        discover_default_sources(filter)
     }
 
     #[allow(dead_code)]
@@ -604,210 +739,72 @@ impl IncrementalScanner {
         self.budget.save(cfg)
     }
 
-    fn is_safe_regular_file(&mut self, src_idx: usize, path: &Path) -> Option<FileSig> {
-        let meta = fs::symlink_metadata(path).ok()?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            self.verified_paths.remove(path);
-            return None;
-        }
-        if !self.verified_paths.contains(path) {
-            if let Some(Some(root)) = self.canon_roots.get(src_idx) {
-                let canon = fs::canonicalize(path).ok()?;
-                if !canon.starts_with(root) {
-                    return None;
-                }
-            }
-            self.verified_paths.insert(path.to_path_buf());
-        }
-        let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-        Some(FileSig {
-            mtime_secs: mtime.as_secs(),
-            mtime_nanos: mtime.subsec_nanos(),
-            len: meta.len(),
-        })
+    pub fn with_session_meta(mut self, session_meta_path: Option<PathBuf>) -> Self {
+        self.session_meta = SessionMetaStore::new(session_meta_path);
+        self
     }
 
-    fn refresh_metadata_cache(&mut self, src_idx: usize) {
-        let root_dir = self.sources[src_idx].1.clone();
-        let path = root_dir.join("cache").join("conversation_metadata.json");
-        let Some(sig) = self.is_safe_regular_file(src_idx, &path) else {
-            self.meta_sigs.remove(&root_dir);
-            self.meta_caches.remove(&root_dir);
-            return;
-        };
-        if self.meta_sigs.get(&root_dir) == Some(&sig) {
-            return;
-        }
-        if let Ok(mut fh) = File::open(&path) {
-            let mut text = String::new();
-            if fh.read_to_string(&mut text).is_ok() {
-                self.meta_caches.insert(root_dir.clone(), parse_metadata_json(&text));
-                self.meta_sigs.insert(root_dir, sig);
-            }
-        }
+    pub fn toggle_session_pin(&mut self, cid: &str) -> Result<bool, String> {
+        self.session_meta.toggle_pin(cid)
     }
 
-    fn get_annotation_title(&mut self, src_idx: usize, cid: &str) -> String {
-        let path = self.sources[src_idx]
-            .1
-            .join("annotations")
-            .join(format!("{cid}.pbtxt"));
-        let Some(sig) = self.is_safe_regular_file(src_idx, &path) else {
-            self.ann_cache.remove(&path);
-            return String::new();
-        };
-        if let Some((cached_sig, title)) = self.ann_cache.get(&path) {
-            if *cached_sig == sig {
-                return title.clone();
-            }
-        }
-        let mut title = String::new();
-        if let Ok(mut fh) = File::open(&path) {
-            let mut text = String::new();
-            if fh.read_to_string(&mut text).is_ok() {
-                title = parse_pbtxt_title(&text);
-            }
-        }
-        self.ann_cache.insert(path, (sig, title.clone()));
-        title
+    pub fn set_session_pinned(&mut self, cid: &str, pinned: bool) -> Result<bool, String> {
+        self.session_meta.set_pinned(cid, pinned)
+    }
+
+    pub fn clear_session_meta(&mut self, cid: &str) -> Result<bool, String> {
+        self.session_meta.clear_entry(cid)
+    }
+
+    pub fn reload_session_meta(&mut self) -> bool {
+        self.session_meta.force_reload()
     }
 
     pub fn scan(&mut self) -> ScanSnapshot {
         let started = Instant::now();
+        let scan_now_utc = Utc::now();
         let pricing_changed = self.pricing.refresh();
         let statusline_changed = self.statusline.refresh();
         let budget_changed = self.budget.refresh();
+        let session_meta_changed = self.session_meta.refresh();
 
-        for i in 0..self.sources.len() {
-            if self.canon_roots[i].is_none() {
-                self.canon_roots[i] = fs::canonicalize(&self.sources[i].1).ok();
-            }
-        }
-
-        let mut sessions_by_id: HashMap<String, SessionInfo> = HashMap::new();
+        let mut sessions_by_key: HashMap<(AgentFamily, String), SessionInfo> = HashMap::new();
         let mut skipped_empty = 0usize;
         let mut skipped_lines = 0usize;
         let mut files_cached = 0usize;
         let mut files_reparsed = 0usize;
-        let mut seen_paths = BTreeSet::new();
-        let mut found_any_brain = false;
+        let mut found_any_root = false;
 
-        for src_idx in 0..self.sources.len() {
-            let (source_kind, root_dir) = self.sources[src_idx].clone();
-            let brain_dir = root_dir.join("brain");
-            if !brain_dir.is_dir() {
-                continue;
+        for adapter in &mut self.adapters {
+            let res = adapter.scan(scan_now_utc);
+            if res.found_root {
+                found_any_root = true;
             }
-            found_any_brain = true;
-            self.refresh_metadata_cache(src_idx);
+            skipped_empty += res.skipped_empty;
+            skipped_lines += res.skipped_lines;
+            files_cached += res.files_cached;
+            files_reparsed += res.files_reparsed;
 
-            let Ok(entries) = fs::read_dir(&brain_dir) else {
-                continue;
-            };
-            let mut conv_dirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    fs::symlink_metadata(p)
-                        .map(|m| !m.file_type().is_symlink() && m.is_dir())
-                        .unwrap_or(false)
-                })
-                .collect();
-            conv_dirs.sort();
-
-            for conv_dir in conv_dirs {
-                let Some(cid) = conv_dir.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
-                    continue;
-                };
-                let logs_dir = conv_dir.join(".system_generated").join("logs");
-                let primary = logs_dir.join("transcript.jsonl");
-                let fallback = logs_dir.join("transcript_full.jsonl");
-
-                let (t_path, sig) = if let Some(s) = self.is_safe_regular_file(src_idx, &primary) {
-                    (primary, s)
-                } else if let Some(s) = self.is_safe_regular_file(src_idx, &fallback) {
-                    (fallback, s)
-                } else {
-                    skipped_empty += 1;
-                    continue;
-                };
-
-                seen_paths.insert(t_path.clone());
-
-                let cached = if let Some(entry) = self.transcript_cache.get(&t_path) {
-                    if entry.sig == sig {
-                        files_cached += 1;
-                        entry.clone()
-                    } else {
-                        match parse_transcript_file(&t_path, sig) {
-                            Some(fresh) => {
-                                files_reparsed += 1;
-                                self.transcript_cache.insert(t_path.clone(), fresh.clone());
-                                fresh
-                            }
-                            None => continue,
-                        }
-                    }
-                } else {
-                    match parse_transcript_file(&t_path, sig) {
-                        Some(fresh) => {
-                            files_reparsed += 1;
-                            self.transcript_cache.insert(t_path.clone(), fresh.clone());
-                            fresh
-                        }
-                        None => continue,
-                    }
-                };
-
-                skipped_lines += cached.skipped_lines;
-                if cached.turns.is_empty() {
+            for parsed in res.sessions {
+                if parsed.turns.is_empty() {
                     skipped_empty += 1;
                     continue;
                 }
-
-                let ann_title = self.get_annotation_title(src_idx, &cid);
-                let meta = self.meta_caches.get(&root_dir).and_then(|m| m.get(&cid));
-                let is_subagent = match meta {
-                    Some(m) if m.is_internal => true,
-                    Some(_) => false,
-                    None => cached.subagent_parent_id.is_some(),
-                };
-                let parent_id = if is_subagent {
-                    cached.subagent_parent_id.clone().filter(|p| p != &cid)
-                } else {
-                    None
-                };
-                let title = if !ann_title.is_empty() {
-                    ann_title
-                } else if let Some(m) = meta.filter(|m| !m.title.is_empty()) {
-                    m.title.clone()
-                } else if let Some(m) = meta.filter(|m| !m.preview.is_empty()) {
-                    m.preview.clone()
-                } else if !cached.first_user_preview.is_empty() {
-                    cached.first_user_preview.clone()
-                } else if is_subagent && !cached.subagent_preview.is_empty() {
-                    cached.subagent_preview.clone()
-                } else if is_subagent {
-                    "(子会话)".to_string()
-                } else {
-                    "(未命名会话)".to_string()
-                };
-                let workspace = meta
-                    .filter(|m| !m.workspace.is_empty())
-                    .map(|m| m.workspace.clone())
-                    .unwrap_or_else(|| "(未知工作区)".to_string());
 
                 let mut counts = TokenCounts::default();
                 let mut models = BTreeSet::new();
                 let mut first_time: Option<DateTime<Local>> = None;
                 let mut last_time: Option<DateTime<Local>> = None;
 
-                let fallback_model = dominant_real_model(&cached.turns);
+                let fallback_model = dominant_real_model(&parsed.turns);
                 let mut last_real_model: Option<String> = None;
-                let mut priced_turns = cached.turns;
+                let mut priced_turns = parsed.turns;
 
                 for t in &mut priced_turns {
-                    let eff_model = if !t.is_checkpoint && !is_compaction_model(&t.model) && t.model != "unknown" {
+                    let eff_model = if !t.is_checkpoint
+                        && !is_compaction_model(&t.model)
+                        && t.model != "unknown"
+                    {
                         last_real_model = Some(t.model.clone());
                         t.model.as_str()
                     } else if !is_compaction_model(&t.model) && t.model != "unknown" {
@@ -818,14 +815,7 @@ impl IncrementalScanner {
                         fallback_model.as_deref().unwrap_or(t.model.as_str())
                     };
                     let local_date = t.timestamp_utc.map(|u| u.with_timezone(&Local).date_naive());
-                    t.cost = self.pricing.price_turn(
-                        eff_model,
-                        t.input_tokens,
-                        t.cache_read_tokens,
-                        t.cache_write_tokens,
-                        t.output_tokens,
-                        local_date,
-                    );
+                    t.cost = price_turn_record(&self.pricing, eff_model, t, local_date);
 
                     counts.add_call_with_cost(
                         t.input_tokens,
@@ -848,24 +838,29 @@ impl IncrementalScanner {
                     }
                 }
 
+                let family = parsed.source.agent_family();
+                let key = (family, parsed.conversation_id.clone());
                 let sess = SessionInfo {
-                    conversation_id: cid.clone(),
-                    title,
-                    workspace,
-                    source: source_kind,
+                    conversation_id: parsed.conversation_id,
+                    title: parsed.title,
+                    workspace: parsed.workspace,
+                    source: parsed.source,
                     is_archived: false,
-                    is_subagent,
-                    parent_id,
-                    parent_title: String::new(),
+                    is_subagent: parsed.is_subagent,
+                    parent_id: parsed.parent_id,
+                    parent_title: parsed.parent_title,
                     turns: priced_turns,
                     counts,
                     models,
                     first_time,
                     last_time,
+                    last_file_mtime_utc: parsed.last_file_mtime_utc,
+                    is_running_hint: parsed.is_running_hint,
                 };
 
-                // Deduplicate across multiple Antigravity dirs: keep session with more turns (or newer last_time).
-                let replace = match sessions_by_id.get(&cid) {
+                // Deduplicate within the same AgentFamily (e.g. Antigravity CLI/App/IDE sharing UUIDs):
+                // keep session with more turns (or newer last_time).
+                let replace = match sessions_by_key.get(&key) {
                     None => true,
                     Some(prev) => {
                         sess.turns.len() > prev.turns.len()
@@ -873,58 +868,55 @@ impl IncrementalScanner {
                     }
                 };
                 if replace {
-                    sessions_by_id.insert(cid, sess);
+                    sessions_by_key.insert(key, sess);
                 }
             }
         }
 
-        let mut sessions: Vec<SessionInfo> = sessions_by_id.into_values().collect();
+        let mut sessions: Vec<SessionInfo> = sessions_by_key.into_values().collect();
 
-        // Link subagent sessions to their parent session so they inherit workspace and parent title.
-        let parent_lookup: HashMap<String, (String, String)> = sessions
+        // Link subagent sessions to their parent within the SAME AgentFamily so they inherit
+        // workspace and parent title without ever cross-linking across different agents.
+        let parent_lookup: HashMap<(AgentFamily, String), (String, String)> = sessions
             .iter()
-            .map(|s| (s.conversation_id.clone(), (s.title.clone(), s.workspace.clone())))
+            .map(|s| {
+                (
+                    (s.source.agent_family(), s.conversation_id.clone()),
+                    (s.title.clone(), s.workspace.clone()),
+                )
+            })
             .collect();
         for s in &mut sessions {
             if !s.is_subagent {
                 continue;
             }
             let Some(pid) = s.parent_id.clone() else { continue };
-            let resolved = if let Some((ptitle, pws)) = parent_lookup.get(&pid) {
+            let family = s.source.agent_family();
+            let resolved = if let Some((ptitle, pws)) = parent_lookup.get(&(family, pid.clone())) {
                 Some((ptitle.clone(), pws.clone()))
             } else {
                 let mut found = None;
-                for src_idx in 0..self.sources.len() {
-                    let root_dir = self.sources[src_idx].1.clone();
-                    let p_ann = self.get_annotation_title(src_idx, &pid);
-                    let p_meta = self.meta_caches.get(&root_dir).and_then(|m| m.get(&pid));
-                    let ptitle = if !p_ann.is_empty() {
-                        p_ann
-                    } else if let Some(m) = p_meta.filter(|m| !m.title.is_empty()) {
-                        m.title.clone()
-                    } else if let Some(m) = p_meta.filter(|m| !m.preview.is_empty()) {
-                        m.preview.clone()
-                    } else {
-                        String::new()
-                    };
-                    let pws = p_meta
-                        .filter(|m| !m.workspace.is_empty())
-                        .map(|m| m.workspace.clone())
-                        .unwrap_or_default();
-                    if !ptitle.is_empty() || !pws.is_empty() {
-                        found = Some((ptitle, pws));
+                for adapter in &mut self.adapters {
+                    if adapter.kind().agent_family() != family {
+                        continue;
+                    }
+                    if let Some(hint) = adapter.lookup_session_hint(&pid) {
+                        found = Some(hint);
                         break;
                     }
                 }
                 found
             };
             if let Some((ptitle, pws)) = resolved {
-                if !ptitle.is_empty() {
+                if !ptitle.is_empty() && s.parent_title.is_empty() {
                     s.parent_title = ptitle.clone();
                 }
-                if (s.workspace.is_empty() || s.workspace == "(未知工作区)")
+                if (s.workspace.is_empty()
+                    || s.workspace == "(未知工作区)"
+                    || s.workspace == "(unknown)")
                     && !pws.is_empty()
                     && pws != "(未知工作区)"
+                    && pws != "(unknown)"
                 {
                     s.workspace = pws;
                 }
@@ -939,15 +931,9 @@ impl IncrementalScanner {
         let archived_sessions_count = archived_backfill.len();
         sessions.extend(archived_backfill);
 
-        self.transcript_cache.retain(|k, _| seen_paths.contains(k));
         sessions.sort_by(|a, b| b.last_time.cmp(&a.last_time));
 
         let agg = aggregate_sessions(&sessions);
-        let (active_block, mut all_blocks) = compute_billing_blocks(&sessions, Utc::now());
-        if all_blocks.len() > 24 {
-            let drain_n = all_blocks.len() - 24;
-            all_blocks.drain(0..drain_n);
-        }
 
         let today_local = Local::now().date_naive();
         let mut model_rate_labels = HashMap::new();
@@ -965,10 +951,24 @@ impl IncrementalScanner {
             }
         }
         let pricing_rows = self.pricing.build_table(&observed_names, today_local);
-        let warning = if !found_any_brain && archived_sessions_count == 0 {
-            Some(format!("未找到目录: {}", self.sources[0].1.join("brain").display()))
+        let warning = if !found_any_root && archived_sessions_count == 0 {
+            if self.sources.len() == 1
+                && self.sources[0].0.agent_family() == AgentFamily::Antigravity
+            {
+                Some(format!(
+                    "未找到目录: {}",
+                    self.sources[0].1.join("brain").display()
+                ))
+            } else {
+                Some(format!(
+                    "未找到可用的本地日志目录（已检查 {} 个来源）",
+                    self.sources.len()
+                ))
+            }
         } else if skipped_lines > 0 {
-            Some(format!("已跳过 {skipped_lines} 行未写完/异常 JSONL（活跃写入时属正常现象）"))
+            Some(format!(
+                "已跳过 {skipped_lines} 行未写完/异常 JSONL（活跃写入时属正常现象）"
+            ))
         } else {
             None
         };
@@ -978,13 +978,14 @@ impl IncrementalScanner {
             data_dirs: self.sources.clone(),
             sessions,
             agg,
-            active_block,
-            recent_blocks: all_blocks,
             statusline: self.statusline.snapshot().cloned(),
             statusline_changed,
             budget: self.budget.config(),
             budget_changed,
             budget_path: self.budget.path().map(Path::to_path_buf),
+            session_meta: self.session_meta.entries().clone(),
+            session_meta_changed,
+            session_meta_path: self.session_meta.path().map(Path::to_path_buf),
             archived_sessions_count,
             archive_enabled: self.archive.is_enabled(),
             archive_path: self.archive.path().map(Path::to_path_buf),
@@ -1094,6 +1095,8 @@ pub fn filter_snapshot_range(
                 models,
                 first_time,
                 last_time,
+                last_file_mtime_utc: s.last_file_mtime_utc,
+                is_running_hint: s.is_running_hint,
             });
         }
     }
@@ -1109,15 +1112,27 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
     for s in sessions {
         agg.total.merge(&s.counts);
         agg.total_active_secs = agg.total_active_secs.saturating_add(s.active_duration_secs());
-        let ws = agg.by_workspace.entry(s.workspace.clone()).or_insert((0, TokenCounts::default()));
+        let ws = agg
+            .by_workspace
+            .entry(s.workspace.clone())
+            .or_insert((0, TokenCounts::default()));
         ws.0 += 1;
         ws.1.merge(&s.counts);
-        let src = agg.by_source.entry(s.source).or_insert((0, TokenCounts::default()));
+        let src = agg
+            .by_source
+            .entry(s.source)
+            .or_insert((0, TokenCounts::default()));
         src.0 += 1;
         src.1.merge(&s.counts);
+        let ag = agg
+            .by_agent
+            .entry(s.source.agent_family())
+            .or_insert((0, TokenCounts::default()));
+        ag.0 += 1;
+        ag.1.merge(&s.counts);
 
         for (idx, t) in s.turns.iter().enumerate() {
-            if t.thinking_chars > 0 {
+            if t.has_thinking() {
                 agg.total_thinking_turns += 1;
             }
             for tool in &t.tool_names {
@@ -1138,16 +1153,19 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
             if t.output_tps().is_some() {
                 mcs.speed_calls += 1;
                 mcs.speed_output_tokens = mcs.speed_output_tokens.saturating_add(t.output_tokens);
-                mcs.speed_gen_secs = mcs.speed_gen_secs.saturating_add(t.gen_secs.unwrap_or(0) as u64);
+                mcs.speed_gen_secs =
+                    mcs.speed_gen_secs.saturating_add(t.gen_secs.unwrap_or(0) as u64);
             }
             if idx > 0 && !t.is_checkpoint {
                 let ctx = t.total_input();
                 mcs.multi_turn_calls += 1;
                 mcs.multi_turn_input = mcs.multi_turn_input.saturating_add(ctx);
-                mcs.multi_turn_cache_read = mcs.multi_turn_cache_read.saturating_add(t.cache_read_tokens);
+                mcs.multi_turn_cache_read =
+                    mcs.multi_turn_cache_read.saturating_add(t.cache_read_tokens);
                 if ctx >= 30_000 && t.cache_hit_rate() < 50.0 {
                     mcs.miss_count += 1;
-                    mcs.miss_uncached_tokens = mcs.miss_uncached_tokens.saturating_add(t.input_tokens);
+                    mcs.miss_uncached_tokens =
+                        mcs.miss_uncached_tokens.saturating_add(t.input_tokens);
                 }
             }
 
@@ -1212,18 +1230,19 @@ pub fn iso_week_key(d: NaiveDate) -> String {
     format!("{:04}-W{:02}", iso.year(), iso.week())
 }
 
+pub fn iso_week_bounds(week_key: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let (y_str, w_str) = week_key.split_once("-W")?;
+    let year = y_str.parse::<i32>().ok()?;
+    let week = w_str.parse::<u32>().ok()?;
+    let mon = NaiveDate::from_isoywd_opt(year, week, chrono::Weekday::Mon)?;
+    let sun = NaiveDate::from_isoywd_opt(year, week, chrono::Weekday::Sun)?;
+    Some((mon, sun))
+}
+
 pub fn iso_week_range_label(week_key: &str) -> String {
-    let Some((y_str, w_str)) = week_key.split_once("-W") else {
-        return week_key.to_string();
-    };
-    let (Ok(year), Ok(week)) = (y_str.parse::<i32>(), w_str.parse::<u32>()) else {
-        return week_key.to_string();
-    };
-    let mon = NaiveDate::from_isoywd_opt(year, week, chrono::Weekday::Mon);
-    let sun = NaiveDate::from_isoywd_opt(year, week, chrono::Weekday::Sun);
-    match (mon, sun) {
-        (Some(m), Some(s)) => format!("{}/{} - {}/{}", m.month(), m.day(), s.month(), s.day()),
-        _ => week_key.to_string(),
+    match iso_week_bounds(week_key) {
+        Some((m, s)) => format!("{}/{} - {}/{}", m.month(), m.day(), s.month(), s.day()),
+        None => week_key.to_string(),
     }
 }
 
@@ -1274,466 +1293,11 @@ pub fn fmt_num(v: u64, human: bool) -> String {
     }
 }
 
-fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> {
-    let fh = File::open(path).ok()?;
-    let mut reader = BufReader::with_capacity(64 * 1024, fh);
-    let mut by_step: BTreeMap<i64, TurnRecord> = BTreeMap::new();
-    let mut fallback_step: i64 = -1;
-    let mut seen_user_input = false;
-    let mut first_user_preview = String::new();
-    let mut subagent_parent_id: Option<String> = None;
-    let mut subagent_preview = String::new();
-    let mut skipped_lines = 0usize;
-    // created_at of GENERIC (tool execution) steps, keyed by step_index. Tool steps are created the
-    // moment the model streams out each tool call, so they bound when a response finished generating.
-    let mut generic_ts: HashMap<i64, DateTime<Utc>> = HashMap::new();
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let Ok(n) = reader.read_line(&mut line) else { break };
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((step, ts)) = parse_generic_step_header(trimmed) {
-            generic_ts.insert(step, ts);
-        }
-        // Fast path: skip full JSON DOM parsing for bulky tool-result / non-token lines
-        // that are syntactically framed as a JSON object and carry no token counters.
-        let need_preview = !seen_user_input && trimmed.contains("USER_INPUT");
-        let need_subagent_meta = !seen_user_input
-            && subagent_parent_id.is_none()
-            && subagent_preview.is_empty()
-            && trimmed.contains("SYSTEM_MESSAGE");
-        if trimmed.starts_with('{')
-            && trimmed.ends_with('}')
-            && !need_preview
-            && !need_subagent_meta
-            && !trimmed.contains("_tokens")
-        {
-            continue;
-        }
-        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
-            skipped_lines += 1;
-            continue;
-        };
-
-        let step_type = map.get("type").and_then(Value::as_str).unwrap_or("");
-        if step_type == "USER_INPUT" {
-            seen_user_input = true;
-            if first_user_preview.is_empty() {
-                if let Some(content) = map.get("content").and_then(Value::as_str) {
-                    first_user_preview = extract_user_preview(content);
-                }
-            }
-        } else if !seen_user_input
-            && subagent_parent_id.is_none()
-            && subagent_preview.is_empty()
-            && step_type == "SYSTEM_MESSAGE"
-        {
-            if let Some(content) = map.get("content").and_then(Value::as_str) {
-                let (pid, prev) = extract_subagent_meta(content);
-                subagent_parent_id = pid;
-                subagent_preview = prev;
-            }
-        }
-
-        let has_tokens = [
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_write_tokens",
-            "cache_creation_tokens",
-            "cache_creation_input_tokens",
-        ]
-        .iter()
-        .any(|k| map.get(*k).map(|v| !v.is_null()).unwrap_or(false));
-
-        if !has_tokens {
-            continue;
-        }
-
-        let input_tokens = val_to_u64(map.get("input_tokens"));
-        let cache_read_tokens = val_to_u64(map.get("cache_read_tokens"));
-        let cache_write_tokens = val_to_u64(
-            map.get("cache_write_tokens")
-                .or_else(|| map.get("cache_creation_tokens"))
-                .or_else(|| map.get("cache_creation_input_tokens")),
-        );
-        let output_tokens = val_to_u64(map.get("output_tokens"));
-        if input_tokens + cache_read_tokens + cache_write_tokens + output_tokens == 0 {
-            continue;
-        }
-
-        let timestamp_utc = map
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-            .map(|dt| dt.with_timezone(&Utc));
-
-        let is_checkpoint = step_type == "CHECKPOINT";
-        let model = map
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(if is_checkpoint { COMPACTION_MODEL_LABEL } else { "unknown" })
-            .to_string();
-
-        let step_index = match map.get("step_index").and_then(Value::as_i64) {
-            Some(s) => s,
-            None => {
-                let s = fallback_step;
-                fallback_step -= 1;
-                s
-            }
-        };
-
-        let tool_names: Vec<String> = map
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        item.as_object()
-                            .and_then(|o| o.get("name"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let thinking_chars = map
-            .get("thinking")
-            .and_then(Value::as_str)
-            .map(|s| s.chars().count() as u64)
-            .unwrap_or(0);
-
-        by_step.insert(
-            step_index,
-            TurnRecord {
-                step_index,
-                timestamp_utc,
-                model,
-                is_checkpoint,
-                input_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                output_tokens,
-                tool_names,
-                thinking_chars,
-                gen_secs: None,
-                cost: CostBreakdown::default(),
-            },
-        );
-    }
-
-    let mut turns: Vec<TurnRecord> = by_step.into_values().collect();
-    turns.sort_by_key(|t| (if t.step_index >= 0 { t.step_index } else { i64::MAX }, t.timestamp_utc));
-    for t in &mut turns {
-        t.gen_secs = estimate_gen_secs(t, &generic_ts);
-    }
-    if seen_user_input {
-        subagent_parent_id = None;
-        subagent_preview.clear();
-    }
-
-    Some(CachedTranscript {
-        sig,
-        turns,
-        first_user_preview,
-        subagent_parent_id,
-        subagent_preview,
-        skipped_lines,
-    })
-}
-
-/// Reads `step_index` + `created_at` from the fixed key header of a GENERIC step line
-/// (`{"step_index":N,"source":..,"type":"GENERIC","status":..,"created_at":"..",...}`) without
-/// parsing the (often huge) tool output that follows. Only the first 256 bytes are inspected and
-/// keys must appear before any `"content"` key, so tool output can never spoof the header.
-fn parse_generic_step_header(line: &str) -> Option<(i64, DateTime<Utc>)> {
-    let mut end = line.len().min(256);
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    let head = &line[..end];
-    let head = match head.find("\"content\"") {
-        Some(p) => &head[..p],
-        None => head,
-    };
-    if !head.starts_with("{\"step_index\":") || !head.contains("\"type\":\"GENERIC\"") {
-        return None;
-    }
-    let num: String = head["{\"step_index\":".len()..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    let step = num.parse::<i64>().ok()?;
-    let key = "\"created_at\":\"";
-    let start = head.find(key)? + key.len();
-    let rest = &head[start..];
-    let ts_str = &rest[..rest.find('"')?];
-    let ts = DateTime::parse_from_rfc3339(ts_str.trim()).ok()?.with_timezone(&Utc);
-    Some((step, ts))
-}
-
-/// Wall-clock generation time of a tool-calling response: from the response step's `created_at`
-/// (request start) to the latest `created_at` among the tool steps it spawned
-/// (`step+1 ..= step+n`). Includes time-to-first-token and thinking. Timestamps have 1 s
-/// resolution. Returns `None` for pure text replies (no end marker) or when any tool step is
-/// missing / not a GENERIC step (e.g. interleaved errors).
-fn estimate_gen_secs(t: &TurnRecord, generic_ts: &HashMap<i64, DateTime<Utc>>) -> Option<u32> {
-    if t.is_checkpoint || t.tool_names.is_empty() || t.step_index < 0 {
-        return None;
-    }
-    let start = t.timestamp_utc?;
-    let mut end = start;
-    for k in 1..=t.tool_names.len() as i64 {
-        let ts = *generic_ts.get(&(t.step_index + k))?;
-        end = end.max(ts);
-    }
-    let secs = (end - start).num_seconds();
-    (0..=3600).contains(&secs).then_some(secs as u32)
-}
-
-fn is_uuid_like(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.len() != 36 {
-        return false;
-    }
-    for (i, &ch) in b.iter().enumerate() {
-        if matches!(i, 8 | 13 | 18 | 23) {
-            if ch != b'-' {
-                return false;
-            }
-        } else if !ch.is_ascii_hexdigit() {
-            return false;
-        }
-    }
-    true
-}
-
-/// Parses subagent launcher system message:
-/// `[Message] timestamp=... sender=<parent-uuid> priority=... content=<task prompt>`
-fn extract_subagent_meta(content: &str) -> (Option<String>, String) {
-    let mut parent_id = None;
-    if let Some(pos) = content.find("sender=") {
-        let rest = &content[pos + "sender=".len()..];
-        let token = rest.split_whitespace().next().unwrap_or("");
-        if is_uuid_like(token) {
-            parent_id = Some(token.to_string());
-        }
-    }
-    let mut preview = String::new();
-    if let Some(pos) = content.find("content=") {
-        let body = &content[pos + "content=".len()..];
-        // Pick first meaningful non-empty line, strip markdown markers for crisp display.
-        for line in body.lines() {
-            let trimmed = line.trim().trim_start_matches('#').trim();
-            if trimmed.is_empty() || trimmed.starts_with("</SYSTEM_MESSAGE>") {
-                continue;
-            }
-            let cleaned_md = trimmed.replace("**", "").replace('`', "");
-            preview = clean_single_line(&cleaned_md, 72);
-            if !preview.is_empty() {
-                break;
-            }
-        }
-    }
-    (parent_id, preview)
-}
-
-fn val_to_u64(val: Option<&Value>) -> u64 {
-    match val {
-        Some(Value::Number(n)) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)).unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-fn extract_user_preview(content: &str) -> String {
-    let snippet = if let (Some(a), Some(b)) = (content.find("<USER_REQUEST>"), content.find("</USER_REQUEST>")) {
-        let start = a + "<USER_REQUEST>".len();
-        if start < b {
-            &content[start..b]
-        } else {
-            content
-        }
-    } else {
-        content
-    };
-    clean_single_line(snippet, 72)
-}
-
-fn clean_single_line(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    let mut prev_space = true;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-    }
-    let trimmed = out.trim();
-    if trimmed.chars().count() > max_chars {
-        let mut cut: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
-        cut.push('…');
-        cut
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn parse_metadata_json(text: &str) -> HashMap<String, CachedMetaEntry> {
-    let mut out = HashMap::new();
-    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(text) else {
-        return out;
-    };
-    let Some(Value::Object(convs)) = root.get("conversations") else {
-        return out;
-    };
-    for (cid, entry) in convs {
-        let is_internal = entry
-            .get("is_internal")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let summary = entry.get("summary").and_then(Value::as_object);
-        let title = summary
-            .and_then(|s| s.get("Title"))
-            .and_then(Value::as_str)
-            .map(|s| clean_single_line(s, 100))
-            .unwrap_or_default();
-        let preview = summary
-            .and_then(|s| s.get("Preview"))
-            .and_then(Value::as_str)
-            .map(|s| clean_single_line(s, 100))
-            .unwrap_or_default();
-        let workspace = summary
-            .and_then(|s| s.get("WorkspaceURIs"))
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(Value::as_str)
-            .map(decode_file_uri)
-            .unwrap_or_default();
-        if !is_internal && summary.is_none() {
-            continue;
-        }
-        out.insert(
-            cid.clone(),
-            CachedMetaEntry {
-                title,
-                preview,
-                workspace,
-                is_internal,
-            },
-        );
-    }
-    out
-}
-
-fn decode_file_uri(uri: &str) -> String {
-    let raw = if let Some(rest) = uri.strip_prefix("file:///") {
-        rest
-    } else if let Some(rest) = uri.strip_prefix("file://") {
-        rest
-    } else {
-        return uri.to_string();
-    };
-    let bytes = raw.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h1), Some(h2)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                decoded.push((h1 << 4) | h2);
-                i += 3;
-                continue;
-            }
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-pub fn parse_pbtxt_title(text: &str) -> String {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("title") else { continue };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix(':') else { continue };
-        let rest = rest.trim_start();
-        if let Some(quoted) = rest.strip_prefix('"') {
-            let mut out = Vec::new();
-            let b = quoted.as_bytes();
-            let mut i = 0;
-            while i < b.len() {
-                match b[i] {
-                    b'"' => break,
-                    b'\\' if i + 1 < b.len() => {
-                        i += 1;
-                        match b[i] {
-                            b'n' => { out.push(b' '); i += 1; }
-                            b'r' | b't' => { out.push(b' '); i += 1; }
-                            b'"' => { out.push(b'"'); i += 1; }
-                            b'\\' => { out.push(b'\\'); i += 1; }
-                            b'0'..=b'7' => {
-                                let mut val: u16 = 0;
-                                let mut cnt = 0;
-                                while i < b.len() && cnt < 3 && (b'0'..=b'7').contains(&b[i]) {
-                                    val = (val << 3) | (b[i] - b'0') as u16;
-                                    i += 1;
-                                    cnt += 1;
-                                }
-                                out.push((val & 0xFF) as u8);
-                            }
-                            b'x' if i + 2 < b.len() => {
-                                if let (Some(h1), Some(h2)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
-                                    out.push((h1 << 4) | h2);
-                                    i += 3;
-                                } else {
-                                    i += 1;
-                                }
-                            }
-                            other => { out.push(other); i += 1; }
-                        }
-                    }
-                    other => {
-                        out.push(other);
-                        i += 1;
-                    }
-                }
-            }
-            return clean_single_line(&String::from_utf8_lossy(&out), 100);
-        }
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::decode_file_uri;
+    use std::fs;
 
     #[test]
     fn test_pbtxt_unescape_octal_and_utf8() {
@@ -1758,6 +1322,117 @@ mod tests {
     }
 
     #[test]
+    fn test_source_kind_agent_family_and_path_inference() {
+        for (kind, s, fam, fam_lbl) in [
+            (SourceKind::Cli, "cli", AgentFamily::Antigravity, "Antigravity"),
+            (SourceKind::App, "app", AgentFamily::Antigravity, "Antigravity"),
+            (SourceKind::Ide, "ide", AgentFamily::Antigravity, "Antigravity"),
+            (SourceKind::ClaudeCode, "claude-code", AgentFamily::ClaudeCode, "Claude Code"),
+            (SourceKind::Codex, "codex", AgentFamily::Codex, "Codex CLI"),
+            (SourceKind::GeminiCli, "gemini-cli", AgentFamily::GeminiCli, "Gemini CLI"),
+            (SourceKind::Custom, "custom", AgentFamily::Antigravity, "Antigravity"),
+        ] {
+            assert_eq!(kind.as_str(), s);
+            assert_eq!(SourceKind::from_str_lossy(s), kind);
+            assert_eq!(kind.agent_family(), fam);
+            assert_eq!(kind.family_label(), fam_lbl);
+        }
+        assert_eq!(
+            SourceKind::infer_from_path(Path::new(r"C:\Users\alice\.claude")),
+            SourceKind::ClaudeCode
+        );
+        assert_eq!(
+            SourceKind::infer_from_path(Path::new(r"C:\Users\alice\.codex")),
+            SourceKind::Codex
+        );
+        assert_eq!(
+            SourceKind::infer_from_path(Path::new(r"C:\Users\alice\.gemini\tmp")),
+            SourceKind::GeminiCli
+        );
+        assert_eq!(
+            SourceKind::infer_from_path(Path::new(r"C:\Users\alice\.gemini\antigravity-cli")),
+            SourceKind::Cli
+        );
+    }
+
+    #[test]
+    fn test_reasoning_tokens_has_thinking_and_by_agent_aggregation() {
+        let mk_turn = |model: &str, cw: u64, cw1h: u64, out: u64, rt: u64, th: u64| TurnRecord {
+            step_index: 1,
+            timestamp_utc: None,
+            model: model.into(),
+            is_checkpoint: false,
+            input_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: cw,
+            cache_write_1h_tokens: cw1h,
+            output_tokens: out,
+            reasoning_tokens: rt,
+            tool_names: Vec::new(),
+            thinking_chars: th,
+            gen_secs: None,
+            cost: CostBreakdown::default(),
+        };
+
+        let t_codex = mk_turn("gpt-5", 0, 0, 800, 500, 0);
+        assert!(t_codex.has_thinking());
+        let t_plain = mk_turn("gpt-5", 0, 0, 200, 0, 0);
+        assert!(!t_plain.has_thinking());
+
+        // Claude 1h cache write pricing: 1M 5m @ $5.00 + 1M 1h @ $8.00 (2x $4.00 base) = $13.00 cache_write
+        let cat = PricingCatalog::new(None);
+        let t_claude = mk_turn("claude-opus-5-5", 2_000_000, 1_000_000, 0, 0, 0);
+        let c = price_turn_record(&cat, "claude-opus-5-5", &t_claude, None);
+        assert!((c.cache_write_usd - 13.0).abs() < 1e-6);
+
+        let mut s_agy = SessionInfo {
+            conversation_id: "same-id".into(),
+            title: "agy".into(),
+            workspace: String::new(),
+            source: SourceKind::Cli,
+            is_archived: false,
+            is_subagent: false,
+            parent_id: None,
+            parent_title: String::new(),
+            turns: vec![t_plain],
+            counts: TokenCounts::default(),
+            models: BTreeSet::new(),
+            first_time: None,
+            last_time: None,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
+        };
+        s_agy.counts.add_call(1_000, 0, 0, 200);
+
+        let mut s_codex = SessionInfo {
+            conversation_id: "same-id".into(),
+            title: "codex".into(),
+            workspace: String::new(),
+            source: SourceKind::Codex,
+            is_archived: false,
+            is_subagent: false,
+            parent_id: None,
+            parent_title: String::new(),
+            turns: vec![t_codex],
+            counts: TokenCounts::default(),
+            models: BTreeSet::new(),
+            first_time: None,
+            last_time: None,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
+        };
+        s_codex.counts.add_call(1_000, 0, 0, 800);
+
+        assert_eq!(s_codex.thinking_turns(), 1);
+        let agg = aggregate_sessions(&[s_agy, s_codex]);
+        assert_eq!(agg.total_thinking_turns, 1);
+        assert_eq!(agg.by_agent.len(), 2);
+        assert_eq!(agg.by_agent[&AgentFamily::Antigravity].0, 1);
+        assert_eq!(agg.by_agent[&AgentFamily::Codex].0, 1);
+        assert_eq!(agg.by_agent[&AgentFamily::Codex].1.output_tokens, 800);
+    }
+
+    #[test]
     fn test_primary_model_and_workspace_short() {
         let s = SessionInfo {
             conversation_id: "abc".into(),
@@ -1777,7 +1452,9 @@ mod tests {
                     input_tokens: 5_000,
                     cache_read_tokens: 500_000,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     output_tokens: 6_000,
+                    reasoning_tokens: 0,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
                     gen_secs: None,
@@ -1791,7 +1468,9 @@ mod tests {
                     input_tokens: 1_000,
                     cache_read_tokens: 100_000,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     output_tokens: 500,
+                    reasoning_tokens: 0,
                     tool_names: vec!["read_file".into()],
                     thinking_chars: 80,
                     gen_secs: None,
@@ -1805,7 +1484,9 @@ mod tests {
                     input_tokens: 500,
                     cache_read_tokens: 10_000,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     output_tokens: 200,
+                    reasoning_tokens: 0,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
                     gen_secs: None,
@@ -1816,6 +1497,8 @@ mod tests {
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
         };
         assert_eq!(s.primary_model(), "gemini-4-neon-xhigh");
         assert_eq!(s.workspace_short(), "agent-home");
@@ -1847,7 +1530,9 @@ mod tests {
                     input_tokens: 40_000,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     output_tokens: 500,
+                    reasoning_tokens: 0,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
                     gen_secs: None,
@@ -1862,7 +1547,9 @@ mod tests {
                     input_tokens: 2_000,
                     cache_read_tokens: 40_000,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     output_tokens: 500,
+                    reasoning_tokens: 0,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
                     gen_secs: None,
@@ -1877,7 +1564,9 @@ mod tests {
                     input_tokens: 180_000,
                     cache_read_tokens: 5_000,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     output_tokens: 800,
+                    reasoning_tokens: 0,
                     tool_names: Vec::new(),
                     thinking_chars: 0,
                     gen_secs: None,
@@ -1888,6 +1577,8 @@ mod tests {
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
         };
         assert_eq!(s.cache_miss_stats(), (1, 180_000));
         assert_eq!(s.latest_context(), 185_000);
@@ -1947,7 +1638,11 @@ mod tests {
     fn test_generation_time_and_speed_from_tool_step_timestamps() {
         let base = std::env::temp_dir().join(format!("agy_gauge_speed_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
-        let logs = base.join("brain").join("sess-s").join(".system_generated").join("logs");
+        let logs = base
+            .join("brain")
+            .join("sess-s")
+            .join(".system_generated")
+            .join("logs");
         fs::create_dir_all(&logs).unwrap();
         let jsonl = [
             // Step 1: 2 tool calls; tools stream out at +4 s and +10 s -> gen 10 s, 1000 out -> 100 tok/s
@@ -1982,10 +1677,6 @@ mod tests {
         assert_eq!(mcs.speed_calls, 1);
         assert_eq!(mcs.output_tps(), Some(100.0));
 
-        // Header parser ignores spoofed keys inside tool output and non-GENERIC steps
-        assert!(parse_generic_step_header(r#"{"step_index":3,"type":"USER_INPUT","created_at":"2026-11-22T01:00:10Z"}"#).is_none());
-        assert!(parse_generic_step_header(r#"{"step_index":3,"source":"MODEL","content":"\"type\":\"GENERIC\",\"created_at\":\"2026-11-22T01:00:10Z\""}"#).is_none());
-
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1995,8 +1686,16 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let parent_id = "8c1095e2-1558-4a06-bfde-446204f978aa";
         let child_id = "14ee4713-eb4d-4a3c-b6a9-6745e2e553e2";
-        let p_logs = base.join("brain").join(parent_id).join(".system_generated").join("logs");
-        let c_logs = base.join("brain").join(child_id).join(".system_generated").join("logs");
+        let p_logs = base
+            .join("brain")
+            .join(parent_id)
+            .join(".system_generated")
+            .join("logs");
+        let c_logs = base
+            .join("brain")
+            .join(child_id)
+            .join(".system_generated")
+            .join("logs");
         let cache = base.join("cache");
         fs::create_dir_all(&p_logs).unwrap();
         fs::create_dir_all(&c_logs).unwrap();
@@ -2028,10 +1727,18 @@ mod tests {
         let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None);
         let snap = scanner.scan();
         assert_eq!(snap.sessions.len(), 2);
-        let parent = snap.sessions.iter().find(|s| s.conversation_id == parent_id).unwrap();
+        let parent = snap
+            .sessions
+            .iter()
+            .find(|s| s.conversation_id == parent_id)
+            .unwrap();
         assert!(!parent.is_subagent);
         assert!(parent.parent_id.is_none());
-        let child = snap.sessions.iter().find(|s| s.conversation_id == child_id).unwrap();
+        let child = snap
+            .sessions
+            .iter()
+            .find(|s| s.conversation_id == child_id)
+            .unwrap();
         assert!(child.is_subagent);
         assert_eq!(child.parent_id.as_deref(), Some(parent_id));
         assert_eq!(child.parent_title, "Subvault Review");
@@ -2039,7 +1746,14 @@ mod tests {
         assert_eq!(child.title, "You are executing Wave 2 · Track A for SubVault.");
         // Child's tokens are aggregated under the inherited parent workspace, not "(未知工作区)"
         assert!(!snap.agg.by_workspace.contains_key("(未知工作区)"));
-        assert_eq!(snap.agg.by_workspace.get("C:/Users/qingz/agent-home").unwrap().0, 2);
+        assert_eq!(
+            snap.agg
+                .by_workspace
+                .get("C:/Users/qingz/agent-home")
+                .unwrap()
+                .0,
+            2
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2050,8 +1764,16 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let cli_dir = base.join("antigravity-cli");
         let app_dir = base.join("antigravity");
-        let s1_logs = cli_dir.join("brain").join("sess-cli").join(".system_generated").join("logs");
-        let s2_logs = app_dir.join("brain").join("sess-app").join(".system_generated").join("logs");
+        let s1_logs = cli_dir
+            .join("brain")
+            .join("sess-cli")
+            .join(".system_generated")
+            .join("logs");
+        let s2_logs = app_dir
+            .join("brain")
+            .join("sess-app")
+            .join(".system_generated")
+            .join("logs");
         fs::create_dir_all(&s1_logs).unwrap();
         fs::create_dir_all(&s2_logs).unwrap();
 
@@ -2081,19 +1803,102 @@ mod tests {
         let snap = scanner.scan();
         assert_eq!(snap.sessions.len(), 2);
         assert_eq!(snap.agg.by_source.len(), 2);
+        assert_eq!(snap.agg.by_agent.len(), 1);
+        assert_eq!(snap.agg.by_agent[&AgentFamily::Antigravity].0, 2);
+        assert!(!snap.has_non_antigravity());
         assert_eq!(snap.agg.by_tool.get("read_file"), Some(&2));
         assert_eq!(snap.agg.by_tool.get("run_command"), Some(&1));
         assert_eq!(snap.agg.total_thinking_turns, 1);
 
-        let cli_s = snap.sessions.iter().find(|s| s.conversation_id == "sess-cli").unwrap();
+        let cli_s = snap
+            .sessions
+            .iter()
+            .find(|s| s.conversation_id == "sess-cli")
+            .unwrap();
         assert_eq!(cli_s.source, SourceKind::Cli);
         assert_eq!(cli_s.active_duration_secs(), 120);
 
         let d_only = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
-        let (filtered, f_agg) = filter_snapshot_range(&snap, DateScope::Custom, Some(d_only), Some(d_only));
+        let (filtered, f_agg) =
+            filter_snapshot_range(&snap, DateScope::Custom, Some(d_only), Some(d_only));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].conversation_id, "sess-cli");
         assert_eq!(f_agg.by_tool.get("read_file"), Some(&2));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_compute_running_hint_thresholds() {
+        let now = DateTime::parse_from_rfc3339("2026-11-24T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t_30s = now - chrono::Duration::seconds(30);
+        let t_120s = now - chrono::Duration::seconds(120);
+        let t_300s = now - chrono::Duration::seconds(300);
+
+        assert!(compute_running_hint(true, Some(t_30s), now));
+        assert!(compute_running_hint(false, Some(t_30s), now)); // within ACTIVE_MTIME_WINDOW_SECS
+        assert!(compute_running_hint(true, Some(t_120s), now)); // RUNNING within RUNNING_STEP_STALE_SECS
+        assert!(!compute_running_hint(false, Some(t_120s), now));
+        assert!(!compute_running_hint(true, Some(t_300s), now)); // crashed/stale RUNNING > 180s
+        assert!(!compute_running_hint(true, None, now));
+    }
+
+    #[test]
+    fn test_scanner_running_hint_before_fast_path_and_session_meta_integration() {
+        let base =
+            std::env::temp_dir().join(format!("agy_gauge_meta_run_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let cid = "99999999-aaaa-bbbb-cccc-000000000001";
+        let logs = base
+            .join("brain")
+            .join(cid)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+
+        // Trailing GENERIC line has NO `_tokens` (skipped by fast-path) and `status: RUNNING`
+        let jsonl = [
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-24T04:00:00Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":2000,"output_tokens":300,"tool_calls":[{"name":"run_command"}]}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-11-24T04:00:05Z","content":"running tool"}"#,
+        ]
+        .join("\n");
+        let t_path = logs.join("transcript.jsonl");
+        fs::write(&t_path, format!("{jsonl}\n")).unwrap();
+
+        let meta_path = base.join("session_meta.json");
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None)
+            .with_session_meta(Some(meta_path.clone()));
+
+        let snap1 = scanner.scan();
+        assert_eq!(snap1.sessions.len(), 1);
+        assert!(snap1.sessions[0].last_file_mtime_utc.is_some());
+        assert!(snap1.sessions[0].is_running_hint);
+        assert!(snap1.session_meta.is_empty());
+        assert!(!snap1.session_meta_changed);
+        assert_eq!(snap1.session_meta_path.as_deref(), Some(meta_path.as_path()));
+
+        // Second scan hits incremental file cache cleanly
+        let snap_cached = scanner.scan();
+        assert_eq!(snap_cached.files_cached, 1);
+        assert_eq!(snap_cached.files_reparsed, 0);
+
+        // Toggle pin via scanner helper -> next scan exposes updated session_meta & changed flag
+        assert!(scanner.toggle_session_pin(cid).unwrap());
+        let snap2 = scanner.scan();
+        assert!(snap2.session_meta_changed);
+        assert!(snap2.session_meta.get(cid).is_some_and(|m| m.pinned));
+
+        // Subsequent scan with no changes reports session_meta_changed == false
+        let snap3 = scanner.scan();
+        assert!(!snap3.session_meta_changed);
+
+        // Unpin auto-GCs the entry
+        assert!(!scanner.toggle_session_pin(cid).unwrap());
+        let snap4 = scanner.scan();
+        assert!(snap4.session_meta_changed);
+        assert!(snap4.session_meta.is_empty());
 
         let _ = fs::remove_dir_all(&base);
     }

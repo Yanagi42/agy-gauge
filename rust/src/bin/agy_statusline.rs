@@ -49,8 +49,6 @@ fn render_statusline(
     today_tokens: u64,
     today_usd: f64,
     today_calls: u64,
-    block_usd: Option<f64>,
-    block_rem_secs: Option<i64>,
     compact: bool,
     color: bool,
     term_width: usize,
@@ -99,16 +97,6 @@ fn render_statusline(
                 };
                 parts.push(ansi(&seg, col, color));
             }
-        }
-    }
-
-    if let (Some(b_usd), Some(b_rem)) = (block_usd, block_rem_secs) {
-        if !compact && term_width >= 100 {
-            parts.push(ansi(
-                &format!("5h ${:.2} ({})", b_usd, fmt_countdown(b_rem)),
-                "33",
-                color,
-            ));
         }
     }
 
@@ -195,11 +183,11 @@ fn main() {
         let _ = save_statusline_state(path, snap);
     }
 
-    let (today_tokens, today_usd, today_calls, block_usd, block_rem) = if skip_scan {
-        (0, 0.0, 0, None, None)
+    let (today_tokens, today_usd, today_calls) = if skip_scan {
+        (0, 0.0, 0)
     } else {
         let mut scanner = IncrementalScanner::new_multi(
-            IncrementalScanner::default_data_dirs(),
+            IncrementalScanner::default_antigravity_dirs(),
             PricingCatalog::default_override_path(),
             None,
             BudgetStore::default_path(),
@@ -210,17 +198,7 @@ fn main() {
         let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
         let tc = snap.agg.by_day.get(&today_key).copied().unwrap_or_default();
         let _ = fmt_cost_compact(&tc.cost, tc.calls);
-        let (b_usd, b_rem) = match snap.active_block {
-            Some(b) => (Some(b.counts.cost.total_usd()), Some(b.remaining_secs)),
-            None => (None, None),
-        };
-        (
-            tc.total_tokens(),
-            tc.cost.total_usd(),
-            tc.calls,
-            b_usd,
-            b_rem,
-        )
+        (tc.total_tokens(), tc.cost.total_usd(), tc.calls)
     };
 
     let line = render_statusline(
@@ -228,8 +206,6 @@ fn main() {
         today_tokens,
         today_usd,
         today_calls,
-        block_usd,
-        block_rem,
         compact,
         !no_color,
         term_width,
@@ -254,7 +230,7 @@ mod tests {
             }
         }"#;
         let snap = parse_statusline_payload(raw, now).unwrap();
-        let out = render_statusline(Some(&snap), 1_500_000, 2.35, 12, Some(1.2), Some(5400), false, false, 120);
+        let out = render_statusline(Some(&snap), 1_500_000, 2.35, 12, false, false, 120);
         assert!(out.contains("Gemini 4 Neon"));
         assert!(out.contains("Ctx 35%"));
         assert!(out.contains("Gemini 5h 72%"));

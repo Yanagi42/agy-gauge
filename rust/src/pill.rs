@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Direct2D::ID2D1RenderTarget;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu,
-    MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON,
 };
 
 use crate::d2d::{
@@ -24,14 +24,13 @@ use crate::d2d::{
     D2DFactories, Fonts, LayeredSurface, Theme,
 };
 use crate::pricing::fmt_cost_compact;
-use crate::quota::{fmt_countdown, AlertSeverity, QuotaProvenance};
+use crate::quota::{AlertSeverity, QuotaProvenance};
 use crate::stats::{fmt_compact, iso_week_key, ScanSnapshot, TokenCounts};
 use crate::telemetry::{
     clamp_pos_to_work_area, compute_tray_flyout_pos, get_monitors, get_work_area,
     monitor_index_for_point, to_wide_null, wide_pcwstr, SystemTelemetry, PILL_ITEMS_ALL_MASK,
-    PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX, PILL_ITEM_BLOCK_5H, PILL_ITEM_CACHE_HIT,
-    PILL_ITEM_COST, PILL_ITEM_CPU, PILL_ITEM_NON_CACHED, PILL_ITEM_QUOTA, PILL_ITEM_RAM,
-    PILL_ITEM_TOTAL,
+    PILL_ITEMS_DEFAULT, PILL_ITEM_ACTIVE_CTX, PILL_ITEM_CACHE_HIT, PILL_ITEM_COST, PILL_ITEM_CPU,
+    PILL_ITEM_NON_CACHED, PILL_ITEM_QUOTA, PILL_ITEM_RAM, PILL_ITEM_TOTAL,
 };
 
 pub const CMD_OPEN_DETAIL: u32 = 1001;
@@ -47,9 +46,17 @@ pub const CMD_TOGGLE_NOTIFICATIONS: u32 = 1010;
 pub const CMD_TOGGLE_HIDE_FULLSCREEN: u32 = 1011;
 pub const CMD_TOGGLE_AUTOSTART: u32 = 1012;
 pub const CMD_TOGGLE_TRAY_HOVER: u32 = 1013;
+pub const CMD_OPEN_SESSIONS_TAB: u32 = 1014;
 pub const CMD_MONITOR_BASE: u32 = 1100;
 pub const CMD_PILL_ITEM_BASE: u32 = 1200; // 1200..1208 -> bit 0..8
 pub const CMD_PILL_ITEMS_RESET: u32 = 1210;
+pub const CMD_QUICK_RESUME_BASE: u32 = 1300; // 1300..1304 -> top 5 resumable CLI sessions
+
+#[derive(Debug, Clone)]
+pub struct QuickSessionMenuItem {
+    pub conversation_id: String,
+    pub label: String,
+}
 
 const SHADOW_PAD: f32 = 10.0;
 const PILL_H_STD: f32 = 30.0;
@@ -147,7 +154,6 @@ impl PillRenderer {
 
         let alerts = crate::quota::evaluate_alerts(
             &snapshot.budget,
-            snapshot.active_block.as_ref(),
             &today_key,
             today_c.cost.total_usd(),
             &week_key,
@@ -161,7 +167,11 @@ impl PillRenderer {
             .max()
             .unwrap_or(AlertSeverity::Normal);
 
-        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(7);
+        let show_cpu = (items & PILL_ITEM_CPU) != 0;
+        let show_ram = (items & PILL_ITEM_RAM) != 0;
+        let has_sys = show_cpu || show_ram;
+
+        let mut segs: Vec<PillTokenSeg> = Vec::with_capacity(6);
         let mut ctx_warn = false;
 
         if (items & PILL_ITEM_TOTAL) != 0 {
@@ -193,59 +203,31 @@ impl PillRenderer {
             segs.push(PillTokenSeg { text, width, color });
         }
         if (items & PILL_ITEM_QUOTA) != 0 {
-            let (text, color) = if let Some(sl) = snapshot
+            let official_seg = snapshot
                 .statusline
                 .as_ref()
                 .filter(|s| s.provenance(now_utc) != QuotaProvenance::LocalEstimate)
-            {
-                if let Some(b) = sl.tightest_bucket() {
-                    if let Some(rem_pct) = b.remaining_pct() {
-                        let sev = snapshot.budget.classify_quota_remaining(rem_pct);
-                        let c = match sev {
-                            AlertSeverity::Critical => theme.danger,
-                            AlertSeverity::Warn => theme.warn,
-                            AlertSeverity::Normal => theme.sage,
-                        };
-                        (format!("Q {:.0}%", rem_pct), c)
-                    } else {
-                        ("Q --".to_string(), theme.muted)
-                    }
-                } else {
-                    ("Q --".to_string(), theme.muted)
-                }
-            } else if let Some(blk) = snapshot.active_block.as_ref() {
-                (format!("5h {}", fmt_countdown(blk.remaining_secs)), theme.sub)
-            } else {
-                ("Q --".to_string(), theme.muted)
-            };
-            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(28.0) + 2.0;
-            segs.push(PillTokenSeg { text, width, color });
-        }
-        if (items & PILL_ITEM_BLOCK_5H) != 0 {
-            let (text, color) = if let Some(blk) = snapshot.active_block.as_ref() {
-                let b_sev = if snapshot.budget.block_5h_usd > 0.0 {
-                    snapshot
-                        .budget
-                        .classify_usage_pct((blk.counts.cost.total_usd() / snapshot.budget.block_5h_usd) * 100.0)
-                } else {
-                    AlertSeverity::Normal
-                };
-                let c = match b_sev {
-                    AlertSeverity::Critical => theme.danger,
-                    AlertSeverity::Warn => theme.warn,
-                    AlertSeverity::Normal => if segs.is_empty() { theme.text } else { theme.output },
-                };
-                let txt = if blk.counts.cost.total_usd() > 0.0 {
-                    format!("5h {}", fmt_cost_compact(&blk.counts.cost, blk.counts.calls))
-                } else {
-                    format!("5h {}", fmt_compact(blk.counts.total_tokens()))
-                };
-                (txt, c)
-            } else {
-                ("5h 空闲".to_string(), theme.muted)
-            };
-            let width = factories.measure_text_width(&text, &fonts.pill_tok).max(32.0) + 2.0;
-            segs.push(PillTokenSeg { text, width, color });
+                .and_then(|sl| sl.tightest_bucket())
+                .and_then(|b| b.remaining_pct())
+                .map(|rem_pct| {
+                    let sev = snapshot.budget.classify_quota_remaining(rem_pct);
+                    let c = match sev {
+                        AlertSeverity::Critical => theme.danger,
+                        AlertSeverity::Warn => theme.warn,
+                        AlertSeverity::Normal => theme.sage,
+                    };
+                    (format!("Q {:.0}%", rem_pct), c)
+                });
+            // Only show the official quota segment when `/statusline` reports active buckets;
+            // fall back to a quiet `Q --` placeholder only if it is the sole enabled pill item.
+            let maybe_seg = official_seg.or_else(|| {
+                let only_quota_enabled = (items & !PILL_ITEM_QUOTA) == 0 && !has_sys;
+                only_quota_enabled.then(|| ("Q --".to_string(), theme.muted))
+            });
+            if let Some((text, color)) = maybe_seg {
+                let width = factories.measure_text_width(&text, &fonts.pill_tok).max(28.0) + 2.0;
+                segs.push(PillTokenSeg { text, width, color });
+            }
         }
         if (items & PILL_ITEM_NON_CACHED) != 0 {
             let text = format!("Δ{}", fmt_compact(today_c.non_cached_tokens()));
@@ -280,10 +262,6 @@ impl PillRenderer {
             };
             segs.push(PillTokenSeg { text, width, color });
         }
-
-        let show_cpu = (items & PILL_ITEM_CPU) != 0;
-        let show_ram = (items & PILL_ITEM_RAM) != 0;
-        let has_sys = show_cpu || show_ram;
 
         let mut content_w = 23.0; // Left dot zone
         for (i, seg) in segs.iter().enumerate() {
@@ -569,6 +547,7 @@ pub fn show_context_menu(
     autostart_enabled: bool,
     current_monitor: usize,
     pill_items: u32,
+    quick_sessions: &[QuickSessionMenuItem],
 ) -> Option<u32> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
@@ -578,6 +557,29 @@ pub fn show_context_menu(
             CMD_OPEN_DETAIL as usize,
             if dash_open { w!("关闭详细统计") } else { w!("打开详细统计") },
         );
+
+        let mut quick_menu = None;
+        if let Ok(qm) = CreatePopupMenu() {
+            if privacy_mode {
+                let _ = AppendMenuW(qm, MF_STRING | MF_GRAYED, 0, w!("脱敏模式已隐藏"));
+            } else if quick_sessions.is_empty() {
+                let _ = AppendMenuW(qm, MF_STRING | MF_GRAYED, 0, w!("暂无可继续的 CLI 会话"));
+            } else {
+                for (idx, item) in quick_sessions.iter().take(5).enumerate() {
+                    let wide = to_wide_null(&item.label);
+                    let _ = AppendMenuW(
+                        qm,
+                        MF_STRING,
+                        (CMD_QUICK_RESUME_BASE as usize) + idx,
+                        wide_pcwstr(&wide),
+                    );
+                }
+            }
+            let _ = AppendMenuW(qm, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(qm, MF_STRING, CMD_OPEN_SESSIONS_TAB as usize, w!("打开会话管理…"));
+            let _ = AppendMenuW(menu, MF_POPUP, qm.0 as usize, w!("最近会话"));
+            quick_menu = Some(qm);
+        }
         let _ = AppendMenuW(
             menu,
             MF_STRING | if tray_hover_mode { MF_CHECKED } else { MF_UNCHECKED },
@@ -604,8 +606,7 @@ pub fn show_context_menu(
             for (bit_idx, bit, lbl) in [
                 (0usize, PILL_ITEM_TOTAL, w!("今日总 Token")),
                 (6usize, PILL_ITEM_COST, w!("今日估算费用 ($)")),
-                (8usize, PILL_ITEM_QUOTA, w!("官方配额 / 5h 倒计时 (Q)")),
-                (7usize, PILL_ITEM_BLOCK_5H, w!("5h 滚动窗口用量 (5h)")),
+                (8usize, PILL_ITEM_QUOTA, w!("官方配额 (Q · AGY)")),
                 (1usize, PILL_ITEM_NON_CACHED, w!("今日非缓存增量 (Δ)")),
                 (2usize, PILL_ITEM_CACHE_HIT, w!("今日缓存命中率 (%)")),
                 (3usize, PILL_ITEM_ACTIVE_CTX, w!("活跃会话上下文 (Ctx)")),
@@ -705,6 +706,9 @@ pub fn show_context_menu(
         }
         if let Some(im) = items_menu {
             let _ = DestroyMenu(im);
+        }
+        if let Some(qm) = quick_menu {
+            let _ = DestroyMenu(qm);
         }
         let _ = DestroyMenu(menu);
         if cmd.0 != 0 {

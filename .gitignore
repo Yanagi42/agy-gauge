@@ -7,6 +7,7 @@ statusline_state.json
 budget.json
 archive.json
 pricing.json
+session_meta.json
 
 # Python caches
 __pycache__/

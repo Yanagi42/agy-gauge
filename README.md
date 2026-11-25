@@ -1,53 +1,58 @@
 # agy-gauge
 
-一个**严格只读、极轻量、零联网**的 Antigravity（`agy` CLI / App / IDE）本地 Token 用量、API 费用估算（USD）、官方 `/statusline` 配额桥接与系统负载仪表盘（Windows）：
+一个**严格只读、极轻量、零联网**的多 Agent 本地 Token 用量、API 费用估算（USD）、官方 `/statusline` 配额桥接与系统负载仪表盘（Windows），原生聚合 **Antigravity（`agy` CLI / App / IDE）+ Claude Code + OpenAI Codex CLI + Gemini CLI**：
 
-- **Rust + Direct2D 桌面悬浮版**（`agy-token-monitor.exe`）：右下角逐像素抗锯齿毛玻璃胶囊 + Windows 系统托盘常驻 + 即时详情面板（进程内复用增量扫描缓存与 90 秒系统负载历史）。
-- **Rust 原生 `/statusline` 桥接器**（`agy-statusline.exe` / `agy-statusline.cmd`）：遵循 Antigravity 官方 `statusLine` 命令协议（启动与渲染耗时 < 10ms），在终端底部显示紧凑状态栏的同时，把脱敏后的官方剩余配额与重置倒计时同步给桌面版与 CLI。
-- **Python 零依赖命令行版**（`agy_token_stats.py`）：100% 严格只读（单元测试通过 AST 静态约束验证），支持表格 / 单行摘要 / JSON / CSV 统计、5h 账单块、工具分布与预算退出码检查。
+- **Rust + Direct2D 桌面悬浮版**（`agy-token-monitor.exe`）：右下角逐像素抗锯齿毛玻璃胶囊 + Windows 系统托盘常驻 + 即时详情面板（进程内复用增量扫描缓存与 90 秒系统负载历史），默认自动发现本机已安装的全部 Tier-1 纯文本 Agent。
+- **Rust 原生 `/statusline` 桥接器**（`agy-statusline.exe` / `agy-statusline.cmd`）：遵循 Antigravity 官方 `statusLine` 命令协议（仅扫描 Antigravity 目录以保持启动与渲染耗时 < 10ms），在终端底部显示紧凑状态栏的同时，把脱敏后的 Antigravity 官方剩余配额与重置倒计时同步给桌面版与 CLI。
+- **Python 零依赖命令行版**（`agy_token_stats.py`）：100% 严格只读（单元测试通过 AST 静态约束验证，零文件写操作、零 `sqlite3`、零网络模块），支持多 Agent 聚合与过滤、表格 / 单行摘要 / JSON / CSV 统计、来源分布与预算退出码检查。
 
 ## 桌面版特性
 
-- **双编辑级主题**：内置 **暖炭黑（Obsidian）** 与 **浅色纸感（Warm Paper）** 两套克制配色，自动调用 `Segoe UI Variable` / `Maple Mono` / `JetBrains Mono`，支持一键切换并同步 Win11 标题栏。
-- **官方 `/statusline` 合规配额桥接 + 5h 滚动账单块**：
-  - 概览页内置「**额度 / 5h | 本周同比**」卡片，实时显示当前 5 小时滚动账单块（消耗、烧钱/烧 Token 速率、窗口结束预测与重置倒计时）及 Pace 进度条（对比用量进度与时间进度）。
-  - 接入 `agy-statusline.exe` 后自动热读本地 `statusline_state.json`，清晰标注数据来源（`官方实时` / `官方缓存` / `本地估算`），全程零账号凭证读取、零未公开接口请求。
-  - 面板内提供一键「复制 `/statusline` 配置」，粘贴进 `agy` 的 `settings.json` 即可启用。
-- **预算阈值与托盘气球预警（`budget.json`）**：
-  - 在「模型 → 预算 / 桥接」（快捷键 `B`）中可设置 **5h / 每日 / 每周美元预算** 与 **预警 / 临界百分比**，保存至程序目录 `budget.json`。
-  - 达到预警/临界阈值或官方剩余配额过低时，悬浮胶囊数值与状态点自动切换警示色，并弹出按窗口去重的 Windows 托盘气球提醒（右键菜单可开关）。
+- **多 Agent 纯文本聚合 + 轻量归档（`archive.json`）**：
+  - 默认自动只读发现并汇总本机已安装的 **Antigravity（CLI / App / IDE）**、**Claude Code**、**OpenAI Codex CLI** 与 **Gemini CLI** 会话日志（可用 `--agy-only` 或 `--agents claude,codex` 过滤）。
+  - 仅存在 Antigravity 日志时保持原有简洁风格（仅标注 `[App]` / `[IDE]`）；当检测到非 Antigravity 来源时，在概览最近会话、会话列表、会话详情、调用记录与托盘快捷恢复菜单中展示克制的单色来源前缀 `[AGY]` / `[App]` / `[IDE]` / `[Claude]` / `[Codex]` / `[Gemini]`。
+  - 扫描后自动将轻量轮次摘要持久化到程序同目录 `archive.json`（按 Agent 家族隔离键值，避免跨 Agent ID 冲突）；当历史目录被清理时自动回填并标示 `[归档]`，活文件始终优先覆盖、零重复计数（`--no-archive` 可禁用）。
+- **多 Agent 终端会话恢复与置顶管理**：
+  - 支持在会话详情顶栏、会话右键菜单与托盘「最近会话」子菜单一键恢复终端会话或复制恢复命令，按来源自动分派对应 CLI：
+    - Antigravity CLI：`agy --conversation <id>`
+    - Claude Code：`claude --resume <id>`
+    - OpenAI Codex CLI：`codex resume <id>`
+    - Gemini CLI：`gemini --resume <id>`
+  - 自动解析 `.exe` / `.cmd` / `.bat`（兼容 Windows npm `.cmd` shim）并校验会话 ID 白名单；子会话自动按同 Agent 家族关联父会话，支持跳转或直接恢复父会话；桌面 App / IDE 与归档会话清晰给出原因提示。
+  - 支持跨时间范围置顶会话（持久化于程序同目录 `session_meta.json`，不污染统计汇总与导出）。
+- **双编辑级主题**：内置 **暖炭黑（Obsidian）** 与 **浅色纸感（Warm Paper）** 两套克制配色（零霓虹高亮），自动调用 `Segoe UI Variable` / `Maple Mono` / `JetBrains Mono`，支持一键切换并同步 Win11 标题栏。
+- **Antigravity 官方 `/statusline` 桥接 + 全源预算预警（`budget.json`）**：
+  - **边界清晰**：`/statusline` 仅桥接 **Antigravity CLI（`agy`）** 官方剩余配额与重置倒计时；而 **每日 / 每周美元预算** 与悬浮胶囊/顶栏统计**自动汇总全部已发现 Agent**。
+  - 接入 `agy-statusline.exe` 后自动热读本地 `statusline_state.json`，清晰标注数据来源（`官方实时` / `官方缓存` / `本地估算`），全程零账号凭证读取、零未公开接口请求；面板内提供一键「复制 `/statusline` 配置」。
+  - 在「模型 → 预算 / 桥接」（快捷键 `B`）中可设置每日 / 每周美元预算与预警/临界百分比，保存至程序目录 `budget.json`；触发阈值或官方配额偏低时，胶囊与托盘图标自动切换警示色并按窗口去重弹出系统通知。
 - **系统托盘、托盘悬停模式、全屏自动隐藏与开机自启**：
-  - 常驻 Windows 系统托盘（左键切换详情面板，右键打开统一菜单，Explorer 重启自动恢复图标），默认悬停显示今日用量、5h 窗口与官方配额摘要。
-  - **托盘悬停模式（右键菜单勾选或 `--tray-hover`）**：胶囊不再常占屏幕空间；开启时自动将托盘图标固定展示在任务栏右下角（写入当前用户 `HKCU\Control Panel\NotifyIconSettings` 的 `IsPromoted=1`，不收进 `^` 折叠区，像输入法图标一样常驻状态栏），切换回常驻悬浮胶囊时自动收回到 `^` 折叠区（`IsPromoted=0`，右下角任务栏不再额外显示图标）；鼠标悬停即在任务栏上方偏右位置（与屏幕右边和任务栏留出适度呼吸间距）浮出实时毛玻璃胶囊，点击图标或胶囊即时打开/关闭详情面板。
-  - 支持「隐藏悬浮胶囊」仅保留托盘后台监控、「全屏应用自动隐藏胶囊」（通过 `SHQueryUserNotificationState` 检测游戏/演示全屏）以及免提权开机自启（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgyGauge`）。
-- **Antigravity 多端聚合 + 本地轻量归档（`archive.json`）**：
-  - 自动只读聚合本机存在的 `~/.gemini/antigravity-cli`（CLI）、`~/.gemini/antigravity`（App）与 `~/.gemini/antigravity-ide`（IDE）会话日志，在会话列表标注来源标签 `[App]` / `[IDE]`。
-  - 扫描后自动将轻量轮次摘要持久化到程序同目录 `archive.json`；当 `~/.gemini` 清理历史目录时，已归档会话自动回填并标示 `[归档]`，活文件始终优先覆盖、零重复计数（启动参数 `--no-archive` 可禁用）。
+  - 常驻 Windows 系统托盘（左键切换详情面板，右键打开统一菜单与最近 CLI 会话快捷恢复，Explorer 重启自动恢复图标），悬停显示今日全源用量与官方配额摘要。
+  - **托盘悬停模式（右键菜单勾选或 `--tray-hover`）**：胶囊不再常占屏幕空间；开启时自动将托盘图标固定展示在任务栏右下角（写入当前用户 `HKCU\Control Panel\NotifyIconSettings` 的 `IsPromoted=1`），切换回常驻悬浮胶囊时自动收回到 `^` 折叠区（`IsPromoted=0`）；鼠标悬停即在任务栏上方浮出实时毛玻璃胶囊。
+  - 支持「隐藏悬浮胶囊」仅保留托盘后台监控、「全屏应用自动隐藏胶囊」（`SHQueryUserNotificationState`）以及免提权开机自启（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgyGauge`）。
 - **全局 `Tok | $` 费用视图切换（快捷键 `D`）**：
-  - 顶栏一键在 **Token 用量** 与 **估算 API 费用（USD）** 之间切换；Token 模式下 Hero 与明细表同样常驻显示 `$` 估算金额。
-  - 费用模式下，趋势柱图、按天/按周/按月与逐轮剖析全部按美元拆解堆叠（缓存读 / 新输入 / 输出），实时计算**缓存命中已省美元金额**与周环比变化；支持在线编辑单价表并热写程序目录 `pricing.json`（精确模型名优先于前缀匹配）。
+  - 内置覆盖 Antigravity / Claude（支持 1h 缓存写 `2.0×` 计费）/ OpenAI Codex（`gpt-5.*`、`gpt-5-codex`、`codex-mini`、`gpt-4.1*`）/ Gemini 2.0+ 模型单价，支持在「模型 → 单价表」在线编辑并热写程序目录 `pricing.json`（精确模型名优先于前缀匹配）。
+  - 费用模式下，趋势柱图、按天/按周/按月与逐轮剖析全部按美元拆解堆叠（缓存读 / 新输入 / 输出），实时计算**缓存命中已省美元金额**与周环比变化。
 - **一键脱敏模式（快捷键 `P` / `--redact`）**：
-  - 开启后自动将会话标题/子任务名、项目工作区名、会话 ID、含本机用户名的路径替换为稳定可读的脱敏代号（`会话 #1`、`子任务 #1.1`、`项目 A`、`S-001`、`~/.gemini/antigravity-cli`），完整保留模型名、Token、命中率与估算费用。
-  - 脱敏规则同步覆盖面板视图、剪贴板复制、**会话关键词搜索**（脱敏下不匹配原始敏感词，杜绝侧信道）以及 **CSV / JSON 导出文件**。
+  - 开启后自动将会话标题/子任务名、项目工作区名、会话 ID、含本机用户名的路径替换为稳定可读的脱敏代号（`会话 #1`、`子任务 #1.1`、`项目 A`、`S-001`、`~/.gemini/antigravity-cli`、`~/.claude`、`~/.config/claude`、`~/.codex`、`~/.gemini/tmp`；自定义目录统一显示 `<已脱敏目录>`），完整保留 Agent 名称、模型名、Token、命中率与估算费用。
+  - 脱敏规则同步覆盖面板视图、系统页活跃来源状态、剪贴板复制、**实时搜索框**（脱敏下可搜 Agent 别名、模型名与工具名，但绝不匹配原始敏感词，杜绝侧信道）以及 **CSV / JSON 导出文件**。
 - **右下角轻量胶囊**：
   - `UpdateLayeredWindow` 逐像素圆角与柔和阴影，不占任务栏/Alt-Tab、不抢焦点；支持自由拖拽跨屏记忆位置与右键复位。
-  - 右键「胶囊显示内容」支持 9 项自由组合：**今日总 Token / 今日估算费用 ($) / 5h 窗口 / 官方配额 / 非缓存增量 Δ / 缓存命中率 % / 活跃上下文 Ctx / CPU 波形 / 内存环**。
+  - 右键「胶囊显示内容」支持 8 项自由组合：**今日总 Token / 今日估算费用 ($) / 官方配额 (Q · AGY) / 今日非缓存增量 Δ / 今日缓存命中率 % / 活跃会话上下文 Ctx / CPU 波形 / 内存环**。
 - **扁平 6 视图 + 热力图 + 交互搜索与导出**：
-  1. **概览**：智能趋势图（今日分时 / 多日近 7–14 天）+ **「额度 / 5h | 本周同比」** + **「模型 | 项目 | 工具」**切换（点击任意柱体/模型/项目直接钻取）+ 全宽最近活跃会话表。
-  2. **按天**：内置 **「按天柱图 | 活跃热力图」**切换——20 周 × 7 天陶土色阶日历热力图（悬停查看当日详情，点击任意日期格直接钻取该日会话）与可滚动每日明细表。
-  3. **按周**：ISO 自然周（周一到周日，含周环比、活跃天、日均与估算费用）与 **「按周 (ISO) | 按月」**切换。
-  4. **模型**：内置 **「缓存对比 | 单价表 ($) | 预算 / 桥接」**三合一子视图，支持横向对比稳定命中率与**输出速度（tok/s）**、在线修改单价表、配置预算阈值与查看近期 5h 账单块。
-  5. **会话**：与概览、调用页统一的三段式视觉分组（`轮数` — **`总Token` / `新输入` / `输出`** — `命中率` / `费用`，`Tok` 模式加粗总Token、`$` 模式加粗费用；可按最近、费用、总Token、新输入、输出、命中低→高排序）；自动识别子代理并支持 **`子会话:归组` / `独立`**；内置**实时关键词搜索框（按 `/` 聚焦，支持搜标题、项目、模型、工具名与来源）**；底部剖析卡展示**有效活跃时长、Thinking 轮次占比、高频工具 Top 2** 与逐轮上下文/费用柱图（悬停显示该轮总Token、新输入、输出、缓存读、生成耗时/速度与工具列表）。
-  6. **调用记录（按 `L` 或点击顶栏「调用」）**：把当前时间范围内每一次模型调用（transcript 中带 Token 计数的每一步）按时间倒序平铺成一张表，三段式展示 **耗时 / tok/s** — **`总Token` / `新输入` / `输出`** — **命中率 / 费用**（缓存读收纳至底部明细卡）；支持 **最新 / 费用 / 总Token / 新输入 / 输出 / 耗时** 排序、共用会话搜索框（匹配会话、模型与工具名）、`↑`/`↓` 逐条切换，底部明细卡展示完整 Token（含缓存读）与费用拆分、距上一步间隔与工具列表并可一键复制或跳转所属会话；会话页剖析卡的「调用记录 ›」可直接钻取单个会话的调用。数据完全复用已扫描的轮次，**不新增任何文件读取**，只展示工具名，不展示提示词、工具参数或输出，脱敏模式下同样生效。
-     - **耗时与速度怎么来的**：transcript 只有每一步的秒级 `created_at`。一次带工具调用的回复，从它自己的 `created_at`（请求发出）到它派生的最后一个工具步骤的 `created_at`（最后一个工具调用流式输出完毕）就是生成耗时；输出速度 = 输出 Token（含思考）÷ 生成耗时，是**含首字延迟的端到端速度**，比纯解码速度偏低。耗时不足 3 秒或输出不足 64 Token 的调用不计速度（秒级取整误差太大），汇总与模型页均按 Token 加权平均。纯文本回复（没有后续工具步骤）没有结束时间，显示 `-`。
-     - **为什么没有首字延迟（TTFT）**：本地日志不记录首个 Token 的时间，只有拦截 API 流量才能测到，这违背本工具零侵入的底线，因此不提供。
-  7. **系统监控（点击 Hero 右侧 CPU/内存圆环或按 `6`）**：90 秒 CPU / 物理内存渐变面积折线图（悬停回看）+ 双圆环硬件表 + 多端只读扫描与归档状态。
-  8. **自定义日期与导出**：时间范围新增 **`自定义`**（输入起止 `YYYY-MM-DD` 筛选）；顶栏 **`导出`** 按钮支持原生保存框导出 **完整统计快照（JSON）**、**当前会话列表（UTF-8 BOM CSV）**、**当前调用记录（CSV）**、**每日汇总表（CSV）** 或复制 `/statusline` 配置片段。
-- **快捷键**：`1`–`5` 切换标签、`L` 调用记录、`6` 系统监控、`B` 预算与桥接、`/` 聚焦搜索（会话 / 调用页）、`D` 切换 `Tok`/`$`、`P` 脱敏模式、`T` 总计/仅增量、`↑`/`↓` 切换会话或调用、`Backspace` 清除筛选、`R`/`F5` 刷新、`Ctrl+C` 复制摘要、`Esc` 退出输入框或隐藏面板。
+  1. **概览**：智能趋势图（今日分时 / 多日近 7–14 天）+ **「官方额度 | 本周同比」** + **「模型 | 项目 | 工具 | 来源」**四维切换（点击任意柱体 / 模型 / 项目 / Agent 来源直接钻取会话）+ 全宽最近活跃会话表。
+  2. **按天**：独立于顶栏时间范围、始终基于全量历史展示（顶栏显示「全量历史」，不改写原范围偏好）；内置 **「按天柱图 | 活跃热力图」**切换——近 30 天柱图、20 周 × 7 天陶土色阶日历热力图与可滚动全量每日明细表，点击任意日期格或行直接钻取该日会话（若超出当前范围自动切至「全部」）。
+  3. **按周**：独立于顶栏时间范围、基于全量完整自然周期聚合，避免窄范围截断首尾周/月导致环比失真；支持 **「按周 (ISO) | 按月」**切换（含周环比、活跃天、日均与估算费用），点击任意周直接钻取整周会话。
+  4. **模型**：内置 **「缓存对比 | 单价表 ($) | 预算 / 桥接」**三合一子视图，支持横向对比稳定命中率与**输出速度（tok/s）**、在线修改单价表、配置全源预算阈值与查看 Antigravity 官方配额池。
+  5. **会话**：三段式视觉分组（`轮数` — **`总Token` / `新输入` / `输出`** — `命中率` / `费用`）；自动识别并按同 Agent 家族归组子代理（**`子会话:归组` / `独立`**）；内置**实时关键词搜索框（按 `/` 聚焦，支持搜标题、项目、模型、工具名与来源别名如 `claude` / `codex` / `gemini-cli` / `agy`）**；底部剖析卡集成一键**继续 / 复制命令 / 打开目录 / 置顶**，展示有效活跃时长、Thinking 轮次占比、高频工具与逐轮柱图。
+  6. **调用记录（按 `L` 或点击顶栏「调用」）**：按时间倒序平铺每一次带 Token 计数的模型调用，三段式展示 **耗时 / tok/s** — **`总Token` / `新输入` / `输出`** — **命中率 / 费用**；共用搜索框与快捷键 `↑`/`↓` 切换，底部明细卡展示完整 Token、费用、工具列表与思考量（Codex / Gemini CLI 展示 `思考 X tok`，Antigravity / Claude Code 展示 `思考 X 字`）。
+     - **耗时与速度的优雅降级**：Antigravity transcript 通过请求与派生工具步骤的秒级时间戳估算生成耗时与端到端速度（含首字延迟与思考；耗时不足 3 秒或输出不足 64 Token 不计速度）；纯文本回复及不记录生成耗时的外部 Agent 日志（Claude Code / Codex / Gemini CLI）均优雅显示 `-`，剪贴板明细注明「当前日志无生成耗时记录」。不拦截 API 流量，因此不提供首字延迟（TTFT）。
+  7. **系统监控（点击 Hero 右侧 CPU/内存圆环或按 `6`）**：90 秒 CPU / 物理内存渐变面积折线图（悬停回看）+ 双圆环硬件表 + 动态展示全部活跃只读来源目录、增量缓存命中与归档回填状态。
+  8. **自定义日期与导出**：时间范围支持 **`今日` / `7天` / `30天` / `全部` / `自定义`**（`YYYY-MM-DD`）；顶栏 **`导出`** 支持原生保存框导出 **完整统计快照（JSON，含 `by_agent`）**、**当前会话列表（UTF-8 BOM CSV）**、**当前调用记录（CSV）**、**每日汇总表（CSV）** 或复制 `/statusline` 配置片段。
+- **快捷键**：`1`–`5` 切换标签、`L` 调用记录、`6` 系统监控、`B` 预算与桥接、`/` 聚焦搜索（会话 / 调用页）、`D` 切换 `Tok`/`$`、`P` 脱敏模式、`T` 总计/仅增量、`Enter` 恢复选中会话、`Ctrl+Shift+C` 复制恢复命令、`O` 打开工作区目录、`S` 置顶/取消置顶、`↑`/`↓` 切换会话或调用、`Backspace` 清除筛选、`R`/`F5` 刷新、`Ctrl+C` 复制摘要、`Esc` 退出输入框或隐藏面板。
 
-## 官方 `/statusline` 桥接配置（可选）
+## 官方 `/statusline` 桥接配置（可选，仅 Antigravity CLI）
 
-若希望桌面版与 CLI 合规展示 Antigravity 官方剩余配额与重置倒计时，在桌面版点击「复制 `/statusline` 配置」（或运行 `.\agy-statusline.exe --print-config`），将生成的 `statusLine` 片段合并到 `~/.gemini/antigravity-cli/settings.json`（本工具遵守只读底线，不自动修改你的 `settings.json`）：
+`/statusline` 桥接**仅用于 Antigravity CLI（`agy`）官方配额池同步**（每日/每周美元预算仍自动聚合全部已发现 Agent）。在桌面版点击「复制 `/statusline` 配置」（或运行 `.\agy-statusline.cmd --print-config`），将生成的 `statusLine` 片段合并到 `~/.gemini/antigravity-cli/settings.json`（本工具遵守只读底线，绝不自动修改 `settings.json`）：
 
 ```json
 {
@@ -61,11 +66,11 @@
 
 每次 `agy` 刷新底部状态栏时，会通过标准输入向 `agy-statusline.exe` 传入官方 JSON；`agy-statusline.exe` 在 10ms 内输出精简终端状态栏，同时将脱敏后的配额快照原子写入同目录 `statusline_state.json`（自动剥离工作区路径、会话 ID 与对话内容）。
 
-## 自定义单价与预算文件（位于程序同目录）
+## 自定义单价、预算与会话元数据（仅位于程序同目录）
 
-以下 JSON 文件均仅读写于 `agy-token-monitor.exe` 同目录，**绝不写入 `~/.gemini`**：
+以下 JSON 文件均仅读写于 `agy-token-monitor.exe` 同目录，**绝不写入 `~/.gemini`、`~/.claude` 或 `~/.codex`**：
 
-- `pricing.json`：自定义模型单价热覆盖（可在「模型 → 单价表」在线编辑，或手动编写，单位 USD / 1M tokens）：
+- `pricing.json`：自定义模型单价热覆盖（可在「模型 → 单价表」在线编辑，单位 USD / 1M tokens）：
   ```json
   {
     "models": {
@@ -74,18 +79,28 @@
     }
   }
   ```
-- `budget.json`：5h / 每日 / 每周美元预算与预警/临界百分比（可在「模型 → 预算 / 桥接」在线编辑）。
-- `statusline_state.json`：由 `agy-statusline.exe` 写入的官方配额脱敏缓存。
+- `budget.json`：全源每日 / 每周美元预算与预警/临界百分比（可在「模型 → 预算 / 桥接」在线编辑）。
+- `statusline_state.json`：由 `agy-statusline.exe` 写入的 Antigravity 官方配额脱敏缓存。
 - `archive.json`：本地历史轮次轻量归档（可用 `--no-archive` 禁用）。
+- `session_meta.json`：用户置顶会话标记（与 Agent 原始日志目录完全隔离）。
 
-## 安全与只读保证
+## 安全与只读保证（路径白名单与红线）
 
-- **对 `~/.gemini` 绝对只读**：仅以只读方式打开 Antigravity 目录下的纯文本白名单文件：
-  - `brain/<id>/.system_generated/logs/transcript.jsonl`（缺失时回退 `transcript_full.jsonl`）
-  - `annotations/<id>.pbtxt`（会话标题）
-  - `cache/conversation_metadata.json`（标题与工作区）
-- **不碰 SQLite 数据库**：不打开 `conversations/*.db`，避免与活跃 `agy` 会话产生 WAL/SHM 锁冲突。
-- **不读凭证、不联网、不改配置**：零网络请求、零账号令牌读取；Python CLI 通过单元测试中的 AST 静态检查强制保障零文件写操作与零网络模块导入。
+对全部本地 Agent 数据目录实行**严格只读 + 规范路径边界校验 + 拒绝符号链接**，仅打开下列纯文本白名单文件：
+
+- **Antigravity（CLI / App / IDE）**：`~/.gemini/antigravity{,-cli,-ide}`
+  - 仅读：`brain/<id>/.system_generated/logs/transcript.jsonl`（缺失回退 `transcript_full.jsonl`）、`annotations/<id>.pbtxt`、`cache/conversation_metadata.json`
+  - 红线：**绝不打开** `conversations/*.db` 或任何 SQLite 文件，避免与活跃会话产生 WAL/SHM 锁冲突
+- **Claude Code**：`$CLAUDE_CONFIG_DIR`（逗号分隔）或 `~/.claude` / `~/.config/claude`
+  - 仅读：`projects/<proj>/<uuid>.jsonl`、`.../subagents/agent-*.jsonl`、可选 `sessions-index.json` 与 `agent-*.meta.json`
+  - 红线：**绝不读取** `settings*.json`、`.credentials.json`、`auth*`、`history.jsonl`
+- **OpenAI Codex CLI**：`$CODEX_HOME` 或 `~/.codex`
+  - 仅读：`sessions/YYYY/MM/DD/rollout-*.jsonl`、`archived_sessions/rollout-*.jsonl`、可选 `session_index.jsonl`
+  - 红线：**绝不打开** `*.sqlite*`（含 WAL/SHM 活跃数据库）、`auth.json`、`config.toml`、`history.jsonl`
+- **Gemini CLI**：`$GEMINI_CLI_HOME` 或 `~/.gemini`
+  - 仅读：`tmp/<proj>/chats/session-*.{json,jsonl}`、可选 `.project_root` 与 `projects.json`
+  - 红线：**绝不读取** `oauth_creds.json`、`google_accounts.json`、`jetski-standalone-oauth-token`、`settings.json`
+- **零联网、零凭证、零写入**：全程无任何网络请求与账号令牌访问；Python CLI 通过单元测试中的 AST 静态检查强制保障零文件写操作、零 `sqlite3` 导入与零网络模块导入。
 
 ## 快速开始
 
@@ -102,24 +117,32 @@ copy target\release\agy-statusline.exe ..\agy-statusline.exe
 ### 运行命令
 
 ```powershell
-# 启动桌面悬浮胶囊与系统托盘
+# 启动桌面悬浮胶囊与系统托盘（默认自动发现 Antigravity + Claude Code + Codex CLI + Gemini CLI）
 .\agy-widget.cmd
-# 常用参数：托盘悬停模式 / 极简角标 / 浅色纸感 / 费用视图 / 脱敏模式 / 禁用本地归档 / 指定副屏 / 指定单价表
+
+# 过滤来源：仅监控 Antigravity / 仅监控指定 Agent 组合 / 兼容指定单个数据目录
+.\agy-widget.cmd --agy-only
+.\agy-widget.cmd --agents claude,codex
+.\agy-widget.cmd --data-dir "$env:USERPROFILE\.gemini\antigravity-cli"
+
+# 常用显示参数：托盘悬停模式 / 极简角标 / 浅色纸感 / 费用视图 / 脱敏模式 / 禁用本地归档 / 指定副屏 / 指定单价表
 .\agy-widget.cmd --tray-hover
 .\agy-widget.cmd --mini --light --cost --redact
 .\agy-widget.cmd --no-archive --monitor 1 --pricing .\pricing.json
 
-# 生成官方 /statusline 配置片段
+# 生成 Antigravity CLI 官方 /statusline 配置片段
 .\agy-statusline.cmd --print-config
 
-# Python 零依赖命令行版（严格只读）
+# Python 零依赖命令行版（严格只读，默认自动发现全部 Tier-1 Agent）
 python agy_token_stats.py --today --human
+python agy_token_stats.py --view sources --human
+python agy_token_stats.py --agy-only --today --human
+python agy_token_stats.py --agent claude,codex --days 7 --human
 python agy_token_stats.py --compact
-python agy_token_stats.py --view blocks --human
 python agy_token_stats.py --view tools --days 7
 python agy_token_stats.py --view weekly --sort cost --human
 python agy_token_stats.py --view all --redact
 python agy_token_stats.py --format json --redact
-# 脚本化预算检查（退出码：0 正常 / 10 预警 / 20 临界）
-python agy_token_stats.py --budget-daily 30 --budget-5h 15 --check-budget
+# 脚本化全源预算检查（退出码：0 正常 / 10 预警 / 20 临界）
+python agy_token_stats.py --budget-daily 30 --budget-weekly 150 --check-budget
 ```

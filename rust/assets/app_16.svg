@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Optically tuned for 16px-24px tray: wider warm paper aperture + crisp obsidian bezel -->
+  <circle cx="128" cy="128" r="120" fill="#1B1B20"/>
+  <circle cx="128" cy="128" r="96" fill="#F6F4ED"/>
+  <!-- Bold 270° Track -->
+  <path d="M 81.3 178.7 A 66 66 0 1 1 174.7 178.7"
+        fill="none" stroke="#D2CEC3" stroke-width="25" stroke-linecap="round"/>
+  <!-- Bold Deep Terracotta Arc -->
+  <path d="M 81.3 178.7 A 66 66 0 1 1 184.0 97.0"
+        fill="none" stroke="#D46627" stroke-width="25" stroke-linecap="round"/>
+  <!-- Crisp Ink Needle + Hub -->
+  <line x1="128" y1="132" x2="174" y2="104" stroke="#1A1A1C" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="128" cy="132" r="20" fill="#1A1A1C"/>
+  <circle cx="128" cy="132" r="8" fill="#E5854A"/>
+  <!-- Botanical Sage Pip -->
+  <circle cx="128" cy="197" r="11" fill="#4A8768"/>
+</svg>

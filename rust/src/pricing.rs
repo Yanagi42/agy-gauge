@@ -260,6 +260,26 @@ const BUILTIN_SPECS: &[BuiltinSpec] = &[
         intro_rate: None,
         note: "",
     },
+    BuiltinSpec {
+        display: "gemini-2.0-flash-lite",
+        prefixes: &["gemini-2-0-flash-lite"],
+        base: ModelRate::new(0.075, 0.01875, 0.075, 0.30),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gemini-2.0-flash",
+        prefixes: &["gemini-2-0-flash"],
+        base: ModelRate::new(0.10, 0.025, 0.10, 0.40),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
     // --- Anthropic Claude family ---
     BuiltinSpec {
         display: "claude-opus-5-5",
@@ -371,7 +391,87 @@ const BUILTIN_SPECS: &[BuiltinSpec] = &[
         intro_rate: None,
         note: "",
     },
-    // --- OpenAI GPT / o-series fallback ---
+    // --- OpenAI GPT / Codex / o-series (most-specific prefixes before shorter ones like "gpt-5") ---
+    BuiltinSpec {
+        display: "gpt-5.4",
+        prefixes: &["gpt-5-4"],
+        base: ModelRate::new(2.50, 0.25, 2.50, 15.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5.3-codex",
+        prefixes: &["gpt-5-3-codex"],
+        base: ModelRate::new(1.75, 0.175, 1.75, 14.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5.2-codex",
+        prefixes: &["gpt-5-2-codex"],
+        base: ModelRate::new(1.75, 0.175, 1.75, 14.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5.2",
+        prefixes: &["gpt-5-2"],
+        base: ModelRate::new(1.75, 0.175, 1.75, 14.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5.1-codex-mini",
+        prefixes: &["gpt-5-1-codex-mini"],
+        base: ModelRate::new(0.25, 0.025, 0.25, 2.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5.1-codex",
+        prefixes: &["gpt-5-1-codex"],
+        base: ModelRate::new(1.25, 0.125, 1.25, 10.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5.1",
+        prefixes: &["gpt-5-1"],
+        base: ModelRate::new(1.25, 0.125, 1.25, 10.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-5-codex",
+        prefixes: &["gpt-5-codex"],
+        base: ModelRate::new(1.25, 0.125, 1.25, 10.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
     BuiltinSpec {
         display: "gpt-5-mini",
         prefixes: &["gpt-5-mini"],
@@ -383,9 +483,59 @@ const BUILTIN_SPECS: &[BuiltinSpec] = &[
         note: "",
     },
     BuiltinSpec {
+        display: "gpt-5-nano",
+        prefixes: &["gpt-5-nano"],
+        base: ModelRate::new(0.05, 0.005, 0.05, 0.40),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
         display: "gpt-5",
         prefixes: &["gpt-5"],
         base: ModelRate::new(1.25, 0.125, 1.25, 10.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "codex-mini-latest",
+        prefixes: &["codex-mini-latest", "codex-mini"],
+        base: ModelRate::new(1.50, 0.375, 1.50, 6.00),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-4.1-mini",
+        prefixes: &["gpt-4-1-mini"],
+        base: ModelRate::new(0.40, 0.10, 0.40, 1.60),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-4.1-nano",
+        prefixes: &["gpt-4-1-nano"],
+        base: ModelRate::new(0.10, 0.025, 0.10, 0.40),
+        long_threshold: None,
+        long_rate: None,
+        intro_before: None,
+        intro_rate: None,
+        note: "",
+    },
+    BuiltinSpec {
+        display: "gpt-4.1",
+        prefixes: &["gpt-4-1"],
+        base: ModelRate::new(2.00, 0.50, 2.00, 8.00),
         long_threshold: None,
         long_rate: None,
         intro_before: None,
@@ -843,13 +993,28 @@ const EFFORT_SUFFIXES: &[&str] = &[
     "-xhigh", "-high", "-medium", "-med", "-low", "-minimal", "-max", "-none",
 ];
 
+const PROVIDER_PREFIXES: &[&str] = &[
+    "us.anthropic.",
+    "eu.anthropic.",
+    "global.anthropic.",
+    "anthropic.",
+];
+
 /// Canonical lowercase key keeping effort suffixes intact (for exact per-model matching).
+/// Strips path prefixes (`org/model`), Bedrock/Vertex provider prefixes (`us.anthropic.`, etc.),
+/// and normalizes `@`, `.`, `_` separators to `-`.
 pub fn canonical_exact_key(raw: &str) -> String {
     let mut s = raw.trim().to_ascii_lowercase();
-    if let Some(after) = s.rsplit_once('/') {
-        s = after.1.to_string();
+    if let Some((_, after)) = s.rsplit_once('/') {
+        s = after.to_string();
     }
-    s.replace(['.', '_'], "-")
+    for pfx in PROVIDER_PREFIXES {
+        if let Some(stripped) = s.strip_prefix(pfx) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+    s.replace(['@', '.', '_'], "-")
 }
 
 /// Normalize model names to lowercase hyphen-separated base tokens for family/prefix matching.
@@ -1208,5 +1373,112 @@ mod tests {
         assert_eq!(fmt_usd_axis(125.0, 250.0), "$125");
         assert_eq!(fmt_rate_plain(0.075), "0.075");
         assert_eq!(fmt_rate_plain(3.0), "3.00");
+    }
+
+    #[test]
+    fn test_openai_codex_and_gemini2_builtin_rates_and_prefix_ordering() {
+        let cat = PricingCatalog::new(None);
+        let cases: &[(&str, &str, ModelRate)] = &[
+            // OpenAI / Codex GPT-5 family — none may be shadowed by "gpt-5"
+            ("gpt-5.4", "gpt-5.4", ModelRate::new(2.50, 0.25, 2.50, 15.00)),
+            ("gpt-5.4-2026-03-05", "gpt-5.4", ModelRate::new(2.50, 0.25, 2.50, 15.00)),
+            ("gpt-5.3-codex", "gpt-5.3-codex", ModelRate::new(1.75, 0.175, 1.75, 14.00)),
+            ("gpt-5.3-codex-high", "gpt-5.3-codex", ModelRate::new(1.75, 0.175, 1.75, 14.00)),
+            ("gpt-5.2-codex", "gpt-5.2-codex", ModelRate::new(1.75, 0.175, 1.75, 14.00)),
+            ("gpt-5.2", "gpt-5.2", ModelRate::new(1.75, 0.175, 1.75, 14.00)),
+            ("gpt-5.2-2025-12-11", "gpt-5.2", ModelRate::new(1.75, 0.175, 1.75, 14.00)),
+            ("gpt-5.1-codex-mini", "gpt-5.1-codex-mini", ModelRate::new(0.25, 0.025, 0.25, 2.00)),
+            ("gpt-5.1-codex", "gpt-5.1-codex", ModelRate::new(1.25, 0.125, 1.25, 10.00)),
+            ("gpt-5.1", "gpt-5.1", ModelRate::new(1.25, 0.125, 1.25, 10.00)),
+            ("gpt-5-codex", "gpt-5-codex", ModelRate::new(1.25, 0.125, 1.25, 10.00)),
+            ("gpt-5-mini", "gpt-5-mini", ModelRate::new(0.25, 0.025, 0.25, 2.00)),
+            ("gpt-5-nano", "gpt-5-nano", ModelRate::new(0.05, 0.005, 0.05, 0.40)),
+            ("gpt-5", "gpt-5", ModelRate::new(1.25, 0.125, 1.25, 10.00)),
+            ("gpt-5-2025-08-07", "gpt-5", ModelRate::new(1.25, 0.125, 1.25, 10.00)),
+            ("codex-mini-latest", "codex-mini-latest", ModelRate::new(1.50, 0.375, 1.50, 6.00)),
+            ("codex-mini-2025-05-16", "codex-mini-latest", ModelRate::new(1.50, 0.375, 1.50, 6.00)),
+            // OpenAI GPT-4.1 family — mini/nano must not be shadowed by gpt-4.1
+            ("gpt-4.1-mini", "gpt-4.1-mini", ModelRate::new(0.40, 0.10, 0.40, 1.60)),
+            ("gpt-4.1-nano", "gpt-4.1-nano", ModelRate::new(0.10, 0.025, 0.10, 0.40)),
+            ("gpt-4.1", "gpt-4.1", ModelRate::new(2.00, 0.50, 2.00, 8.00)),
+            ("gpt-4.1-2025-04-14", "gpt-4.1", ModelRate::new(2.00, 0.50, 2.00, 8.00)),
+            // Gemini 2.0 family — flash-lite must not be shadowed by flash
+            ("gemini-2.0-flash-lite", "gemini-2.0-flash-lite", ModelRate::new(0.075, 0.01875, 0.075, 0.30)),
+            ("gemini-2.0-flash-lite-001", "gemini-2.0-flash-lite", ModelRate::new(0.075, 0.01875, 0.075, 0.30)),
+            ("gemini-2.0-flash", "gemini-2.0-flash", ModelRate::new(0.10, 0.025, 0.10, 0.40)),
+            ("gemini-2.0-flash-001", "gemini-2.0-flash", ModelRate::new(0.10, 0.025, 0.10, 0.40)),
+        ];
+
+        for &(model, expected_rule, expected_rate) in cases {
+            let (rate, src, matched) = cat
+                .resolve_detail(model, 50_000, None)
+                .unwrap_or_else(|| panic!("expected builtin rate for {model}"));
+            assert_eq!(src, PriceSource::Builtin, "source for {model}");
+            assert_eq!(matched, expected_rule, "matched rule for {model}");
+            assert_eq!(rate, expected_rate, "rate for {model}");
+        }
+    }
+
+    #[test]
+    fn test_bedrock_and_vertex_model_normalization() {
+        assert_eq!(
+            canonical_exact_key("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
+            canonical_exact_key("EU.Anthropic.claude-opus-4-6-v1"),
+            "claude-opus-4-6-v1"
+        );
+        assert_eq!(
+            canonical_exact_key("global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            "claude-haiku-4-5-20251001-v1:0"
+        );
+        assert_eq!(
+            canonical_exact_key("anthropic.claude-3-5-haiku-20241022-v1:0"),
+            "claude-3-5-haiku-20241022-v1:0"
+        );
+        assert_eq!(
+            canonical_exact_key("bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
+            canonical_exact_key("claude-sonnet-4-5@20250929"),
+            "claude-sonnet-4-5-20250929"
+        );
+        assert_eq!(
+            canonical_exact_key("projects/p/locations/us-east5/publishers/anthropic/models/claude-opus-4-6@20260205"),
+            "claude-opus-4-6-20260205"
+        );
+
+        let cat = PricingCatalog::new(None);
+        let (r_sonnet, _, m_sonnet) = cat
+            .resolve_detail("us.anthropic.claude-sonnet-4-5-20250929-v1:0", 10_000, None)
+            .unwrap();
+        assert_eq!(m_sonnet, "claude-sonnet-4");
+        assert_eq!(r_sonnet, ModelRate::new(3.00, 0.30, 3.75, 15.00));
+
+        let (r_vertex, _, m_vertex) = cat
+            .resolve_detail("claude-sonnet-4-5@20250929", 10_000, None)
+            .unwrap();
+        assert_eq!(m_vertex, "claude-sonnet-4");
+        assert_eq!(r_vertex, ModelRate::new(3.00, 0.30, 3.75, 15.00));
+
+        let (r_eu_opus, _, m_eu_opus) = cat
+            .resolve_detail("eu.anthropic.claude-opus-4-6-v1", 10_000, None)
+            .unwrap();
+        assert_eq!(m_eu_opus, "claude-opus-4-6");
+        assert_eq!(r_eu_opus, ModelRate::new(5.00, 0.50, 6.25, 25.00));
+
+        let (r_global_haiku, _, m_global_haiku) = cat
+            .resolve_detail("global.anthropic.claude-haiku-4-5-20251001-v1:0", 10_000, None)
+            .unwrap();
+        assert_eq!(m_global_haiku, "claude-haiku-4-5");
+        assert_eq!(r_global_haiku, ModelRate::new(1.00, 0.10, 1.25, 5.00));
+
+        let (r_bare_anth, _, m_bare_anth) = cat
+            .resolve_detail("anthropic.claude-3-5-haiku-20241022-v1:0", 10_000, None)
+            .unwrap();
+        assert_eq!(m_bare_anth, "claude-3-5-haiku");
+        assert_eq!(r_bare_anth, ModelRate::new(0.80, 0.08, 1.00, 4.00));
     }
 }

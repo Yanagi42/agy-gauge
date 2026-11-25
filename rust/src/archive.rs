@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 
 use crate::pricing::{CostBreakdown, PricingCatalog};
 use crate::quota::{atomic_write_json, default_companion_path};
-use crate::stats::{is_compaction_model, SessionInfo, SourceKind, TokenCounts, TurnRecord};
+use crate::stats::{
+    is_compaction_model, price_turn_record, AgentFamily, SessionInfo, SourceKind, TokenCounts,
+    TurnRecord,
+};
 
 #[derive(Debug, Clone)]
 pub struct ArchivedSession {
@@ -34,7 +37,7 @@ pub struct ArchivedSession {
 pub struct UsageArchive {
     path: Option<PathBuf>,
     enabled: bool,
-    entries: HashMap<String, ArchivedSession>,
+    entries: HashMap<(AgentFamily, String), ArchivedSession>,
     dirty: bool,
 }
 
@@ -84,9 +87,10 @@ impl UsageArchive {
         let Some(Value::Object(sessions)) = root.get("sessions") else {
             return;
         };
-        for (cid, val) in sessions {
-            if let Some(entry) = parse_archived_session(cid, val) {
-                self.entries.insert(cid.clone(), entry);
+        for (raw_key, val) in sessions {
+            if let Some(entry) = parse_archived_session(raw_key, val) {
+                let key = (entry.source.agent_family(), entry.conversation_id.clone());
+                self.entries.insert(key, entry);
             }
         }
     }
@@ -102,10 +106,12 @@ impl UsageArchive {
         if !self.enabled {
             return Vec::new();
         }
-        let mut live_ids = BTreeSet::new();
+        let mut live_keys = BTreeSet::new();
         for s in live_sessions {
-            live_ids.insert(s.conversation_id.as_str());
-            let should_update = match self.entries.get(&s.conversation_id) {
+            let family = s.source.agent_family();
+            let key = (family, s.conversation_id.clone());
+            live_keys.insert((family, s.conversation_id.as_str()));
+            let should_update = match self.entries.get(&key) {
                 None => true,
                 Some(prev) => {
                     prev.turns.len() != s.turns.len()
@@ -113,13 +119,26 @@ impl UsageArchive {
                         || prev.workspace != s.workspace
                         || prev.parent_title != s.parent_title
                         || prev.source != s.source
-                        || prev.turns.last().map(|t| (t.output_tokens, t.input_tokens, t.cache_read_tokens))
-                            != s.turns.last().map(|t| (t.output_tokens, t.input_tokens, t.cache_read_tokens))
+                        || prev.turns.last().map(|t| (
+                            t.output_tokens,
+                            t.input_tokens,
+                            t.cache_read_tokens,
+                            t.cache_write_tokens,
+                            t.cache_write_1h_tokens,
+                            t.reasoning_tokens,
+                        )) != s.turns.last().map(|t| (
+                            t.output_tokens,
+                            t.input_tokens,
+                            t.cache_read_tokens,
+                            t.cache_write_tokens,
+                            t.cache_write_1h_tokens,
+                            t.reasoning_tokens,
+                        ))
                 }
             };
             if should_update {
                 self.entries.insert(
-                    s.conversation_id.clone(),
+                    key,
                     ArchivedSession {
                         conversation_id: s.conversation_id.clone(),
                         title: s.title.clone(),
@@ -142,8 +161,8 @@ impl UsageArchive {
         }
 
         let mut backfilled = Vec::new();
-        for (cid, arch) in &self.entries {
-            if live_ids.contains(cid.as_str()) || arch.turns.is_empty() {
+        for ((family, cid), arch) in &self.entries {
+            if live_keys.contains(&(*family, cid.as_str())) || arch.turns.is_empty() {
                 continue;
             }
             backfilled.push(materialize_archived_session(arch, pricing));
@@ -156,7 +175,7 @@ impl UsageArchive {
             return Ok(());
         };
         let mut sessions_map = Map::new();
-        let mut keys: Vec<&String> = self.entries.keys().collect();
+        let mut keys: Vec<&(AgentFamily, String)> = self.entries.keys().collect();
         keys.sort();
         for k in keys {
             let s = &self.entries[k];
@@ -178,7 +197,13 @@ impl UsageArchive {
                     if t.cache_write_tokens > 0 {
                         to.insert("cw".into(), json!(t.cache_write_tokens));
                     }
+                    if t.cache_write_1h_tokens > 0 {
+                        to.insert("cw1h".into(), json!(t.cache_write_1h_tokens));
+                    }
                     to.insert("out".into(), json!(t.output_tokens));
+                    if t.reasoning_tokens > 0 {
+                        to.insert("rt".into(), json!(t.reasoning_tokens));
+                    }
                     if !t.tool_names.is_empty() {
                         to.insert("tools".into(), json!(t.tool_names));
                     }
@@ -193,6 +218,12 @@ impl UsageArchive {
                 .collect();
 
             let mut so = Map::new();
+            let json_key = if s.source.agent_family() == AgentFamily::Antigravity {
+                s.conversation_id.clone()
+            } else {
+                so.insert("conversation_id".into(), json!(s.conversation_id));
+                format!("{}:{}", s.source.agent_family().as_str(), s.conversation_id)
+            };
             so.insert("title".into(), json!(s.title));
             so.insert("workspace".into(), json!(s.workspace));
             so.insert("source".into(), json!(s.source.as_str()));
@@ -206,7 +237,7 @@ impl UsageArchive {
                 so.insert("parent_title".into(), json!(s.parent_title));
             }
             so.insert("turns".into(), Value::Array(turns_json));
-            sessions_map.insert(k.clone(), Value::Object(so));
+            sessions_map.insert(json_key, Value::Object(so));
         }
 
         let root = json!({
@@ -219,7 +250,7 @@ impl UsageArchive {
     }
 }
 
-fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
+fn parse_archived_session(raw_key: &str, val: &Value) -> Option<ArchivedSession> {
     let obj = val.as_object()?;
     let title = obj
         .get("title")
@@ -234,8 +265,17 @@ fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
     let source = obj
         .get("source")
         .and_then(Value::as_str)
-        .map(SourceKind::from_str_loose)
+        .map(SourceKind::from_str_lossy)
         .unwrap_or(SourceKind::Cli);
+    let conversation_id = obj
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            let prefix = format!("{}:", source.agent_family().as_str());
+            raw_key.strip_prefix(&prefix).unwrap_or(raw_key).to_string()
+        });
     let is_subagent = obj
         .get("is_subagent")
         .and_then(Value::as_bool)
@@ -269,7 +309,13 @@ fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
         let input_tokens = to.get("in").and_then(Value::as_u64).unwrap_or(0);
         let cache_read_tokens = to.get("cr").and_then(Value::as_u64).unwrap_or(0);
         let cache_write_tokens = to.get("cw").and_then(Value::as_u64).unwrap_or(0);
+        let cache_write_1h_tokens = to
+            .get("cw1h")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(cache_write_tokens);
         let output_tokens = to.get("out").and_then(Value::as_u64).unwrap_or(0);
+        let reasoning_tokens = to.get("rt").and_then(Value::as_u64).unwrap_or(0);
         let tool_names = to
             .get("tools")
             .and_then(Value::as_array)
@@ -290,7 +336,9 @@ fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
             input_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            cache_write_1h_tokens,
             output_tokens,
+            reasoning_tokens,
             tool_names,
             thinking_chars,
             gen_secs,
@@ -301,7 +349,7 @@ fn parse_archived_session(cid: &str, val: &Value) -> Option<ArchivedSession> {
         return None;
     }
     Some(ArchivedSession {
-        conversation_id: cid.to_string(),
+        conversation_id,
         title,
         workspace,
         source,
@@ -344,14 +392,7 @@ fn materialize_archived_session(arch: &ArchivedSession, pricing: &PricingCatalog
             fallback_model.as_deref().unwrap_or(t.model.as_str())
         };
         let local_date = t.timestamp_utc.map(|u| u.with_timezone(&Local).date_naive());
-        t.cost = pricing.price_turn(
-            eff_model,
-            t.input_tokens,
-            t.cache_read_tokens,
-            t.cache_write_tokens,
-            t.output_tokens,
-            local_date,
-        );
+        t.cost = price_turn_record(pricing, eff_model, t, local_date);
         counts.add_call_with_cost(
             t.input_tokens,
             t.cache_read_tokens,
@@ -387,6 +428,8 @@ fn materialize_archived_session(arch: &ArchivedSession, pricing: &PricingCatalog
         models,
         first_time,
         last_time,
+        last_file_mtime_utc: None,
+        is_running_hint: false,
     }
 }
 
@@ -421,7 +464,9 @@ mod tests {
                 input_tokens: 100_000,
                 cache_read_tokens: 400_000,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 output_tokens: 2_000,
+                reasoning_tokens: 0,
                 tool_names: vec!["read_file".into()],
                 thinking_chars: 120,
                 gen_secs: None,
@@ -431,6 +476,8 @@ mod tests {
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
         };
 
         {
@@ -453,6 +500,112 @@ mod tests {
             // When live session IS present, archive must NOT duplicate it.
             let back2 = a2.sync_and_backfill(&[s1], &pricing, true);
             assert!(back2.is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_archive_multi_agent_keys_optional_fields_and_legacy_v1_compat() {
+        let dir = std::env::temp_dir().join(format!(
+            "agy_gauge_arch_multi_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch_path = dir.join("archive.json");
+        let pricing = PricingCatalog::new(None);
+        let ts = Utc.with_ymd_and_hms(2026, 11, 20, 12, 0, 0).unwrap();
+
+        // Seed a legacy v1 archive.json (no `rt`, no `cw1h`, bare AGY key).
+        let legacy = json!({
+            "schema_version": 1,
+            "sessions": {
+                "shared-id": {
+                    "title": "Legacy AGY",
+                    "workspace": "C:/agy",
+                    "source": "cli",
+                    "turns": [{
+                        "step": 1,
+                        "ts": ts.to_rfc3339(),
+                        "m": "claude-sonnet-4-6",
+                        "in": 1000,
+                        "cr": 2000,
+                        "out": 500
+                    }]
+                }
+            }
+        });
+        std::fs::write(&arch_path, legacy.to_string()).unwrap();
+
+        // Sync a Claude Code session with the SAME conversation_id, carrying `rt` and `cw1h`.
+        let cc = SessionInfo {
+            conversation_id: "shared-id".into(),
+            title: "Claude Session".into(),
+            workspace: "C:/cc".into(),
+            source: SourceKind::ClaudeCode,
+            is_archived: false,
+            is_subagent: false,
+            parent_id: None,
+            parent_title: String::new(),
+            turns: vec![TurnRecord {
+                step_index: 1,
+                timestamp_utc: Some(ts),
+                model: "claude-sonnet-4-6".into(),
+                is_checkpoint: false,
+                input_tokens: 1_000,
+                cache_read_tokens: 0,
+                cache_write_tokens: 1_000_000,
+                cache_write_1h_tokens: 1_000_000,
+                output_tokens: 2_000,
+                reasoning_tokens: 800,
+                tool_names: vec![],
+                thinking_chars: 0,
+                gen_secs: None,
+                cost: CostBreakdown::default(),
+            }],
+            counts: TokenCounts::default(),
+            models: BTreeSet::new(),
+            first_time: None,
+            last_time: None,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
+        };
+
+        {
+            let mut a1 = UsageArchive::new(Some(arch_path.clone()), true);
+            // AGY session is archived-only while Claude session is live -> AGY backfills, no collision!
+            let back = a1.sync_and_backfill(&[cc.clone()], &pricing, true);
+            assert_eq!(back.len(), 1);
+            assert_eq!(back[0].source, SourceKind::Cli);
+            assert_eq!(back[0].turns[0].reasoning_tokens, 0);
+            assert_eq!(back[0].turns[0].cache_write_1h_tokens, 0);
+        }
+
+        // Verify persisted JSON omits `rt`/`cw1h` when 0 (AGY) and keeps them when >0 (Claude).
+        let raw = std::fs::read_to_string(&arch_path).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let agy_turn = &parsed["sessions"]["shared-id"]["turns"][0];
+        assert!(agy_turn.get("rt").is_none());
+        assert!(agy_turn.get("cw1h").is_none());
+        let cc_turn = &parsed["sessions"]["claude-code:shared-id"]["turns"][0];
+        assert_eq!(cc_turn["rt"], 800);
+        assert_eq!(cc_turn["cw1h"], 1_000_000);
+
+        // Reload fresh archive with no live sessions -> both sessions backfill with distinct sources
+        // and Claude's 1h cache write is priced at 2.0x input ($6.00/M for Sonnet 4.6, vs $3.75/M 5m).
+        {
+            let mut a2 = UsageArchive::new(Some(arch_path.clone()), true);
+            let mut back = a2.sync_and_backfill(&[], &pricing, true);
+            assert_eq!(back.len(), 2);
+            back.sort_by_key(|s| s.source);
+            assert_eq!(back[0].source, SourceKind::Cli);
+            assert_eq!(back[1].source, SourceKind::ClaudeCode);
+            assert_eq!(back[1].conversation_id, "shared-id");
+            assert_eq!(back[1].turns[0].reasoning_tokens, 800);
+            assert!(back[1].turns[0].has_thinking());
+            assert_eq!(back[1].turns[0].cache_write_1h_tokens, 1_000_000);
+            assert!((back[1].turns[0].cost.cache_write_usd - 6.0).abs() < 1e-6);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -59,7 +59,7 @@ pub const PILL_ITEM_ACTIVE_CTX: u32 = 1 << 3;
 pub const PILL_ITEM_CPU: u32 = 1 << 4;
 pub const PILL_ITEM_RAM: u32 = 1 << 5;
 pub const PILL_ITEM_COST: u32 = 1 << 6;
-pub const PILL_ITEM_BLOCK_5H: u32 = 1 << 7;
+// Bit 7 retired (former local 5h billing block); keep bit 8 stable for existing Registry prefs.
 pub const PILL_ITEM_QUOTA: u32 = 1 << 8;
 pub const PILL_ITEMS_ALL_MASK: u32 = PILL_ITEM_TOTAL
     | PILL_ITEM_NON_CACHED
@@ -68,7 +68,6 @@ pub const PILL_ITEMS_ALL_MASK: u32 = PILL_ITEM_TOTAL
     | PILL_ITEM_CPU
     | PILL_ITEM_RAM
     | PILL_ITEM_COST
-    | PILL_ITEM_BLOCK_5H
     | PILL_ITEM_QUOTA;
 pub const PILL_ITEMS_DEFAULT: u32 = PILL_ITEM_TOTAL | PILL_ITEM_CPU | PILL_ITEM_RAM;
 
@@ -1097,6 +1096,25 @@ impl TrayIcon {
         }
     }
 
+    pub fn update_icon(&mut self, icon: HICON) {
+        if icon.0.is_null() || self.icon == icon {
+            return;
+        }
+        self.icon = icon;
+        if !self.active || self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_ICON;
+            nid.hIcon = self.icon;
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
     pub fn get_rect(&self) -> Option<RECT> {
         if !self.active || self.hwnd.0.is_null() {
             return None;
@@ -1884,5 +1902,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_tray_icon_update_icon_preserves_state_and_short_circuits() {
+        let icon_a = HICON(1 as *mut core::ffi::c_void);
+        let icon_b = HICON(2 as *mut core::ffi::c_void);
+        let mut tray = TrayIcon::new(HWND::default(), icon_a, "init");
+        assert!(!tray.active);
+        assert_eq!(tray.icon, icon_a);
+
+        // Same icon short-circuits without mutating state
+        tray.update_icon(icon_a);
+        assert_eq!(tray.icon, icon_a);
+
+        // Null icon is ignored so tray never blanks out
+        tray.update_icon(HICON::default());
+        assert_eq!(tray.icon, icon_a);
+
+        // New non-null icon updates stored handle (preserved across TaskbarCreated / remove+add)
+        tray.update_icon(icon_b);
+        assert_eq!(tray.icon, icon_b);
     }
 }

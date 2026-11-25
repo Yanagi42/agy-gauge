@@ -673,6 +673,62 @@ pub fn draw_text(
     }
 }
 
+/// Draws an anti-aliased rounded-cap circular arc given start and sweep angles in radians
+/// (Direct2D screen space: 0 = 3 o'clock, clockwise positive).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_arc_rad(
+    factories: &D2DFactories,
+    rt: &ID2D1RenderTarget,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    stroke_w: f32,
+    start_rad: f32,
+    sweep_rad: f32,
+    color: D2D1_COLOR_F,
+) {
+    if sweep_rad <= 0.001 || radius <= 0.0 {
+        return;
+    }
+    if sweep_rad >= 2.0 * PI - 0.005 {
+        stroke_circle(rt, cx, cy, radius, color, stroke_w);
+        return;
+    }
+    let end_rad = start_rad + sweep_rad;
+    let sx = cx + radius * start_rad.cos();
+    let sy = cy + radius * start_rad.sin();
+    let ex = cx + radius * end_rad.cos();
+    let ey = cy + radius * end_rad.sin();
+
+    unsafe {
+        if let Ok(geo) = factories.d2d.CreatePathGeometry() {
+            if let Ok(sink) = geo.Open() {
+                sink.BeginFigure(pt(sx, sy), D2D1_FIGURE_BEGIN_HOLLOW);
+                let seg = D2D1_ARC_SEGMENT {
+                    point: pt(ex, ey),
+                    size: D2D_SIZE_F { width: radius, height: radius },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: if sweep_rad > PI { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+                };
+                sink.AddArc(&seg);
+                sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                if sink.Close().is_ok() {
+                    if let Some(b) = brush(rt, color) {
+                        let sp = D2D1_STROKE_STYLE_PROPERTIES {
+                            startCap: D2D1_CAP_STYLE_ROUND,
+                            endCap: D2D1_CAP_STYLE_ROUND,
+                            ..Default::default()
+                        };
+                        let style = factories.d2d.CreateStrokeStyle(&sp, None).ok();
+                        rt.DrawGeometry(&geo, &b, stroke_w, style.as_ref());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Tactile anti-aliased radial arc gauge (like macOS iStat Menus / Apple Activity rings).
 pub fn draw_ring_gauge(
     factories: &D2DFactories,
@@ -694,42 +750,86 @@ pub fn draw_ring_gauge(
         stroke_circle(rt, cx, cy, radius, arc_col, stroke_w);
         return;
     }
+    draw_arc_rad(
+        factories,
+        rt,
+        cx,
+        cy,
+        radius,
+        stroke_w,
+        -PI * 0.5,
+        (clamped / 100.0) * 2.0 * PI,
+        arc_col,
+    );
+}
 
-    let start_angle = -PI * 0.5;
-    let sweep = (clamped / 100.0) * 2.0 * PI;
-    let end_angle = start_angle + sweep;
-    let sx = cx + radius * start_angle.cos();
-    let sy = cy + radius * start_angle.sin();
-    let ex = cx + radius * end_angle.cos();
-    let ey = cy + radius * end_angle.sin();
+/// 14 DIP Braun Paper Dial brand micro-icon (1:1 optical match to Concept C `app_16.svg`).
+/// `alert_level`: 0 = normal, 1 = warn, 2 = critical.
+pub fn draw_brand_dial_icon(
+    factories: &D2DFactories,
+    rt: &ID2D1RenderTarget,
+    cx: f32,
+    cy: f32,
+    is_dark: bool,
+    alert_level: u8,
+) {
+    let (arc_col, core_col, dot_col) = match alert_level {
+        2 => (rgb(217, 107, 107), rgb(217, 107, 107), rgb(217, 107, 107)),
+        1 => (rgb(217, 161, 74), rgb(217, 161, 74), rgb(217, 161, 74)),
+        _ => (rgb(212, 102, 39), rgb(229, 133, 74), rgb(74, 135, 104)),
+    };
 
+    // 1) Obsidian bezel + subtle rim on dark header
+    fill_circle(rt, cx, cy, 7.0, rgb(27, 27, 32));
+    if is_dark {
+        stroke_circle(rt, cx, cy, 6.75, rgba(255, 255, 255, 0.14), 0.75);
+    }
+
+    // 2) Warm paper dial face
+    fill_circle(rt, cx, cy, 5.5, rgb(246, 244, 237));
+
+    // 3) 270 deg track arc: 135 deg -> 45 deg clockwise
+    let start_rad = 0.75 * PI; // 135 deg
+    draw_arc_rad(
+        factories,
+        rt,
+        cx,
+        cy,
+        3.85,
+        1.45,
+        start_rad,
+        1.5 * PI, // 270 deg
+        rgb(210, 206, 195),
+    );
+
+    // 4) Primary reading arc (~71.5%): 135 deg -> -32 deg (193 deg sweep)
+    let sweep_reading = 193.0_f32.to_radians();
+    draw_arc_rad(factories, rt, cx, cy, 3.85, 1.45, start_rad, sweep_reading, arc_col);
+
+    // 5) Deep ink pointer + hub + core dot
+    let ink = rgb(26, 26, 28);
     unsafe {
-        if let Ok(geo) = factories.d2d.CreatePathGeometry() {
-            if let Ok(sink) = geo.Open() {
-                sink.BeginFigure(pt(sx, sy), D2D1_FIGURE_BEGIN_HOLLOW);
-                let seg = D2D1_ARC_SEGMENT {
-                    point: pt(ex, ey),
-                    size: D2D_SIZE_F { width: radius, height: radius },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: if sweep > PI { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
-                };
-                sink.AddArc(&seg);
-                sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                if sink.Close().is_ok() {
-                    if let Some(b) = brush(rt, arc_col) {
-                        let sp = D2D1_STROKE_STYLE_PROPERTIES {
-                            startCap: D2D1_CAP_STYLE_ROUND,
-                            endCap: D2D1_CAP_STYLE_ROUND,
-                            ..Default::default()
-                        };
-                        let style = factories.d2d.CreateStrokeStyle(&sp, None).ok();
-                        rt.DrawGeometry(&geo, &b, stroke_w, style.as_ref());
-                    }
-                }
-            }
+        if let Some(b) = brush(rt, ink) {
+            let sp = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                ..Default::default()
+            };
+            let style = factories.d2d.CreateStrokeStyle(&sp, None).ok();
+            rt.DrawLine(
+                pt(cx, cy + 0.2),
+                pt(cx + 2.33, cy - 1.26),
+                &b,
+                1.05,
+                style.as_ref(),
+            );
         }
     }
+    fill_circle(rt, cx, cy + 0.2, 1.15, ink);
+    fill_circle(rt, cx, cy + 0.2, 0.45, core_col);
+
+    // 6) Bottom opening status dot
+    fill_circle(rt, cx, cy + 3.9, 0.65, dot_col);
 }
 
 /// Smooth antialiased polyline with soft translucent vertical gradient area fill.

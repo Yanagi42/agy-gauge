@@ -8,7 +8,7 @@
 //!     with per-session cache hit rate.
 //!   - Interactive "总计 / 仅增量" toggle and Registry-persisted DateScope (defaults to Today).
 
-use chrono::{Datelike, Local, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -22,21 +22,25 @@ use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::d2d::{
-    brush, draw_activity_heatmap, draw_area_series, draw_editorial_bars, draw_line, draw_pace_bar,
-    draw_ring_gauge, draw_text, fill_circle, fill_round_rect, hit_rect, load_color, rect_f,
-    stroke_round_rect, theme_for, with_alpha, BarItem, BarUnit, D2DFactories, Fonts, HeatmapDay,
-    Theme, WindowSurface,
+    brush, draw_activity_heatmap, draw_area_series, draw_brand_dial_icon, draw_editorial_bars,
+    draw_line, draw_pace_bar, draw_ring_gauge, draw_text, fill_circle, fill_round_rect, hit_rect,
+    load_color, rect_f, stroke_circle, stroke_round_rect, theme_for, with_alpha, BarItem, BarUnit,
+    D2DFactories, Fonts, HeatmapDay, Theme, WindowSurface,
+};
+use crate::launcher::{
+    classify_resume_capability, find_resumable_parent, normalize_workspace_path_str,
+    validate_conversation_id, BlockedReason,
 };
 use crate::pricing::{
     fmt_cost, fmt_cost_compact, fmt_rate_plain, fmt_usd, fmt_usd_compact, fmt_usd_precise,
     PriceSource, PricingTableRow,
 };
-use crate::quota::{fmt_countdown, AlertSeverity, BudgetConfig, QuotaProvenance};
+use crate::quota::{evaluate_alerts, fmt_countdown, AlertSeverity, BudgetConfig, QuotaProvenance};
 use crate::stats::{
     filter_snapshot_range, fmt_commas, fmt_compact, fmt_duration_short, fmt_gap, fmt_num,
-    is_compaction_model, iso_week_key, iso_week_range_label, weekday_cn, workspace_short_name,
-    AggregatedStats, DateScope, ModelCacheStats, ScanSnapshot, SessionInfo, SessionSort,
-    SourceKind, TokenCounts, TurnRecord,
+    is_compaction_model, iso_week_bounds, iso_week_key, iso_week_range_label, weekday_cn,
+    workspace_short_name, AgentFamily, AggregatedStats, DateScope, ModelCacheStats, ScanSnapshot,
+    SessionInfo, SessionSort, SourceKind, TokenCounts, TurnRecord,
 };
 use crate::telemetry::{apply_win11_frame, copy_text_to_clipboard, SystemTelemetry};
 
@@ -85,6 +89,7 @@ pub enum BreakdownMode {
     Model,
     Workspace,
     Tools,
+    Source,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,12 +142,101 @@ pub fn redact_data_dir(path: &Path) -> String {
     let norm = path.to_string_lossy().replace('\\', "/");
     let trimmed = norm.trim_end_matches('/');
     let lower = trimmed.to_ascii_lowercase();
-    for suffix in ["antigravity-cli", "antigravity", "antigravity-ide"] {
+    for suffix in ["antigravity-cli", "antigravity", "antigravity-ide", "tmp"] {
         if lower == format!(".gemini/{suffix}") || lower.ends_with(&format!("/.gemini/{suffix}")) {
             return format!("~/.gemini/{suffix}");
         }
     }
+    for suffix in [".config/claude", ".claude", ".codex"] {
+        if lower == suffix || lower.ends_with(&format!("/{suffix}")) {
+            return format!("~/{suffix}");
+        }
+    }
     "<已脱敏目录>".to_string()
+}
+
+/// Returns the quiet monochrome badge text (without brackets) for a session's `SourceKind`.
+/// When `has_non_antigravity` is `false`, preserves legacy behavior (`Cli` has no prefix;
+/// `App` / `IDE` / `自定义` stay unchanged). When non-AGY agents exist, labels all sources
+/// uniformly as `AGY` / `App` / `IDE` / `Claude` / `Codex` / `Gemini`.
+pub fn format_source_tag(source: SourceKind, has_non_antigravity: bool) -> Option<&'static str> {
+    match source {
+        SourceKind::Cli => has_non_antigravity.then_some("AGY"),
+        SourceKind::App => Some("App"),
+        SourceKind::Ide => Some("IDE"),
+        SourceKind::ClaudeCode => Some("Claude"),
+        SourceKind::Codex => Some("Codex"),
+        SourceKind::GeminiCli => Some("Gemini"),
+        SourceKind::Custom => Some(if has_non_antigravity { "AGY" } else { "自定义" }),
+    }
+}
+
+/// Formats turn thinking/reasoning metadata: prefers exact `reasoning_tokens` (`X tok`, used by
+/// Codex & Gemini CLI) over plaintext `thinking_chars` (`X 字`, used by Antigravity & Claude Code).
+pub fn format_turn_thinking(t: &TurnRecord) -> Option<String> {
+    if !t.has_thinking() {
+        return None;
+    }
+    if t.reasoning_tokens > 0 {
+        Some(format!("{} tok", fmt_commas(t.reasoning_tokens)))
+    } else if t.thinking_chars > 0 {
+        Some(format!("{} 字", fmt_commas(t.thinking_chars)))
+    } else {
+        None
+    }
+}
+
+/// Formats all active read-only source directories for the System tab footer (privacy-safe when redacted).
+pub fn format_active_sources_line(
+    data_dirs: &[(SourceKind, std::path::PathBuf)],
+    fallback_dir: &Path,
+    privacy_mode: bool,
+) -> String {
+    let fmt_one = |kind: SourceKind, dir: &Path| -> String {
+        let eff_path: std::borrow::Cow<'_, Path> = if kind == SourceKind::GeminiCli
+            && dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(".gemini"))
+        {
+            std::borrow::Cow::Owned(dir.join("tmp"))
+        } else {
+            std::borrow::Cow::Borrowed(dir)
+        };
+        let path_disp = if privacy_mode {
+            redact_data_dir(&eff_path)
+        } else {
+            eff_path.display().to_string()
+        };
+        format!("[{}] {}", kind.label_short(), path_disp)
+    };
+    if data_dirs.is_empty() {
+        let disp = if privacy_mode {
+            redact_data_dir(fallback_dir)
+        } else {
+            fallback_dir.display().to_string()
+        };
+        return format!("活跃来源: {disp}");
+    }
+    let parts: Vec<String> = data_dirs.iter().map(|(k, p)| fmt_one(*k, p)).collect();
+    format!("活跃来源({}): {}", data_dirs.len(), parts.join(" · "))
+}
+
+fn source_matches_query(source: SourceKind, q: &str) -> bool {
+    if source.label_short().to_ascii_lowercase().contains(q)
+        || source.as_str().to_ascii_lowercase().contains(q)
+    {
+        return true;
+    }
+    let fam = source.agent_family();
+    if fam.label_short().to_ascii_lowercase().contains(q)
+        || fam.label_full().to_ascii_lowercase().contains(q)
+    {
+        return true;
+    }
+    fam.search_aliases()
+        .iter()
+        .any(|alias| alias.to_ascii_lowercase().contains(q))
 }
 
 pub fn redact_pricing_path(path: Option<&Path>) -> String {
@@ -298,6 +392,7 @@ impl Redactor {
 pub enum SessionFilter {
     Model(String),
     Workspace(String),
+    Agent(AgentFamily),
     Date(String),
     Week(String),
     Parent(String, String), // (parent_conversation_id, parent_title)
@@ -317,6 +412,7 @@ impl SessionFilter {
                 };
                 format!("项目: {}  ×", disp)
             }
+            SessionFilter::Agent(fam) => format!("来源: {}  ×", fam.label_short()),
             SessionFilter::Date(d) => format!("日期: {}  ×", d),
             SessionFilter::Week(w) => format!("周: {}  ×", w),
             SessionFilter::Parent(pid, title) => {
@@ -337,6 +433,7 @@ impl SessionFilter {
                 s.turns.iter().any(|t| self.turn_matches(t))
             }
             SessionFilter::Workspace(ws) => s.workspace == *ws,
+            SessionFilter::Agent(fam) => s.source.agent_family() == *fam,
             SessionFilter::Parent(pid, _) => {
                 s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str())
             }
@@ -344,7 +441,7 @@ impl SessionFilter {
     }
 
     /// Model / day / week filters slice *inside* a session: only the matching turns should be
-    /// counted. Workspace / parent filters select whole sessions.
+    /// counted. Workspace / agent / parent filters select whole sessions.
     fn slices_turns(&self) -> bool {
         matches!(self, SessionFilter::Model(_) | SessionFilter::Date(_) | SessionFilter::Week(_))
     }
@@ -360,7 +457,7 @@ impl SessionFilter {
                 .timestamp_utc
                 .map(|u| iso_week_key(u.with_timezone(&Local).date_naive()) == *wk)
                 .unwrap_or(false),
-            SessionFilter::Workspace(_) | SessionFilter::Parent(..) => true,
+            SessionFilter::Workspace(_) | SessionFilter::Agent(_) | SessionFilter::Parent(..) => true,
         }
     }
 }
@@ -402,12 +499,16 @@ struct DisplaySessionRow {
     last_time: Option<chrono::DateTime<Local>>,
     subagent_count: usize,
     is_child_row: bool,
+    is_pinned: bool,
+    out_of_scope: bool,
 }
 
 /// One model call (= one transcript step carrying token counters) in the call log.
-/// Indexes into `cached_sessions`, so building the log never copies turn data.
+/// Indexes into `cached_sessions` (or `pinned_out_of_scope` when `out_of_scope` is true),
+/// so building the log never copies turn data.
 #[derive(Debug, Clone, Copy)]
 struct CallRow {
+    out_of_scope: bool,
     sess_idx: usize,
     turn_idx: usize,
     /// Seconds since the previous timestamped step of the same session (includes tool execution
@@ -443,6 +544,13 @@ pub enum ClickAction {
     ToggleCostMode,
     TogglePrivacyMode,
     ToggleGroupSubagents,
+    TogglePinnedOnly,
+    TogglePinSession(String),
+    ResumeSession(String),
+    CopyResumeCmd(String),
+    OpenWorkspace(String),
+    SessionMoreMenu(String),
+    ShowBlockedReason(String),
     ToggleFreshOnly,
     ToggleLightTheme,
     ToggleHuman,
@@ -472,6 +580,7 @@ pub struct DashboardView {
     prev_token_tab: Tab,
     pub daily_view: DailyViewMode,
     pub overview_top: OverviewTopMode,
+    overview_top_chosen: bool,
     pub weekly_mode: WeeklyMode,
     pub breakdown_mode: BreakdownMode,
     pub model_card_metric: ModelCardMetric,
@@ -489,6 +598,7 @@ pub struct DashboardView {
     pub session_filter: Option<SessionFilter>,
     pub cost_mode: bool,
     pub group_subagents: bool,
+    pub pinned_only: bool,
     pub privacy_mode: bool,
     pub fresh_only: bool,
     pub selected_session: Option<String>,
@@ -502,24 +612,81 @@ pub struct DashboardView {
     pub pricing_editing_custom_key: Option<String>,
     pub pricing_status: Option<(String, bool, Instant)>,
     pub pricing_field_rects: Option<[D2D_RECT_F; 5]>,
-    pub budget_field_rects: Option<[D2D_RECT_F; 5]>,
+    pub budget_field_rects: Option<[D2D_RECT_F; 4]>,
     pub pricing_focused_field: Option<usize>,
     pub export_btn_rect: Option<D2D_RECT_F>,
+    pub detail_more_btn_rect: Option<D2D_RECT_F>,
     pub mouse_dip: Option<(f32, f32)>,
     pub scroll_rows: usize,
     max_scroll: usize,
     sessions_vis_rows: usize,
     hit_boxes: Vec<HitBox>,
+    session_row_rects: Vec<(D2D_RECT_F, String)>,
     plot_rects: Vec<D2D_RECT_F>,
     last_hover_sig: (Option<usize>, bool),
     copied_until: Option<Instant>,
     session_copied_until: Option<Instant>,
+    pub resume_cmd_copied_until: Option<Instant>,
     banner_status: Option<(String, bool, Instant)>,
     cached_sessions: Vec<SessionInfo>,
+    pinned_out_of_scope: Vec<SessionInfo>,
+    pinned_ids: HashSet<String>,
     cached_agg: AggregatedStats,
+    all_total: TokenCounts,
+    all_sessions_count: usize,
+    has_non_antigravity: bool,
     redactor: Redactor,
     cached_date: NaiveDate,
     dirty_filter: bool,
+}
+
+/// Compact human-scannable Chinese relative timestamp for session rows (`刚刚`/`3m前`/`2h前`/`昨天`/`04/12`).
+pub fn fmt_relative_time_cn(ts: Option<DateTime<Local>>, now: DateTime<Local>) -> String {
+    let Some(t) = ts else {
+        return "-".to_string();
+    };
+    let delta = now.signed_duration_since(t).num_seconds();
+    if delta < 60 {
+        return "刚刚".to_string();
+    }
+    if delta < 3600 {
+        return format!("{}m前", delta / 60);
+    }
+    let today = now.date_naive();
+    let d = t.date_naive();
+    if d == today && delta < 86_400 {
+        return format!("{}h前", delta / 3600);
+    }
+    if today.signed_duration_since(d).num_days() == 1 {
+        return "昨天".to_string();
+    }
+    if d.year() == today.year() {
+        t.format("%m/%d").to_string()
+    } else {
+        t.format("%y/%m/%d").to_string()
+    }
+}
+
+fn draw_session_status_dot(
+    rt: &ID2D1RenderTarget,
+    theme: &Theme,
+    cx: f32,
+    cy: f32,
+    s: &SessionInfo,
+    last_time: Option<DateTime<Local>>,
+    now: DateTime<Local>,
+) {
+    if s.is_running_hint && !s.is_archived {
+        fill_circle(rt, cx, cy, 4.6, with_alpha(theme.accent, 0.24));
+        fill_circle(rt, cx, cy, 2.5, theme.accent);
+    } else if s.is_archived {
+        stroke_circle(rt, cx, cy, 2.1, theme.muted, 0.9);
+    } else if let Some(lt) = last_time {
+        let age = now.signed_duration_since(lt).num_seconds();
+        if age < 3600 {
+            fill_circle(rt, cx, cy, 2.2, theme.sage);
+        }
+    }
 }
 
 fn hit_rate_color(theme: &Theme, rate: f64) -> D2D1_COLOR_F {
@@ -623,7 +790,8 @@ impl DashboardView {
             active_tab: Tab::Overview,
             prev_token_tab: Tab::Overview,
             daily_view: DailyViewMode::Bars,
-            overview_top: OverviewTopMode::QuotaPace,
+            overview_top: OverviewTopMode::WeeklyCompare,
+            overview_top_chosen: false,
             weekly_mode: WeeklyMode::Weekly,
             breakdown_mode: BreakdownMode::Model,
             model_card_metric: ModelCardMetric::Volume,
@@ -641,6 +809,7 @@ impl DashboardView {
             session_filter: None,
             cost_mode,
             group_subagents,
+            pinned_only: false,
             privacy_mode,
             fresh_only,
             selected_session: None,
@@ -655,22 +824,42 @@ impl DashboardView {
             budget_field_rects: None,
             pricing_focused_field: None,
             export_btn_rect: None,
+            detail_more_btn_rect: None,
             mouse_dip: None,
             scroll_rows: 0,
             max_scroll: 0,
             sessions_vis_rows: 6,
             hit_boxes: Vec::new(),
+            session_row_rects: Vec::new(),
             plot_rects: Vec::new(),
             last_hover_sig: (None, false),
             copied_until: None,
             session_copied_until: None,
+            resume_cmd_copied_until: None,
             banner_status: None,
             cached_sessions: Vec::new(),
+            pinned_out_of_scope: Vec::new(),
+            pinned_ids: HashSet::new(),
             cached_agg: AggregatedStats::default(),
+            all_total: TokenCounts::default(),
+            all_sessions_count: 0,
+            has_non_antigravity: false,
             redactor: Redactor::default(),
             cached_date: Local::now().date_naive(),
             dirty_filter: true,
         }
+    }
+
+    fn is_multi_agent(&self) -> bool {
+        self.has_non_antigravity
+            || self
+                .cached_sessions
+                .iter()
+                .any(|s| s.source.agent_family() != AgentFamily::Antigravity)
+            || self
+                .pinned_out_of_scope
+                .iter()
+                .any(|s| s.source.agent_family() != AgentFamily::Antigravity)
     }
 
     fn format_session_id(&self, cid: &str) -> String {
@@ -735,10 +924,17 @@ impl DashboardView {
         if misses > 0 {
             events.push_str(&format!(" · {}次缓存未命中(重灌{})", misses, fmt_compact(miss_tok)));
         }
+        let source_disp = match s.source {
+            SourceKind::App | SourceKind::Ide => {
+                format!("{} ({})", s.source.family_label(), s.source.label_short())
+            }
+            _ => s.source.family_label().to_string(),
+        };
         format!(
-            "AGY 会话明细 · {}\n- ID: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
+            "会话明细 · {}\n- ID: {} | 来源: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
             title,
             sid,
+            source_disp,
             range,
             s.primary_model(),
             if ws.is_empty() { String::new() } else { format!(" | 项目: {}", ws) },
@@ -815,10 +1011,10 @@ impl DashboardView {
         if self.active_tab == Tab::Calls {
             return self.step_call(delta);
         }
-        if self.active_tab != Tab::Sessions || self.cached_sessions.is_empty() {
+        if self.active_tab != Tab::Sessions {
             return false;
         }
-        let sorted = self.display_sessions(true);
+        let sorted = self.display_sessions_for_tab();
         if sorted.is_empty() {
             return false;
         }
@@ -846,17 +1042,22 @@ impl DashboardView {
         self.session_filter.as_ref().filter(|f| f.slices_turns())
     }
 
-    /// Looks up a session by id, sliced to the active model / day / week filter so the detail card
-    /// and clipboard report the same numbers as the list row.
-    fn session_for_detail(&self, cid: &str) -> Option<SessionInfo> {
-        let s = self.cached_sessions.iter().find(|s| s.conversation_id == cid)?;
-        match self.slicing_filter() {
-            Some(f) => Some(slice_session(s, f).unwrap_or_else(|| s.clone())),
-            None => Some(s.clone()),
+    /// Looks up a session by id (including out-of-scope pinned sessions), sliced to the active
+    /// model / day / week filter when applicable so the detail card and clipboard match the row.
+    pub fn session_for_detail(&self, cid: &str) -> Option<SessionInfo> {
+        if let Some(s) = self.cached_sessions.iter().find(|s| s.conversation_id == cid) {
+            return match self.slicing_filter() {
+                Some(f) => Some(slice_session(s, f).unwrap_or_else(|| s.clone())),
+                None => Some(s.clone()),
+            };
         }
+        self.pinned_out_of_scope
+            .iter()
+            .find(|s| s.conversation_id == cid)
+            .cloned()
     }
 
-    fn count_subagents_of(&self, parent_id: &str) -> (usize, TokenCounts) {
+    pub fn count_subagents_of(&self, parent_id: &str) -> (usize, TokenCounts) {
         let mut cnt = 0usize;
         let mut agg = TokenCounts::default();
         let slicer = self.slicing_filter();
@@ -879,9 +1080,13 @@ impl DashboardView {
         (cnt, agg)
     }
 
+    fn session_split_counts_of(sessions: &[SessionInfo]) -> (usize, usize) {
+        let sub = sessions.iter().filter(|s| s.is_subagent).count();
+        (sessions.len().saturating_sub(sub), sub)
+    }
+
     fn session_split_counts(&self) -> (usize, usize) {
-        let sub = self.cached_sessions.iter().filter(|s| s.is_subagent).count();
-        (self.cached_sessions.len().saturating_sub(sub), sub)
+        Self::session_split_counts_of(&self.cached_sessions)
     }
 
     fn sort_display_rows(&self, rows: &mut [DisplaySessionRow], keep_parent_first: Option<&str>) {
@@ -918,10 +1123,13 @@ impl DashboardView {
             rows.sort_by(|a, b| {
                 let a_root = a.session.conversation_id == pid;
                 let b_root = b.session.conversation_id == pid;
-                b_root.cmp(&a_root).then_with(|| ord_row(a, b))
+                b_root
+                    .cmp(&a_root)
+                    .then_with(|| b.is_pinned.cmp(&a.is_pinned))
+                    .then_with(|| ord_row(a, b))
             });
         } else {
-            rows.sort_by(ord_row);
+            rows.sort_by(|a, b| b.is_pinned.cmp(&a.is_pinned).then_with(|| ord_row(a, b)));
         }
     }
 
@@ -936,7 +1144,7 @@ impl DashboardView {
         if title.contains(&q) || sid.contains(&q) || ws.contains(&q) {
             return true;
         }
-        if s.source.label_short().to_ascii_lowercase().contains(&q) {
+        if source_matches_query(s.source, &q) {
             return true;
         }
         if s.models.iter().any(|m| m.to_ascii_lowercase().contains(&q)) {
@@ -951,11 +1159,26 @@ impl DashboardView {
         false
     }
 
+    /// Sessions list for the `会话` tab (includes cross-`DateScope` pinned sessions and honors `pinned_only`).
+    fn display_sessions_for_tab(&self) -> Vec<DisplaySessionRow> {
+        self.display_sessions_inner(true, true)
+    }
+
+    /// Sessions list strictly inside the active `DateScope` (for CSV/JSON exports & overview fidelity).
+    fn display_sessions(&self, apply_filter: bool) -> Vec<DisplaySessionRow> {
+        self.display_sessions_inner(apply_filter, false)
+    }
+
     /// Builds session list rows, rolling up subagents into their parent session when `group_subagents`
     /// is enabled (unless drilling into a Parent group or filtering specifically to subagent-only models).
-    fn display_sessions(&self, apply_filter: bool) -> Vec<DisplaySessionRow> {
+    fn display_sessions_inner(
+        &self,
+        apply_filter: bool,
+        include_out_of_scope_pins: bool,
+    ) -> Vec<DisplaySessionRow> {
         let filter = if apply_filter { self.session_filter.as_ref() } else { None };
         let apply_search = apply_filter && !self.search_query.trim().is_empty();
+        let apply_pinned_only = apply_filter && include_out_of_scope_pins && self.pinned_only;
 
         // Parent drill-down always expands parent + all its subagents flat for inspection.
         if let Some(SessionFilter::Parent(pid, _)) = filter {
@@ -970,9 +1193,33 @@ impl DashboardView {
                     last_time: s.last_time,
                     subagent_count: 0,
                     is_child_row: s.parent_id.as_deref() == Some(pid.as_str()),
+                    is_pinned: self.pinned_ids.contains(&s.conversation_id),
+                    out_of_scope: false,
                     session: s.clone(),
                 })
                 .collect();
+            if include_out_of_scope_pins {
+                for s in &self.pinned_out_of_scope {
+                    if (s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
+                        && (!apply_search || self.session_matches_search(s))
+                        && !rows.iter().any(|r| r.session.conversation_id == s.conversation_id)
+                    {
+                        rows.push(DisplaySessionRow {
+                            counts: s.counts,
+                            primary_model: s.primary_model(),
+                            last_time: s.last_time,
+                            subagent_count: 0,
+                            is_child_row: s.parent_id.as_deref() == Some(pid.as_str()),
+                            is_pinned: true,
+                            out_of_scope: true,
+                            session: s.clone(),
+                        });
+                    }
+                }
+            }
+            if apply_pinned_only {
+                rows.retain(|r| r.is_pinned);
+            }
             self.sort_display_rows(&mut rows, Some(pid.as_str()));
             return rows;
         }
@@ -997,8 +1244,8 @@ impl DashboardView {
             .filter(|s| !apply_search || self.session_matches_search(s))
             .collect();
 
-        if !use_grouping {
-            let mut rows: Vec<DisplaySessionRow> = filtered
+        let mut rows = if !use_grouping {
+            filtered
                 .into_iter()
                 .map(|s| DisplaySessionRow {
                     counts: s.counts,
@@ -1006,56 +1253,102 @@ impl DashboardView {
                     last_time: s.last_time,
                     subagent_count: 0,
                     is_child_row: s.is_subagent,
+                    is_pinned: self.pinned_ids.contains(&s.conversation_id),
+                    out_of_scope: false,
                     session: s.clone(),
                 })
+                .collect()
+        } else {
+            let present_ids: std::collections::HashSet<&str> = filtered
+                .iter()
+                .map(|s| s.conversation_id.as_str())
                 .collect();
-            self.sort_display_rows(&mut rows, None);
-            return rows;
-        }
-
-        let present_ids: std::collections::HashSet<&str> = filtered
-            .iter()
-            .map(|s| s.conversation_id.as_str())
-            .collect();
-        let mut children_by_parent: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
-        for s in &filtered {
-            if let Some(pid) = s.parent_id.as_deref() {
-                if present_ids.contains(pid) {
-                    children_by_parent.entry(pid).or_default().push(*s);
-                }
-            }
-        }
-
-        let mut rows = Vec::with_capacity(filtered.len());
-        for s in &filtered {
-            // Skip subagents whose parent is already shown in this view (they roll up into parent).
-            if let Some(pid) = s.parent_id.as_deref() {
-                if present_ids.contains(pid) {
-                    continue;
-                }
-            }
-            let mut counts = s.counts;
-            let mut last_time = s.last_time;
-            let mut sub_cnt = 0usize;
-            if let Some(kids) = children_by_parent.get(s.conversation_id.as_str()) {
-                sub_cnt = kids.len();
-                for k in kids {
-                    counts.merge(&k.counts);
-                    if let Some(kt) = k.last_time {
-                        if last_time.map(|pt| kt > pt).unwrap_or(true) {
-                            last_time = Some(kt);
-                        }
+            let mut children_by_parent: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
+            for s in &filtered {
+                if let Some(pid) = s.parent_id.as_deref() {
+                    if present_ids.contains(pid) {
+                        children_by_parent.entry(pid).or_default().push(*s);
                     }
                 }
             }
-            rows.push(DisplaySessionRow {
-                counts,
-                primary_model: s.primary_model(),
-                last_time,
-                subagent_count: sub_cnt,
-                is_child_row: s.is_subagent,
-                session: (*s).clone(),
-            });
+
+            let mut out = Vec::with_capacity(filtered.len());
+            for s in &filtered {
+                // Skip subagents whose parent is already shown in this view (they roll up into parent).
+                if let Some(pid) = s.parent_id.as_deref() {
+                    if present_ids.contains(pid) {
+                        continue;
+                    }
+                }
+                let mut counts = s.counts;
+                let mut last_time = s.last_time;
+                let mut sub_cnt = 0usize;
+                if let Some(kids) = children_by_parent.get(s.conversation_id.as_str()) {
+                    sub_cnt = kids.len();
+                    for k in kids {
+                        counts.merge(&k.counts);
+                        if let Some(kt) = k.last_time {
+                            if last_time.map(|pt| kt > pt).unwrap_or(true) {
+                                last_time = Some(kt);
+                            }
+                        }
+                    }
+                }
+                out.push(DisplaySessionRow {
+                    counts,
+                    primary_model: s.primary_model(),
+                    last_time,
+                    subagent_count: sub_cnt,
+                    is_child_row: s.is_subagent,
+                    is_pinned: self.pinned_ids.contains(&s.conversation_id),
+                    out_of_scope: false,
+                    session: (*s).clone(),
+                });
+            }
+            out
+        };
+
+        // Append out-of-scope pinned sessions for the Sessions tab (Scheme A: always reachable
+        // without polluting DateScope aggregates / Hero stats / exports). Skip when user explicitly
+        // drilled into a specific Date or Week bar/cell.
+        let allow_oos = include_out_of_scope_pins
+            && !matches!(filter, Some(SessionFilter::Date(_) | SessionFilter::Week(_)));
+        if allow_oos {
+            let existing: HashSet<String> = rows
+                .iter()
+                .map(|r| r.session.conversation_id.clone())
+                .collect();
+            for s in &self.pinned_out_of_scope {
+                if existing.contains(&s.conversation_id) {
+                    continue;
+                }
+                if let Some(f) = filter {
+                    if !f.matches(s) {
+                        continue;
+                    }
+                }
+                if apply_search && !self.session_matches_search(s) {
+                    continue;
+                }
+                let eff = match filter.filter(|f| f.slices_turns()) {
+                    Some(f) => slice_session(s, f).unwrap_or_else(|| s.clone()),
+                    None => s.clone(),
+                };
+                rows.push(DisplaySessionRow {
+                    counts: eff.counts,
+                    primary_model: eff.primary_model(),
+                    last_time: eff.last_time,
+                    subagent_count: 0,
+                    is_child_row: eff.is_subagent,
+                    is_pinned: true,
+                    out_of_scope: true,
+                    session: eff,
+                });
+            }
+        }
+
+        if apply_pinned_only {
+            rows.retain(|r| r.is_pinned);
         }
         self.sort_display_rows(&mut rows, None);
         rows
@@ -1063,18 +1356,22 @@ impl DashboardView {
 
     // ---------- Call Log (per-step records derived from already-scanned turns; no extra file access) ----------
 
+    fn call_session(&self, r: &CallRow) -> &SessionInfo {
+        if r.out_of_scope {
+            &self.pinned_out_of_scope[r.sess_idx]
+        } else {
+            &self.cached_sessions[r.sess_idx]
+        }
+    }
+
     /// Builds the call log for the current date scope, honoring the shared search box and the
-    /// optional single-session drill-down. Search matches redacted session labels under privacy
-    /// mode (same no-oracle rule as the Sessions tab), plus the call's own model and tool names.
+    /// optional single-session drill-down (falling back to `pinned_out_of_scope` when inspecting
+    /// an out-of-scope pinned session's calls). Search matches redacted session labels under
+    /// privacy mode (same no-oracle rule as the Sessions tab), plus model and tool names.
     fn call_rows(&self) -> Vec<CallRow> {
         let q = self.search_query.trim().to_ascii_lowercase();
         let mut rows = Vec::new();
-        for (si, s) in self.cached_sessions.iter().enumerate() {
-            if let Some(cid) = self.call_session_filter.as_deref() {
-                if s.conversation_id != cid {
-                    continue;
-                }
-            }
+        let mut push_session_calls = |out_of_scope: bool, si: usize, s: &SessionInfo| {
             let session_hit = q.is_empty() || {
                 let title = self.format_session_title(s).to_ascii_lowercase();
                 let sid = self.format_session_id(&s.conversation_id).to_ascii_lowercase();
@@ -1082,7 +1379,7 @@ impl DashboardView {
                 title.contains(&q)
                     || sid.contains(&q)
                     || ws.contains(&q)
-                    || s.source.label_short().to_ascii_lowercase().contains(&q)
+                    || source_matches_query(s.source, &q)
             };
             let mut prev_ts: Option<chrono::DateTime<Utc>> = None;
             for (ti, t) in s.turns.iter().enumerate() {
@@ -1097,11 +1394,40 @@ impl DashboardView {
                     || t.model.to_ascii_lowercase().contains(&q)
                     || t.tool_names.iter().any(|n| n.to_ascii_lowercase().contains(&q));
                 if hit {
-                    rows.push(CallRow { sess_idx: si, turn_idx: ti, gap_secs });
+                    rows.push(CallRow {
+                        out_of_scope,
+                        sess_idx: si,
+                        turn_idx: ti,
+                        gap_secs,
+                    });
+                }
+            }
+        };
+
+        let mut matched_filtered_session = false;
+        for (si, s) in self.cached_sessions.iter().enumerate() {
+            if let Some(cid) = self.call_session_filter.as_deref() {
+                if s.conversation_id != cid {
+                    continue;
+                }
+                matched_filtered_session = true;
+            }
+            push_session_calls(false, si, s);
+        }
+        // Fallback for `ShowSessionCalls` triggered on an out-of-scope pinned session.
+        if !matched_filtered_session {
+            if let Some(cid) = self.call_session_filter.as_deref() {
+                if let Some((si, s)) = self
+                    .pinned_out_of_scope
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| s.conversation_id == cid)
+                {
+                    push_session_calls(true, si, s);
                 }
             }
         }
-        let turn = |r: &CallRow| &self.cached_sessions[r.sess_idx].turns[r.turn_idx];
+        let turn = |r: &CallRow| &self.call_session(r).turns[r.turn_idx];
         let recent = |a: &CallRow, b: &CallRow| {
             let (ta, tb) = (turn(a), turn(b));
             tb.timestamp_utc
@@ -1136,14 +1462,14 @@ impl DashboardView {
     }
 
     fn call_key(&self, r: &CallRow) -> (String, i64) {
-        let s = &self.cached_sessions[r.sess_idx];
+        let s = self.call_session(r);
         (s.conversation_id.clone(), s.turns[r.turn_idx].step_index)
     }
 
     fn selected_call_index(&self, rows: &[CallRow]) -> Option<usize> {
         let (cid, step) = self.selected_call.as_ref()?;
         rows.iter().position(|r| {
-            let s = &self.cached_sessions[r.sess_idx];
+            let s = self.call_session(r);
             s.conversation_id == *cid && s.turns[r.turn_idx].step_index == *step
         })
     }
@@ -1220,15 +1546,27 @@ impl DashboardView {
             t.tool_names.join(", ")
         };
         let speed = match (t.gen_secs, t.output_tps()) {
-            (Some(g), Some(v)) => format!("{} · {:.0} tok/s", fmt_duration_short(g as u64), v),
-            (Some(g), None) => format!("{} (过短，不计速度)", fmt_duration_short(g as u64)),
+            (Some(g), Some(v)) => format!(
+                "{} · {:.0} tok/s (含首字延迟与思考，秒级时间戳估算)",
+                fmt_duration_short(g as u64),
+                v
+            ),
+            (Some(g), None) => format!(
+                "{} (过短，不计速度)",
+                fmt_duration_short(g as u64)
+            ),
+            (None, _) if s.source.agent_family() != AgentFamily::Antigravity => {
+                "- (当前日志无生成耗时记录)".to_string()
+            }
             (None, _) => "- (纯回复 / 压缩步骤无结束时间)".to_string(),
         };
+        let thinking_disp = format_turn_thinking(t).unwrap_or_else(|| "无".to_string());
         format!(
-            "AGY 调用明细 · {} · Step #{}\n- 时间: {} | 会话: {} | 模型: {}{}\n- 估算 API 费用: {}\n- 总 Token: {} | 新输入: {} | 输出: {} | 缓存读: {} (命中 {:.1}%) | 缓存写: {}\n- 生成耗时: {} (含首字延迟与思考，秒级时间戳估算)\n- 工具({}): {} | 思考: {} 字 | 距上一步: {}",
+            "调用明细 · {} · Step #{}\n- 时间: {} | 来源: {} | 会话: {} | 模型: {}{}\n- 估算 API 费用: {}\n- 总 Token: {} | 新输入: {} | 输出: {} | 缓存读: {} (命中 {:.1}%) | 缓存写: {}\n- 生成耗时: {}\n- 工具({}): {} | 思考: {} | 距上一步: {}",
             self.format_session_title(s),
             t.step_index,
             time,
+            s.source.family_label(),
             self.format_session_id(&s.conversation_id),
             t.model,
             if ws.is_empty() { String::new() } else { format!(" | 项目: {}", ws) },
@@ -1242,7 +1580,7 @@ impl DashboardView {
             speed,
             t.tool_names.len(),
             tools,
-            fmt_commas(t.thinking_chars),
+            thinking_disp,
             gap_secs.map(fmt_gap).unwrap_or_else(|| "-".into()),
         )
     }
@@ -1252,7 +1590,7 @@ impl DashboardView {
     pub fn export_calls_csv(&self) -> String {
         let mut out = String::from("\u{FEFF}time,session_id,source,step,model,kind,tools,tool_count,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,context_tokens,cache_hit_pct,thinking_chars,gen_secs,output_tps,gap_secs,cost_usd,workspace,session_title\n");
         for r in self.call_rows() {
-            let s = &self.cached_sessions[r.sess_idx];
+            let s = self.call_session(&r);
             let t = &s.turns[r.turn_idx];
             let time = t
                 .timestamp_utc
@@ -1373,14 +1711,51 @@ impl DashboardView {
         matches!(self.active_tab, Tab::Sessions | Tab::Calls)
     }
 
-    pub fn is_custom_date_active(&self) -> bool {
-        self.scope == DateScope::Custom
+    /// Whether the active tab is filtered by the top-bar `DateScope` selector.
+    /// `按天` and `按周` (incl. `按月`) are full-history time-series views and stay independent of narrow scopes.
+    pub fn tab_uses_scope(&self) -> bool {
+        !matches!(self.active_tab, Tab::Daily | Tab::Weekly)
     }
 
-    pub fn format_budget_fields(cfg: &BudgetConfig) -> [String; 5] {
+    pub fn is_custom_date_active(&self) -> bool {
+        self.tab_uses_scope() && self.scope == DateScope::Custom
+    }
+
+    fn scope_covers_filter(
+        scope: DateScope,
+        custom_since: Option<NaiveDate>,
+        custom_until: Option<NaiveDate>,
+        filter: &SessionFilter,
+        today: NaiveDate,
+    ) -> bool {
+        let (since, until): (Option<NaiveDate>, Option<NaiveDate>) = match scope {
+            DateScope::Today => (Some(today), Some(today)),
+            DateScope::Days7 => (today.checked_sub_days(chrono::Days::new(6)), Some(today)),
+            DateScope::Days30 => (today.checked_sub_days(chrono::Days::new(29)), Some(today)),
+            DateScope::All => return true,
+            DateScope::Custom => (custom_since, custom_until),
+        };
+        match filter {
+            SessionFilter::Date(day_str) => {
+                let Ok(d) = NaiveDate::parse_from_str(day_str, "%Y-%m-%d") else {
+                    return true;
+                };
+                since.map(|s| d >= s).unwrap_or(true) && until.map(|u| d <= u).unwrap_or(true)
+            }
+            SessionFilter::Week(wk_str) => {
+                let Some((mon, sun)) = iso_week_bounds(wk_str) else {
+                    return true;
+                };
+                let eff_end = sun.min(today).max(mon);
+                since.map(|s| mon >= s).unwrap_or(true) && until.map(|u| eff_end <= u).unwrap_or(true)
+            }
+            _ => true,
+        }
+    }
+
+    pub fn format_budget_fields(cfg: &BudgetConfig) -> [String; 4] {
         let fmt_b = |v: f64| if v > 0.0 { format!("{v:.2}") } else { String::new() };
         [
-            fmt_b(cfg.block_5h_usd),
             fmt_b(cfg.daily_usd),
             fmt_b(cfg.weekly_usd),
             format!("{:.0}", cfg.warn_pct),
@@ -1456,9 +1831,14 @@ impl DashboardView {
         out
     }
 
-    pub fn export_daily_csv(&self) -> String {
+    pub fn export_daily_csv(&self, snapshot: &ScanSnapshot) -> String {
+        let by_day = if self.tab_uses_scope() {
+            &self.cached_agg.by_day
+        } else {
+            &snapshot.agg.by_day
+        };
         let mut out = String::from("\u{FEFF}date,calls,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,non_cached_tokens,cache_hit_pct,cost_usd,cache_saved_usd,peak_context\n");
-        for (day, c) in &self.cached_agg.by_day {
+        for (day, c) in by_day {
             out.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{:.2},{:.6},{:.6},{}\n",
                 day,
@@ -1494,45 +1874,108 @@ impl DashboardView {
                 "cache_saved_usd": (c.cost.cache_saved_usd * 1e6).round() / 1e6,
             })
         };
-        let sessions_v: Vec<Value> = self
-            .display_sessions(true)
-            .into_iter()
-            .map(|r| {
-                let s = &r.session;
-                json!({
-                    "id": self.format_session_id(&s.conversation_id),
-                    "title": self.format_session_title(s),
-                    "workspace": self.format_workspace_label(&s.workspace),
-                    "source": s.source.as_str(),
-                    "is_archived": s.is_archived,
-                    "primary_model": r.primary_model,
-                    "active_duration_secs": s.active_duration_secs(),
-                    "thinking_turns": s.thinking_turns(),
-                    "tools": s.tool_counts(),
-                    "stats": tc_json(&r.counts),
+        let use_full = !self.tab_uses_scope() && self.scope != DateScope::All;
+        let full_redactor = if use_full && self.privacy_mode {
+            Some(Redactor::build(&snapshot.sessions, &snapshot.agg))
+        } else {
+            None
+        };
+        let agg_ref = if use_full { &snapshot.agg } else { &self.cached_agg };
+        let scope_str = if use_full {
+            format!("{:?}", DateScope::All)
+        } else {
+            format!("{:?}", self.scope)
+        };
+        let sessions_v: Vec<Value> = if use_full {
+            snapshot
+                .sessions
+                .iter()
+                .map(|s| {
+                    let (sid, title, ws) = if let Some(red) = full_redactor.as_ref() {
+                        (
+                            red.session_id(&s.conversation_id),
+                            red.session_title(s),
+                            red.workspace_label(&s.workspace),
+                        )
+                    } else {
+                        let short_ws = workspace_short_name(&s.workspace);
+                        (
+                            s.conversation_id[..s.conversation_id.len().min(8)].to_string(),
+                            s.title.clone(),
+                            if short_ws.is_empty() {
+                                "(未知工作区)".to_string()
+                            } else {
+                                short_ws
+                            },
+                        )
+                    };
+                    json!({
+                        "id": sid,
+                        "title": title,
+                        "workspace": ws,
+                        "source": s.source.as_str(),
+                        "is_archived": s.is_archived,
+                        "primary_model": s.primary_model(),
+                        "active_duration_secs": s.active_duration_secs(),
+                        "thinking_turns": s.thinking_turns(),
+                        "tools": s.tool_counts(),
+                        "stats": tc_json(&s.counts),
+                    })
                 })
-            })
-            .collect();
-        let by_day: BTreeMap<&String, Value> = self
-            .cached_agg
+                .collect()
+        } else {
+            self.display_sessions(true)
+                .into_iter()
+                .map(|r| {
+                    let s = &r.session;
+                    json!({
+                        "id": self.format_session_id(&s.conversation_id),
+                        "title": self.format_session_title(s),
+                        "workspace": self.format_workspace_label(&s.workspace),
+                        "source": s.source.as_str(),
+                        "is_archived": s.is_archived,
+                        "primary_model": r.primary_model,
+                        "active_duration_secs": s.active_duration_secs(),
+                        "thinking_turns": s.thinking_turns(),
+                        "tools": s.tool_counts(),
+                        "stats": tc_json(&r.counts),
+                    })
+                })
+                .collect()
+        };
+        let by_day: BTreeMap<&String, Value> = agg_ref
             .by_day
             .iter()
             .map(|(k, c)| (k, tc_json(c)))
             .collect();
-        let by_model: BTreeMap<&String, Value> = self
-            .cached_agg
+        let by_model: BTreeMap<&String, Value> = agg_ref
             .by_model
             .iter()
             .map(|(k, c)| (k, tc_json(c)))
             .collect();
+        let by_agent: BTreeMap<&str, Value> = agg_ref
+            .by_agent
+            .iter()
+            .map(|(fam, (cnt, c))| {
+                (
+                    fam.as_str(),
+                    json!({
+                        "label": fam.label_full(),
+                        "sessions": cnt,
+                        "stats": tc_json(c),
+                    }),
+                )
+            })
+            .collect();
         let payload = json!({
             "exported_at": Utc::now().to_rfc3339(),
             "redacted": self.privacy_mode,
-            "scope": format!("{:?}", self.scope),
-            "overview": tc_json(&self.cached_agg.total),
-            "active_duration_secs": self.cached_agg.total_active_secs,
-            "thinking_turns": self.cached_agg.total_thinking_turns,
-            "by_tool": self.cached_agg.by_tool,
+            "scope": scope_str,
+            "overview": tc_json(&agg_ref.total),
+            "active_duration_secs": agg_ref.total_active_secs,
+            "thinking_turns": agg_ref.total_thinking_turns,
+            "by_agent": by_agent,
+            "by_tool": agg_ref.by_tool,
             "by_day": by_day,
             "by_model": by_model,
             "sessions": sessions_v,
@@ -1598,10 +2041,27 @@ impl DashboardView {
         had_hover
     }
 
+    pub fn open_sessions_tab(&mut self) {
+        self.active_tab = Tab::Sessions;
+        self.prev_token_tab = Tab::Sessions;
+        self.scroll_rows = 0;
+    }
+
     pub fn hit_test_click(&self, x: f32, y: f32) -> Option<ClickAction> {
         for hb in self.hit_boxes.iter().rev() {
             if hit_rect(&hb.rect, x, y) {
                 return Some(hb.action.clone());
+            }
+        }
+        None
+    }
+
+    /// Independent session-row hit-tester for right-click context menus (`WM_RBUTTONUP`) on both
+    /// the Overview recent list and the Sessions list (immune to nested star button hitboxes).
+    pub fn hit_test_session_row(&self, x: f32, y: f32) -> Option<String> {
+        for (rect, cid) in self.session_row_rects.iter().rev() {
+            if hit_rect(rect, x, y) {
+                return Some(cid.clone());
             }
         }
         None
@@ -1641,6 +2101,7 @@ impl DashboardView {
             }
             ClickAction::SelectOverviewTop(mode) => {
                 self.overview_top = mode;
+                self.overview_top_chosen = true;
                 (false, false)
             }
             ClickAction::SelectWeeklyMode(m) => {
@@ -1678,8 +2139,11 @@ impl DashboardView {
             ClickAction::CopyStatuslineConfig => {
                 let snippet = Self::format_statusline_config_snippet();
                 if copy_text_to_clipboard(hwnd, &snippet) {
-                    self.set_banner_status("已复制 /statusline 配置片段（粘贴至 settings.json 即可接入官方配额）", false);
-                    self.set_pricing_status("已复制 /statusline 配置片段到剪贴板", false);
+                    self.set_banner_status(
+                        "已复制 /statusline 配置（粘入 ~/.gemini/antigravity-cli/settings.json 接入 agy 官方配额）",
+                        false,
+                    );
+                    self.set_pricing_status("已复制 Antigravity CLI /statusline 配置片段到剪贴板", false);
                 }
                 (false, false)
             }
@@ -1695,7 +2159,21 @@ impl DashboardView {
             | ClickAction::SaveBudgetEntry
             | ClickAction::ClearBudgetEntry
             | ClickAction::ExportMenu
-            | ClickAction::ApplyCustomDate => (false, false),
+            | ClickAction::ApplyCustomDate
+            | ClickAction::TogglePinSession(_)
+            | ClickAction::ResumeSession(_)
+            | ClickAction::CopyResumeCmd(_)
+            | ClickAction::OpenWorkspace(_)
+            | ClickAction::SessionMoreMenu(_) => (false, false),
+            ClickAction::ShowBlockedReason(msg) => {
+                self.set_banner_status(msg, true);
+                (false, false)
+            }
+            ClickAction::TogglePinnedOnly => {
+                self.pinned_only = !self.pinned_only;
+                self.scroll_rows = 0;
+                (false, false)
+            }
             ClickAction::SelectModelSort(sort) => {
                 self.model_sort = sort;
                 self.scroll_rows = 0;
@@ -1740,18 +2218,25 @@ impl DashboardView {
                 (false, true)
             }
             ClickAction::CopySummary => {
-                let t = self.cached_agg.total;
-                let scope_lbl = match self.scope {
-                    DateScope::Today => "今日",
-                    DateScope::Days7 => "近7天",
-                    DateScope::Days30 => "近30天",
-                    DateScope::All => "全部",
-                    DateScope::Custom => "自定义范围",
+                let use_full = !self.tab_uses_scope();
+                let t = if use_full { self.all_total } else { self.cached_agg.total };
+                let sess_cnt = if use_full { self.all_sessions_count } else { self.cached_sessions.len() };
+                let scope_lbl = if use_full {
+                    "全量历史"
+                } else {
+                    match self.scope {
+                        DateScope::Today => "今日",
+                        DateScope::Days7 => "近7天",
+                        DateScope::Days30 => "近30天",
+                        DateScope::All => "全部",
+                        DateScope::Custom => "自定义范围",
+                    }
                 };
+                let brand_hdr = if self.is_multi_agent() { "AGY Gauge 多端" } else { "AGY CLI " };
                 let text = if self.active_tab == Tab::Models {
                     let (primary, secondary) = self.ordered_models(self.model_sort);
                     let mut lines = vec![
-                        format!("AGY CLI 按模型用量与估算费用 ({})", scope_lbl),
+                        format!("{brand_hdr}按模型用量与估算费用 ({})", scope_lbl),
                         "| 模型 | 调用 | 命中率 | 稳定命中(第2轮起) | 未命中 | 输出速度(tok/s) | 新增输入 | 缓存读取 | 输出 | 总 Token | 估算费用(USD) | 峰值Ctx |".to_string(),
                         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
                     ];
@@ -1803,9 +2288,9 @@ impl DashboardView {
                     lines.join("\n")
                 } else {
                     format!(
-                        "AGY CLI Token & API 费用统计 ({})\n- 会话: {} | 调用: {}\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
+                        "{brand_hdr}Token & API 费用统计 ({})\n- 会话: {} | 调用: {}\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
                         scope_lbl,
-                        self.cached_sessions.len(),
+                        sess_cnt,
                         t.calls,
                         fmt_cost(&t.cost, t.calls, false),
                         fmt_usd_precise(t.cost.input_plus_write_usd()),
@@ -1853,32 +2338,55 @@ impl DashboardView {
             ClickAction::InspectSession(cid) => {
                 self.selected_session = Some(cid);
                 self.session_filter = None;
+                self.pinned_only = false;
                 self.active_tab = Tab::Sessions;
                 self.prev_token_tab = Tab::Sessions;
                 self.scroll_rows = 0;
                 (false, false)
             }
             ClickAction::FilterSessions(filter) => {
+                let expanded_scope = !Self::scope_covers_filter(
+                    self.scope,
+                    self.custom_since,
+                    self.custom_until,
+                    &filter,
+                    Local::now().date_naive(),
+                );
+                if expanded_scope {
+                    let msg = match &filter {
+                        SessionFilter::Week(_) => "已切换至「全部」以查看整周会话",
+                        _ => "已切换至「全部」以查看所选日期的会话",
+                    };
+                    self.scope = DateScope::All;
+                    self.dirty_filter = true;
+                    self.selected_session = None;
+                    self.set_banner_status(msg, false);
+                }
                 self.session_filter = Some(filter);
+                self.pinned_only = false;
                 self.active_tab = Tab::Sessions;
                 self.prev_token_tab = Tab::Sessions;
                 self.scroll_rows = 0;
-                let matches = self.display_sessions(true);
-                let keep = self
-                    .selected_session
-                    .as_deref()
-                    .map(|id| matches.iter().any(|r| r.session.conversation_id == id))
-                    .unwrap_or(false);
-                if !keep {
-                    self.selected_session = matches.first().map(|r| r.session.conversation_id.clone());
+                if !expanded_scope {
+                    let matches = self.display_sessions_for_tab();
+                    let keep = self
+                        .selected_session
+                        .as_deref()
+                        .map(|id| matches.iter().any(|r| r.session.conversation_id == id))
+                        .unwrap_or(false);
+                    if !keep {
+                        self.selected_session = matches.first().map(|r| r.session.conversation_id.clone());
+                    }
                 }
                 (false, false)
             }
             ClickAction::ClearSessionFilter => {
                 if self.active_tab == Tab::Calls {
                     self.call_session_filter = None;
-                } else {
+                } else if self.session_filter.is_some() {
                     self.session_filter = None;
+                } else {
+                    self.pinned_only = false;
                 }
                 self.scroll_rows = 0;
                 (false, false)
@@ -1908,7 +2416,7 @@ impl DashboardView {
             ClickAction::CopyCallDetail => {
                 let rows = self.call_rows();
                 if let Some(r) = self.selected_call_index(&rows).map(|i| rows[i]) {
-                    let s = &self.cached_sessions[r.sess_idx];
+                    let s = self.call_session(&r);
                     let text = self.format_call_detail_clipboard(s, &s.turns[r.turn_idx], r.gap_secs);
                     if copy_text_to_clipboard(hwnd, &text) {
                         self.call_copied_until = Some(Instant::now() + std::time::Duration::from_millis(1600));
@@ -1927,12 +2435,63 @@ impl DashboardView {
         self.cached_date = today;
         let (sessions, agg) =
             filter_snapshot_range(snapshot, self.scope, self.custom_since, self.custom_until);
-        self.redactor = Redactor::build(&sessions, &agg);
+        let all_ids: HashSet<&str> = snapshot
+            .sessions
+            .iter()
+            .map(|s| s.conversation_id.as_str())
+            .collect();
+        self.pinned_ids = snapshot
+            .session_meta
+            .iter()
+            .filter(|(k, m)| m.pinned && all_ids.contains(k.as_str()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let in_scope_ids: HashSet<&str> = sessions
+            .iter()
+            .map(|s| s.conversation_id.as_str())
+            .collect();
+        let pinned_out_of_scope: Vec<SessionInfo> = snapshot
+            .sessions
+            .iter()
+            .filter(|s| {
+                self.pinned_ids.contains(&s.conversation_id)
+                    && !in_scope_ids.contains(s.conversation_id.as_str())
+            })
+            .cloned()
+            .collect();
+
+        // Build Redactor across both in-scope sessions and out-of-scope pinned sessions so
+        // cross-scope pinned rows never degrade to `S-???` / `项目 ?`, while preserving exact
+        // in-scope numbering and Hero aggregates.
+        let mut all_for_redactor = Vec::with_capacity(sessions.len() + pinned_out_of_scope.len());
+        all_for_redactor.extend(sessions.iter().cloned());
+        all_for_redactor.extend(pinned_out_of_scope.iter().cloned());
+        self.redactor = Redactor::build(&all_for_redactor, &agg);
+
+        if self.pinned_ids.is_empty() {
+            self.pinned_only = false;
+        }
+        if !self.overview_top_chosen {
+            let has_official = snapshot
+                .statusline
+                .as_ref()
+                .map(|s| s.provenance(Utc::now()) != QuotaProvenance::LocalEstimate)
+                .unwrap_or(false);
+            self.overview_top = if has_official {
+                OverviewTopMode::QuotaPace
+            } else {
+                OverviewTopMode::WeeklyCompare
+            };
+        }
         self.cached_sessions = sessions;
+        self.pinned_out_of_scope = pinned_out_of_scope;
         self.cached_agg = agg;
+        self.all_total = snapshot.agg.total;
+        self.all_sessions_count = snapshot.sessions.len();
+        self.has_non_antigravity = snapshot.has_non_antigravity();
         self.dirty_filter = false;
 
-        let visible = self.display_sessions(true);
+        let visible = self.display_sessions_for_tab();
         let keep = self
             .selected_session
             .as_ref()
@@ -1977,13 +2536,52 @@ impl DashboardView {
         }
 
         self.hit_boxes.clear();
+        self.session_row_rects.clear();
         self.plot_rects.clear();
         self.pricing_field_rects = None;
         self.budget_field_rects = None;
         self.search_field_rect = None;
         self.custom_date_rects = None;
         self.export_btn_rect = None;
+        self.detail_more_btn_rect = None;
         let theme = theme_for(light_theme);
+
+        let alert_level = {
+            let today_date = Local::now().date_naive();
+            let today_key = today_date.format("%Y-%m-%d").to_string();
+            let week_key = iso_week_key(today_date);
+            let today_usd = snapshot
+                .agg
+                .by_day
+                .get(&today_key)
+                .map(|c| c.cost.total_usd())
+                .unwrap_or(0.0);
+            let week_usd = snapshot
+                .agg
+                .by_week
+                .get(&week_key)
+                .map(|c| c.cost.total_usd())
+                .unwrap_or(0.0);
+            let alerts = evaluate_alerts(
+                &snapshot.budget,
+                &today_key,
+                today_usd,
+                &week_key,
+                week_usd,
+                snapshot.statusline.as_ref(),
+                Utc::now(),
+            );
+            match alerts
+                .iter()
+                .map(|a| a.severity)
+                .max()
+                .unwrap_or(AlertSeverity::Normal)
+            {
+                AlertSeverity::Critical => 2u8,
+                AlertSeverity::Warn => 1u8,
+                AlertSeverity::Normal => 0u8,
+            }
+        };
 
         let Some(surface) = self.surface.take() else {
             return Ok(());
@@ -1992,14 +2590,14 @@ impl DashboardView {
             unsafe {
                 rt.Clear(Some(&theme.bg));
             }
-            self.draw_header(rt, fonts, theme, w, human, light_theme);
-            let y_off = if self.scope == DateScope::Custom {
+            self.draw_header(factories, rt, fonts, theme, w, human, light_theme, alert_level);
+            let y_off = if self.is_custom_date_active() {
                 self.draw_custom_date_bar(rt, fonts, theme, w);
                 32.0
             } else {
                 0.0
             };
-            self.draw_hero_strip(factories, rt, fonts, theme, w, 58.0 + y_off, telemetry, human);
+            self.draw_hero_strip(factories, rt, fonts, theme, w, 58.0 + y_off, snapshot, telemetry, human);
 
             let body = rect_f(
                 20.0,
@@ -2010,9 +2608,9 @@ impl DashboardView {
             match self.active_tab {
                 Tab::Overview => self.draw_overview_tab(factories, rt, fonts, theme, body, snapshot, human),
                 Tab::Daily => self.draw_daily_tab(rt, fonts, theme, body, snapshot, human),
-                Tab::Weekly => self.draw_weekly_tab(rt, fonts, theme, body, human),
+                Tab::Weekly => self.draw_weekly_tab(rt, fonts, theme, body, snapshot, human),
                 Tab::Models => self.draw_models_tab(factories, rt, fonts, theme, body, snapshot, human),
-                Tab::Sessions => self.draw_sessions_tab(factories, rt, fonts, theme, body, human),
+                Tab::Sessions => self.draw_sessions_tab(factories, rt, fonts, theme, body, snapshot, human),
                 Tab::Calls => self.draw_calls_tab(factories, rt, fonts, theme, body, human),
                 Tab::System => self.draw_system_tab(factories, rt, fonts, theme, body, snapshot, telemetry),
             }
@@ -2097,26 +2695,29 @@ impl DashboardView {
 
     // ---------- Minimalist Editorial Header (4-Tab Flat Underline Nav) ----------
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_header(
         &mut self,
+        factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
         fonts: &Fonts,
         theme: &Theme,
         w: f32,
         human: bool,
         light_theme: bool,
+        alert_level: u8,
     ) {
         let h = 46.0;
         draw_line(rt, 0.0, h, w, h, theme.border, 1.0);
 
-        // Minimalist brand mark
-        fill_circle(rt, 21.0, h * 0.5, 3.2, theme.accent);
-        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(29.0, 0.0, 35.0, h), theme.text);
+        // 14 DIP Concept C Braun Paper Dial brand micro-icon
+        draw_brand_dial_icon(factories, rt, 20.0, h * 0.5, theme.is_dark, alert_level);
+        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(31.0, 0.0, 34.0, h), theme.text);
         draw_text(
             rt,
             if self.cost_mode { "/ $" } else { "/ 额" },
             &fonts.ui_small,
-            rect_f(63.0, 1.0, 28.0, h),
+            rect_f(65.0, 1.0, 27.0, h),
             theme.muted,
         );
 
@@ -2242,34 +2843,45 @@ impl DashboardView {
         draw_line(rt, rx, 14.0, rx, h - 14.0, theme.border, 1.0);
         rx -= 6.0;
 
-        // Scope filter (borderless editorial text toggles; persisted in Registry)
-        let scopes = [
-            (DateScope::Custom, "自定义", 42.0),
-            (DateScope::All, "全部", 32.0),
-            (DateScope::Days30, "30天", 34.0),
-            (DateScope::Days7, "7天", 28.0),
-            (DateScope::Today, "今日", 32.0),
-        ];
-        for (sc, lbl, sw) in scopes {
-            let r = rect_f(rx - sw, btn_y, sw, btn_h);
-            if r.left > tx + 4.0 {
-                let act = self.scope == sc;
-                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
-                if act {
-                    fill_round_rect(rt, r, 6.0, theme.hover);
-                } else if hov {
-                    fill_round_rect(rt, r, 6.0, with_alpha(theme.text, 0.04));
+        // Scope filter (borderless editorial text toggles; persisted in Registry).
+        // Hidden on full-history time-series tabs (`按天` / `按周`) to prevent truncated periods.
+        if self.tab_uses_scope() {
+            let scopes = [
+                (DateScope::Custom, "自定义", 42.0),
+                (DateScope::All, "全部", 32.0),
+                (DateScope::Days30, "30天", 34.0),
+                (DateScope::Days7, "7天", 28.0),
+                (DateScope::Today, "今日", 32.0),
+            ];
+            for (sc, lbl, sw) in scopes {
+                let r = rect_f(rx - sw, btn_y, sw, btn_h);
+                if r.left > tx + 4.0 {
+                    let act = self.scope == sc;
+                    let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&r, mx, my)).unwrap_or(false);
+                    if act {
+                        fill_round_rect(rt, r, 6.0, theme.hover);
+                    } else if hov {
+                        fill_round_rect(rt, r, 6.0, with_alpha(theme.text, 0.04));
+                    }
+                    draw_text(
+                        rt,
+                        lbl,
+                        &fonts.ui_small_center,
+                        r,
+                        if act { theme.text } else if hov { theme.sub } else { theme.muted },
+                    );
+                    self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectScope(sc) });
                 }
-                draw_text(
-                    rt,
-                    lbl,
-                    &fonts.ui_small_center,
-                    r,
-                    if act { theme.text } else if hov { theme.sub } else { theme.muted },
-                );
-                self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectScope(sc) });
+                rx -= sw + 2.0;
             }
-            rx -= sw + 2.0;
+        } else {
+            let badge_w = 62.0;
+            let r = rect_f(rx - badge_w, btn_y + 1.0, badge_w, btn_h - 2.0);
+            if r.left > tx + 4.0 {
+                fill_round_rect(rt, r, 6.0, theme.surface_subtle);
+                stroke_round_rect(rt, r, 6.0, theme.border, 0.8);
+                draw_text(rt, "全量历史", &fonts.ui_small_center, r, theme.muted);
+            }
         }
     }
 
@@ -2310,6 +2922,7 @@ impl DashboardView {
         theme: &Theme,
         w: f32,
         y: f32,
+        snapshot: &ScanSnapshot,
         telemetry: &SystemTelemetry,
         human: bool,
     ) {
@@ -2331,7 +2944,14 @@ impl DashboardView {
             draw_line(rt, dx, y + 14.0, dx, y + h - 14.0, theme.border, 1.0);
         }
 
-        let t = self.cached_agg.total;
+        let use_full = !self.tab_uses_scope();
+        let (t, days_cnt, root_sess, sub_sess, total_sess) = if use_full {
+            let (r, s) = Self::session_split_counts_of(&snapshot.sessions);
+            (snapshot.agg.total, snapshot.agg.by_day.len(), r, s, snapshot.sessions.len())
+        } else {
+            let (r, s) = Self::session_split_counts_of(&self.cached_sessions);
+            (self.cached_agg.total, self.cached_agg.by_day.len(), r, s, self.cached_sessions.len())
+        };
 
         // Block 1: Hero Total (Token or USD) + subtle ratio ribbon
         let bar_l = x0 + 18.0;
@@ -2456,14 +3076,13 @@ impl DashboardView {
         }
 
         // Block 3: Sessions & Calls
-        let (root_sess, sub_sess) = self.session_split_counts();
         let sess_lbl = if sub_sess > 0 {
             format!("活跃规模 (含{}子会话)", sub_sess)
         } else {
             "活跃规模".to_string()
         };
         draw_text(rt, &sess_lbl, &fonts.ui_micro, rect_f(x2 + 16.0, y + 9.0, c3 - 22.0, 14.0), theme.muted);
-        let disp_sess = if self.group_subagents && root_sess > 0 { root_sess } else { self.cached_sessions.len() };
+        let disp_sess = if self.group_subagents && root_sess > 0 { root_sess } else { total_sess };
         let act_str = if c3 >= 195.0 {
             format!("{} 会话 · {} 次", disp_sess, t.calls)
         } else {
@@ -2480,7 +3099,7 @@ impl DashboardView {
             format!("均单次 {}  ·  均会话 {}", fmt_usd_compact(avg_call), fmt_usd_compact(avg_sess))
         } else {
             let avg = if t.calls > 0 { t.total_tokens() / t.calls } else { 0 };
-            format!("均单次 {}  ·  {} 天", fmt_compact(avg), self.cached_agg.by_day.len())
+            format!("均单次 {}  ·  {} 天", fmt_compact(avg), days_cnt)
         };
         draw_text(rt, &sub3, &fonts.ui_micro, rect_f(x2 + 16.0, y + 53.0, c3 - 22.0, 14.0), theme.sub);
 
@@ -2692,7 +3311,7 @@ impl DashboardView {
             }
         }
 
-        // 2) Top-Right: Quota & 5h Pace (or ISO Week Compare) + Model/Workspace/Tool Breakdown
+        // 2) Top-Right: Official Quota / Daily-Weekly Budget (or ISO Week Compare) + Breakdown
         let tr = rect_f(tl.right + gap, body.top, right_w, top_h);
         fill_round_rect(rt, tr, 10.0, theme.surface);
         stroke_round_rect(rt, tr, 10.0, theme.border, 1.0);
@@ -2700,7 +3319,7 @@ impl DashboardView {
         let split_y = tr.top + (top_h * 0.44).clamp(100.0, 114.0);
         let mut ox = tr.left + 14.0;
         for (mode, lbl, ow) in [
-            (OverviewTopMode::QuotaPace, "额度 / 5h", 64.0),
+            (OverviewTopMode::QuotaPace, "官方额度", 60.0),
             (OverviewTopMode::WeeklyCompare, "本周同比", 60.0),
         ] {
             let r = rect_f(ox, tr.top + 8.0, ow, 20.0);
@@ -2740,9 +3359,14 @@ impl DashboardView {
                 };
                 let b_btn = rect_f(tr.right - 56.0, tr.top + 8.0, 44.0, 20.0);
                 self.draw_ghost_btn(rt, fonts, theme, b_btn, "预算 ›", false, ClickAction::OpenBudgetView);
+                let prov_lbl = if prov == QuotaProvenance::LocalEstimate {
+                    "未接入"
+                } else {
+                    prov.label_cn()
+                };
                 draw_text(
                     rt,
-                    prov.label_cn(),
+                    prov_lbl,
                     &fonts.ui_small_right,
                     rect_f(ox + 2.0, tr.top + 10.0, (b_btn.left - ox - 8.0).max(40.0), 16.0),
                     prov_col,
@@ -2757,6 +3381,21 @@ impl DashboardView {
                     .as_ref()
                     .map(|s| s.provenance(now_utc) != QuotaProvenance::LocalEstimate)
                     .unwrap_or(false);
+
+                let today_key = today.format("%Y-%m-%d").to_string();
+                let cur_wk = iso_week_key(today);
+                let today_usd = snapshot
+                    .agg
+                    .by_day
+                    .get(&today_key)
+                    .map(|c| c.cost.total_usd())
+                    .unwrap_or(0.0);
+                let week_usd = snapshot
+                    .agg
+                    .by_week
+                    .get(&cur_wk)
+                    .map(|c| c.cost.total_usd())
+                    .unwrap_or(0.0);
 
                 if has_official {
                     if let Some(sl) = snapshot.statusline.as_ref() {
@@ -2791,75 +3430,56 @@ impl DashboardView {
                             draw_pace_bar(rt, theme, rect_f(inner_l, cy + 16.0, inner_w, 5.0), used_pct as f32, time_pct, bar_col);
                             cy += 27.0;
                         }
-                    }
-                    if let Some(blk) = snapshot.active_block.as_ref() {
-                        let line = format!(
-                            "5h 块 {} · 速率 {}/h · 预计 {} · 剩 {}",
-                            fmt_cost_compact(&blk.counts.cost, blk.counts.calls),
-                            fmt_usd_compact(blk.usd_per_hour),
-                            fmt_usd_compact(blk.projected_usd),
-                            fmt_countdown(blk.remaining_secs),
-                        );
-                        draw_text(rt, &line, &fonts.ui_micro, rect_f(inner_l, (split_y - 17.0).max(cy), inner_w, 14.0), theme.sub);
-                    }
-                } else if let Some(blk) = snapshot.active_block.as_ref() {
-                    let b_cost = blk.counts.cost.total_usd();
-                    let time_pct = blk.time_progress_pct() as f32;
-                    let (title_r, fill_pct, bar_col) = if snapshot.budget.block_5h_usd > 0.0 {
-                        let used_p = (b_cost / snapshot.budget.block_5h_usd) * 100.0;
-                        let sev = snapshot.budget.classify_usage_pct(used_p);
-                        let col = match sev {
-                            AlertSeverity::Critical => theme.danger,
-                            AlertSeverity::Warn => theme.warn,
-                            AlertSeverity::Normal => theme.accent,
+                        let foot = if snapshot.budget.daily_usd > 0.0 || snapshot.budget.weekly_usd > 0.0 {
+                            let mut parts = Vec::new();
+                            if snapshot.budget.daily_usd > 0.0 {
+                                parts.push(format!(
+                                    "今日 {}/${:.0}",
+                                    fmt_usd_compact(today_usd),
+                                    snapshot.budget.daily_usd
+                                ));
+                            }
+                            if snapshot.budget.weekly_usd > 0.0 {
+                                parts.push(format!(
+                                    "本周 {}/${:.0}",
+                                    fmt_usd_compact(week_usd),
+                                    snapshot.budget.weekly_usd
+                                ));
+                            }
+                            format!("全源预算 · {}", parts.join(" · "))
+                        } else {
+                            let age = fmt_duration_short(sl.age_secs(now_utc).max(0) as u64);
+                            format!("Antigravity CLI /statusline 已同步 · {}前更新", age)
                         };
-                        (
-                            format!("{} / ${:.0} ({:.0}%)", fmt_cost_compact(&blk.counts.cost, blk.counts.calls), snapshot.budget.block_5h_usd, used_p),
-                            used_p as f32,
-                            col,
-                        )
+                        draw_text(rt, &foot, &fonts.ui_micro, rect_f(inner_l, (split_y - 17.0).max(cy), inner_w, 14.0), theme.sub);
+                    }
+                } else if snapshot.budget.daily_usd > 0.0 || snapshot.budget.weekly_usd > 0.0 {
+                    let (lbl, spent, cap) = if snapshot.budget.daily_usd > 0.0 {
+                        ("今日预算 (全源)", today_usd, snapshot.budget.daily_usd)
                     } else {
-                        (
-                            format!("{} · {} ({:.0}%窗口)", fmt_cost_compact(&blk.counts.cost, blk.counts.calls), fmt_compact(blk.counts.total_tokens()), time_pct),
-                            time_pct,
-                            theme.accent,
-                        )
+                        ("本周预算 (全源)", week_usd, snapshot.budget.weekly_usd)
                     };
+                    let used_p = (spent / cap) * 100.0;
+                    let sev = snapshot.budget.classify_usage_pct(used_p);
+                    let bar_col = match sev {
+                        AlertSeverity::Critical => theme.danger,
+                        AlertSeverity::Warn => theme.warn,
+                        AlertSeverity::Normal => theme.accent,
+                    };
+                    draw_text(rt, lbl, &fonts.mono_small, rect_f(inner_l, cy, inner_w * 0.44, 15.0), theme.text);
                     draw_text(
                         rt,
-                        &format!("5h 活跃窗口 ({})", blk.local_range_label()),
-                        &fonts.mono_small,
-                        rect_f(inner_l, cy, inner_w * 0.50, 15.0),
-                        theme.text,
-                    );
-                    draw_text(
-                        rt,
-                        &title_r,
+                        &format!("{} / ${:.0} ({:.0}%)", fmt_usd_compact(spent), cap, used_p),
                         &fonts.mono_small_right,
-                        rect_f(inner_l + inner_w * 0.48, cy, inner_w * 0.52, 15.0),
+                        rect_f(inner_l + inner_w * 0.42, cy, inner_w * 0.58, 15.0),
                         bar_col,
                     );
-                    draw_pace_bar(
-                        rt,
-                        theme,
-                        rect_f(inner_l, cy + 19.0, inner_w, 6.0),
-                        fill_pct,
-                        if snapshot.budget.block_5h_usd > 0.0 { Some(time_pct) } else { None },
-                        bar_col,
-                    );
-                    let rate_line = format!(
-                        "速率 {}/h ({}/m) · 窗口预计 {} · 剩 {}",
-                        fmt_usd_compact(blk.usd_per_hour),
-                        fmt_compact(blk.tokens_per_min.round() as u64),
-                        fmt_usd_compact(blk.projected_usd),
-                        fmt_countdown(blk.remaining_secs),
-                    );
-                    draw_text(rt, &rate_line, &fonts.ui_micro, rect_f(inner_l, cy + 31.0, inner_w, 15.0), theme.sub);
-                    let sl_btn = rect_f(inner_l, (split_y - 19.0).max(cy + 48.0), inner_w, 16.0);
+                    draw_pace_bar(rt, theme, rect_f(inner_l, cy + 19.0, inner_w, 6.0), used_p as f32, None, bar_col);
+                    let sl_btn = rect_f(inner_l, (split_y - 21.0).max(cy + 34.0), inner_w, 18.0);
                     let sl_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&sl_btn, mx, my)).unwrap_or(false);
                     draw_text(
                         rt,
-                        "点击复制 /statusline 配置，合规接入官方剩余配额 ›",
+                        "复制 /statusline 配置，接入 Antigravity CLI 官方配额 ›",
                         &fonts.ui_micro,
                         sl_btn,
                         if sl_hov { theme.accent } else { theme.muted },
@@ -2869,20 +3489,32 @@ impl DashboardView {
                         action: ClickAction::CopyStatuslineConfig,
                     });
                 } else {
-                    draw_text(rt, "当前无活跃 5h 滚动窗口（空闲中）", &fonts.ui_small, rect_f(inner_l, cy + 8.0, inner_w, 18.0), theme.sub);
-                    let sl_btn = rect_f(inner_l, cy + 32.0, inner_w, 18.0);
-                    let sl_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&sl_btn, mx, my)).unwrap_or(false);
                     draw_text(
                         rt,
-                        "点击复制 /statusline 配置，接入官方剩余配额 ›",
-                        &fonts.ui_micro,
-                        sl_btn,
-                        if sl_hov { theme.accent } else { theme.muted },
+                        "Antigravity CLI /statusline 配额桥接未接入",
+                        &fonts.ui_small,
+                        rect_f(inner_l, cy + 2.0, inner_w, 16.0),
+                        theme.text,
                     );
-                    self.hit_boxes.push(HitBox {
-                        rect: sl_btn,
-                        action: ClickAction::CopyStatuslineConfig,
-                    });
+                    draw_text(
+                        rt,
+                        "仅桥接 agy 官方余量；每日/每周美元预算汇总全部已发现 Agent",
+                        &fonts.ui_micro,
+                        rect_f(inner_l, cy + 21.0, inner_w, 14.0),
+                        theme.muted,
+                    );
+                    let btn_w = 136.0_f32.min(inner_w);
+                    let sl_btn = rect_f(inner_l, (split_y - 25.0).max(cy + 40.0), btn_w, 21.0);
+                    self.draw_ghost_btn(
+                        rt,
+                        fonts,
+                        theme,
+                        sl_btn,
+                        "复制 /statusline 配置",
+                        true,
+                        ClickAction::CopyStatuslineConfig,
+                    );
+                    stroke_round_rect(rt, sl_btn, 6.0, with_alpha(theme.accent, 0.55), 0.8);
                 }
             }
             OverviewTopMode::WeeklyCompare => {
@@ -3001,12 +3633,13 @@ impl DashboardView {
 
         draw_line(rt, tr.left + 16.0, split_y, tr.right - 16.0, split_y, theme.border, 1.0);
 
-        // Quiet "模型 | 项目 | 工具" breakdown toggle inside lower right section
+        // Quiet "模型 | 项目 | 工具 | 来源" breakdown toggle inside lower right section
         let mut bx = tr.left + 14.0;
         for (mode, lbl, bw_btn) in [
-            (BreakdownMode::Model, "模型", 42.0),
-            (BreakdownMode::Workspace, "项目", 42.0),
-            (BreakdownMode::Tools, "工具", 42.0),
+            (BreakdownMode::Model, "模型", 36.0),
+            (BreakdownMode::Workspace, "项目", 36.0),
+            (BreakdownMode::Tools, "工具", 36.0),
+            (BreakdownMode::Source, "来源", 36.0),
         ] {
             let r = rect_f(bx, split_y + 7.0, bw_btn, 20.0);
             let act = self.breakdown_mode == mode;
@@ -3027,7 +3660,7 @@ impl DashboardView {
                 rect: r,
                 action: ClickAction::SelectBreakdown(mode),
             });
-            bx += bw_btn + 3.0;
+            bx += bw_btn + 2.0;
         }
         if self.breakdown_mode == BreakdownMode::Model {
             let mut mx = tr.right - 98.0;
@@ -3056,12 +3689,12 @@ impl DashboardView {
                 });
                 mx += mw + 3.0;
             }
-        } else if self.breakdown_mode == BreakdownMode::Workspace {
+        } else if matches!(self.breakdown_mode, BreakdownMode::Workspace | BreakdownMode::Source) {
             draw_text(
                 rt,
                 "占比 · 会话数",
                 &fonts.ui_small_right,
-                rect_f(tr.right - 136.0, split_y + 9.0, 120.0, 16.0),
+                rect_f(tr.right - 130.0, split_y + 9.0, 114.0, 16.0),
                 theme.muted,
             );
         } else {
@@ -3078,6 +3711,7 @@ impl DashboardView {
             BreakdownMode::Model => self.draw_compact_models(factories, rt, fonts, theme, bd_bounds, human),
             BreakdownMode::Workspace => self.draw_compact_workspaces(rt, fonts, theme, bd_bounds, human),
             BreakdownMode::Tools => self.draw_compact_tools(rt, fonts, theme, bd_bounds),
+            BreakdownMode::Source => self.draw_compact_sources(rt, fonts, theme, bd_bounds, human),
         }
 
         // 3) Bottom Full-Width: Recent Active Sessions (grouped by parent session when enabled)
@@ -3104,7 +3738,7 @@ impl DashboardView {
         );
         draw_text(
             rt,
-            "点击查看逐轮剖析 →",
+            "左键剖析 · 右键管理 →",
             &fonts.ui_small_right,
             rect_f(bot.right - 170.0, bot.top + 10.0, 154.0, 18.0),
             theme.muted,
@@ -3131,13 +3765,14 @@ impl DashboardView {
         let (sm_x, sm_w, metrics_w) = session_metric_columns(rx);
         let sm_rect = |i: usize, y: f32, h: f32| rect_f(sm_x[i], y, sm_w[i], h);
         let model_x = rx - metrics_w - model_w;
-        let title_x = rr_l + 88.0;
+        let time_x = rr_l + 34.0;
+        let title_x = rr_l + 94.0;
         let title_w = (model_x - 10.0 - title_x).max(80.0);
 
         // Subtle column header row
         let hdr_y = bot.top + 31.0;
         let hdr_h = 20.0;
-        draw_text(rt, "时间", &fonts.ui_micro, rect_f(rr_l + 8.0, hdr_y, 74.0, hdr_h), theme.muted);
+        draw_text(rt, "时间", &fonts.ui_micro, rect_f(time_x, hdr_y, 56.0, hdr_h), theme.muted);
         draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
         draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
         for (i, lbl) in SESSION_METRIC_LABELS.iter().enumerate() {
@@ -3154,11 +3789,13 @@ impl DashboardView {
                 theme.muted,
             );
         } else {
+            let now_local = Local::now();
             let row_h = (avail_h / max_vis as f32).clamp(26.0, 32.0);
             for (i, row) in recent_rows.iter().take(show_n).enumerate() {
                 let s = &row.session;
                 let ry = list_y + i as f32 * row_h;
-                let rr = rect_f(rr_l, ry, rr_w, row_h - 2.0);
+                let cell_h = row_h - 2.0;
+                let rr = rect_f(rr_l, ry, rr_w, cell_h);
                 let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
                 if hov {
                     fill_round_rect(rt, rr, 6.0, theme.hover);
@@ -3166,17 +3803,30 @@ impl DashboardView {
                 if i > 0 {
                     draw_line(rt, bot.left + 16.0, ry - 1.0, bot.right - 16.0, ry - 1.0, theme.grid, 0.8);
                 }
-                let t_str = row.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
+                let cy = ry + cell_h * 0.5;
+                draw_session_status_dot(rt, theme, rr_l + 10.5, cy, s, row.last_time, now_local);
+                if row.is_pinned {
+                    draw_text(
+                        rt,
+                        "★",
+                        &fonts.ui_small_center,
+                        rect_f(rr_l + 16.0, ry, 16.0, cell_h),
+                        theme.accent,
+                    );
+                }
+
+                let t_str = fmt_relative_time_cn(row.last_time, now_local);
                 let hit_str = format!("{:.1}%", row.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &row.counts);
                 let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
                 let base_title = self.format_session_title(s);
+                let show_multi = snapshot.has_non_antigravity();
                 let mut prefix = String::new();
                 if row.is_child_row {
                     prefix.push_str("↳ ");
                 }
-                if s.source != SourceKind::Cli {
-                    prefix.push_str(&format!("[{}] ", s.source.label_short()));
+                if let Some(tag) = format_source_tag(s.source, show_multi) {
+                    prefix.push_str(&format!("[{tag}] "));
                 }
                 if s.is_archived {
                     prefix.push_str("[归档] ");
@@ -3188,14 +3838,14 @@ impl DashboardView {
                     None
                 };
 
-                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 74.0, row_h - 2.0), theme.muted);
+                draw_text(rt, &t_str, &fonts.mono_small, rect_f(time_x, ry, 56.0, cell_h), theme.muted);
                 let (actual_title_w, badge_rect) = if let Some(ref b) = sub_badge {
                     let bw = (factories.measure_text_width(b, &fonts.ui_small_center) + 10.0).ceil();
                     if title_w > bw + 40.0 {
                         let tw = (title_w - bw - 6.0).max(32.0);
                         let nat = factories.measure_text_width(&title_disp, &fonts.ui_reg);
                         let bx = title_x + nat.min(tw) + 6.0;
-                        (tw, Some(rect_f(bx, ry + (row_h - 2.0 - 16.0) * 0.5, bw, 16.0)))
+                        (tw, Some(rect_f(bx, ry + (cell_h - 16.0) * 0.5, bw, 16.0)))
                     } else {
                         (title_w, None)
                     }
@@ -3206,14 +3856,14 @@ impl DashboardView {
                     rt,
                     &title_disp,
                     &fonts.ui_reg,
-                    rect_f(title_x, ry, actual_title_w, row_h - 2.0),
+                    rect_f(title_x, ry, actual_title_w, cell_h),
                     if row.is_child_row { theme.sub } else { theme.text },
                 );
                 if let (Some(b), Some(br)) = (sub_badge.as_deref(), badge_rect) {
                     fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
                     draw_text(rt, b, &fonts.ui_small_center, br, theme.accent);
                 }
-                draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, row_h - 2.0), theme.muted);
+                draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, cell_h), theme.muted);
                 draw_session_metric_cells(
                     rt,
                     fonts,
@@ -3221,7 +3871,7 @@ impl DashboardView {
                     &sm_x,
                     &sm_w,
                     ry,
-                    row_h - 2.0,
+                    cell_h,
                     &row.counts,
                     &hit_str,
                     hit_col,
@@ -3230,6 +3880,7 @@ impl DashboardView {
                     human,
                 );
 
+                self.session_row_rects.push((rr, s.conversation_id.clone()));
                 self.hit_boxes.push(HitBox {
                     rect: rr,
                     action: ClickAction::InspectSession(s.conversation_id.clone()),
@@ -3514,9 +4165,129 @@ impl DashboardView {
         }
     }
 
+    fn draw_compact_sources(
+        &mut self,
+        rt: &ID2D1RenderTarget,
+        fonts: &Fonts,
+        theme: &Theme,
+        bounds: D2D_RECT_F,
+        human: bool,
+    ) {
+        let mut items: Vec<(AgentFamily, usize, TokenCounts)> = self
+            .cached_agg
+            .by_agent
+            .iter()
+            .map(|(&fam, &(cnt, c))| (fam, cnt, c))
+            .collect();
+        if self.cost_mode {
+            items.sort_by(|a, b| {
+                b.2.cost
+                    .total_usd()
+                    .partial_cmp(&a.2.cost.total_usd())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.2.total_tokens().cmp(&a.2.total_tokens()))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+        } else {
+            items.sort_by(|a, b| {
+                b.2.total_tokens()
+                    .cmp(&a.2.total_tokens())
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+        }
+        if items.is_empty() {
+            draw_text(rt, "当前范围暂无来源数据", &fonts.ui_small, bounds, theme.muted);
+            return;
+        }
+        let avail_h = (bounds.bottom - bounds.top).max(24.0);
+        let max_show = if avail_h >= 94.0 { 4 } else if avail_h >= 66.0 { 3 } else { 2 };
+        let show_n = items.len().min(max_show);
+        let total_all_tok = self.cached_agg.total.total_tokens().max(1);
+        let total_all_usd = self.cached_agg.total.cost.total_usd();
+        let row_h = (avail_h / show_n as f32).clamp(21.5, 34.0);
+        let w = bounds.right - bounds.left;
+        let palette = [theme.accent, theme.output, theme.ram, theme.sage];
+
+        for (i, (fam, sess_cnt, c)) in items.into_iter().take(show_n).enumerate() {
+            let y = bounds.top + i as f32 * row_h;
+            let row_r = rect_f(bounds.left - 4.0, y - 1.5, w + 8.0, row_h.min(25.0));
+            let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&row_r, mx, my)).unwrap_or(false);
+            if hov {
+                fill_round_rect(rt, row_r, 5.0, with_alpha(theme.text, 0.04));
+            }
+            let (share, stat) = if self.cost_mode {
+                let sh = if total_all_usd > 0.0 {
+                    (c.cost.total_usd() / total_all_usd) as f32
+                } else {
+                    0.0
+                };
+                (
+                    sh,
+                    format!(
+                        "{} ({:.0}%) · {}会话",
+                        fmt_cost(&c.cost, c.calls, human),
+                        sh * 100.0,
+                        sess_cnt
+                    ),
+                )
+            } else {
+                let sh = (c.total_tokens() as f64 / total_all_tok as f64) as f32;
+                (
+                    sh,
+                    format!(
+                        "{} ({:.0}%) · {}会话",
+                        fmt_num(c.total_tokens(), human),
+                        sh * 100.0,
+                        sess_cnt
+                    ),
+                )
+            };
+            draw_text(
+                rt,
+                fam.label_full(),
+                &fonts.mono_small,
+                rect_f(bounds.left, y, w * 0.44, 15.0),
+                if hov { theme.accent } else { theme.text },
+            );
+            draw_text(
+                rt,
+                &stat,
+                &fonts.mono_small_right,
+                rect_f(bounds.left + w * 0.42, y, w * 0.58, 15.0),
+                theme.sub,
+            );
+            fill_round_rect(rt, rect_f(bounds.left, y + 16.5, w, 3.0), 1.5, theme.grid);
+            if share > 0.0 {
+                fill_round_rect(
+                    rt,
+                    rect_f(bounds.left, y + 16.5, (w * share).max(3.0), 3.0),
+                    1.5,
+                    palette[i % palette.len()],
+                );
+            }
+            self.hit_boxes.push(HitBox {
+                rect: row_r,
+                action: ClickAction::FilterSessions(SessionFilter::Agent(fam)),
+            });
+        }
+    }
+
     fn draw_chart_legend_and_toggle(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, card: D2D_RECT_F) {
+        let _ = self.draw_chart_legend_and_toggle_at(rt, fonts, theme, card, card.top + 9.0);
+    }
+
+    /// Draws the stacked-bar color legend + `总计 | 仅增量` switch at a caller-specified `y_top`
+    /// and returns the left-most X coordinate occupied so caller text never collides on narrow windows.
+    fn draw_chart_legend_and_toggle_at(
+        &mut self,
+        rt: &ID2D1RenderTarget,
+        fonts: &Fonts,
+        theme: &Theme,
+        card: D2D_RECT_F,
+        y_top: f32,
+    ) -> f32 {
         let tw = 112.0;
-        let tr = rect_f(card.right - tw - 14.0, card.top + 9.0, tw, 22.0);
+        let tr = rect_f(card.right - tw - 14.0, y_top, tw, 22.0);
         fill_round_rect(rt, tr, 6.0, theme.surface_subtle);
         let r_tot = rect_f(tr.left + 2.0, tr.top + 2.0, 52.0, 18.0);
         let r_inc = rect_f(tr.left + 56.0, tr.top + 2.0, 54.0, 18.0);
@@ -3542,8 +4313,10 @@ impl DashboardView {
         self.hit_boxes.push(HitBox { rect: tr, action: ClickAction::ToggleFreshOnly });
 
         let mut lx = tr.left - 168.0;
-        let ly = card.top + 20.0;
+        let ly = y_top + 11.0;
+        let mut left_edge = tr.left;
         if lx > card.left + 152.0 {
+            left_edge = lx - 6.0;
             if !self.fresh_only {
                 fill_circle(rt, lx, ly, 3.0, theme.cache);
                 draw_text(rt, "缓存", &fonts.ui_micro, rect_f(lx + 6.0, ly - 7.0, 34.0, 14.0), theme.muted);
@@ -3557,6 +4330,7 @@ impl DashboardView {
             fill_circle(rt, lx, ly, 3.0, theme.output);
             draw_text(rt, "输出", &fonts.ui_micro, rect_f(lx + 6.0, ly - 7.0, 34.0, 14.0), theme.muted);
         }
+        left_edge
     }
 
     // ---------- Tab 2: Direct Daily Analytics ----------
@@ -3594,10 +4368,6 @@ impl DashboardView {
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectDailyView(mode) });
             dx += dw + 4.0;
         }
-        if self.scope == DateScope::Today && self.daily_view == DailyViewMode::Bars {
-            let hint_r = rect_f(dx + 6.0, chart_c.top + 9.0, 108.0, 22.0);
-            self.draw_ghost_btn(rt, fonts, theme, hint_r, "仅今日 · 展开全部", true, ClickAction::SelectScope(DateScope::All));
-        }
         if self.daily_view == DailyViewMode::Bars {
             self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
         } else {
@@ -3614,7 +4384,7 @@ impl DashboardView {
         self.plot_rects.push(plot);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
-        let days_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_day.iter().collect();
+        let days_asc: Vec<(&String, &TokenCounts)> = snapshot.agg.by_day.iter().collect();
 
         if self.daily_view == DailyViewMode::Heatmap {
             let today = Local::now().date_naive();
@@ -3673,14 +4443,14 @@ impl DashboardView {
                 });
             }
         } else {
-            let chart_days: Vec<(String, TokenCounts)> = if self.scope != DateScope::Today && days_asc.len() < 7 && !days_asc.is_empty() {
+            let chart_days: Vec<(String, TokenCounts)> = if days_asc.len() < 7 && !days_asc.is_empty() {
                 let today = Local::now().date_naive();
                 (0..7u64)
                     .rev()
                     .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
                     .map(|d| {
                         let k = d.format("%Y-%m-%d").to_string();
-                        (k.clone(), self.cached_agg.by_day.get(&k).copied().unwrap_or_default())
+                        (k.clone(), snapshot.agg.by_day.get(&k).copied().unwrap_or_default())
                     })
                     .collect()
             } else {
@@ -3804,7 +4574,15 @@ impl DashboardView {
 
     // ---------- Tab 3: Direct ISO Weekly (with quiet Monthly sub-toggle) ----------
 
-    fn draw_weekly_tab(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, body: D2D_RECT_F, human: bool) {
+    fn draw_weekly_tab(
+        &mut self,
+        rt: &ID2D1RenderTarget,
+        fonts: &Fonts,
+        theme: &Theme,
+        body: D2D_RECT_F,
+        snapshot: &ScanSnapshot,
+        human: bool,
+    ) {
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
         let chart_h = (bh * 0.50).clamp(190.0, 275.0);
@@ -3827,10 +4605,6 @@ impl DashboardView {
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectWeeklyMode(mode) });
             gx += gw + 4.0;
         }
-        if self.scope == DateScope::Today {
-            let hint_r = rect_f(gx + 6.0, chart_c.top + 9.0, 108.0, 22.0);
-            self.draw_ghost_btn(rt, fonts, theme, hint_r, "仅今日 · 展开全部", true, ClickAction::SelectScope(DateScope::All));
-        }
         self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
@@ -3839,7 +4613,7 @@ impl DashboardView {
 
         match self.weekly_mode {
             WeeklyMode::Weekly => {
-                let weeks_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_week.iter().collect();
+                let weeks_asc: Vec<(&String, &TokenCounts)> = snapshot.agg.by_week.iter().collect();
                 let mut wow: HashMap<String, String> = HashMap::new();
                 let mut prev: Option<f64> = None;
                 for (wk, c) in &weeks_asc {
@@ -3856,7 +4630,7 @@ impl DashboardView {
                 let bars: Vec<BarItem> = weeks_asc[start..]
                     .iter()
                     .map(|(wk, c)| {
-                        let ad = self.cached_agg.week_active_days.get(*wk).copied().unwrap_or(1).max(1) as u64;
+                        let ad = snapshot.agg.week_active_days.get(*wk).copied().unwrap_or(1).max(1) as u64;
                         let lbl = wk.split('-').last().unwrap_or(wk).to_string();
                         let tip = if self.cost_mode {
                             vec![
@@ -3909,7 +4683,7 @@ impl DashboardView {
                     .iter()
                     .rev()
                     .map(|(wk, c)| {
-                        let ad = self.cached_agg.week_active_days.get(*wk).copied().unwrap_or(0);
+                        let ad = snapshot.agg.week_active_days.get(*wk).copied().unwrap_or(0);
                         if self.cost_mode {
                             let avg_usd = if ad > 0 { c.cost.total_usd() / ad as f64 } else { 0.0 };
                             vec![
@@ -3982,7 +4756,7 @@ impl DashboardView {
                 self.draw_table(rt, fonts, theme, tbl_r, cols, &rows, Some(&wk_actions), None, None);
             }
             WeeklyMode::Monthly => {
-                let m_asc: Vec<(&String, &TokenCounts)> = self.cached_agg.by_month.iter().collect();
+                let m_asc: Vec<(&String, &TokenCounts)> = snapshot.agg.by_month.iter().collect();
                 let bars: Vec<BarItem> = m_asc
                     .iter()
                     .map(|(m, c)| {
@@ -4640,7 +5414,7 @@ impl DashboardView {
             "优先级：精确模型名 > 前缀匹配（如 gemini-4-neon 匹配全档位） > 内置默认  ·  Tab 切框 / Enter 保存"
         );
         let line2 = format!(
-            "共 {} 条单价 · 已自定义 {} 项 · 写入本地 {}（对 ~/.gemini 保持绝对只读）",
+            "共 {} 条单价 · 已自定义 {} 项 · 写入本地 {}（对所有 Agent 日志目录保持绝对只读）",
             snapshot.pricing_rows.len(),
             snapshot.custom_pricing_count,
             path_hint,
@@ -4724,7 +5498,7 @@ impl DashboardView {
         human: bool,
     ) {
         let bw = body.right - body.left;
-        let edit_h = 152.0;
+        let edit_h = 136.0;
         let edit_c = rect_f(body.left, body.top, bw, edit_h);
         fill_round_rect(rt, edit_c, 10.0, theme.surface);
         stroke_round_rect(rt, edit_c, 10.0, theme.border, 1.0);
@@ -4743,7 +5517,7 @@ impl DashboardView {
             Some((msg, true)) => (msg.to_string(), theme.danger),
             Some((msg, false)) => (msg.to_string(), theme.sage),
             None => (
-                "留空或填 0 表示不限制 · 到达预警/临界阈值时胶囊变色并弹出托盘提醒".to_string(),
+                "每日/每周美元预算汇总全部已发现 Agent · 留空或填 0 不限，超阈值自动提醒".to_string(),
                 theme.muted,
             ),
         };
@@ -4759,10 +5533,9 @@ impl DashboardView {
         let fields_r = inner_r - btns_w - 12.0;
         let fields_w = (fields_r - inner_l).max(260.0);
         let gap = 8.0;
-        let net_w = (fields_w - gap * 4.0).max(220.0);
-        let fracs = [0.22_f32, 0.22, 0.22, 0.17, 0.17];
+        let net_w = (fields_w - gap * 3.0).max(220.0);
+        let fracs = [0.28_f32, 0.28, 0.22, 0.22];
         let labels = [
-            "5h 预算 ($)",
             "每日预算 ($)",
             "每周预算 ($)",
             "预警比例 (%)",
@@ -4779,8 +5552,8 @@ impl DashboardView {
         };
 
         let mut fx = inner_l;
-        let mut child_rects = [rect_f(0.0, 0.0, 10.0, 10.0); 5];
-        for i in 0..5 {
+        let mut child_rects = [rect_f(0.0, 0.0, 10.0, 10.0); 4];
+        for i in 0..4 {
             let fw = (net_w * fracs[i]).floor();
             draw_text(rt, labels[i], &fonts.ui_micro, rect_f(fx + 2.0, lbl_y, fw, 14.0), theme.muted);
             let outer = rect_f(fx, box_y, fw, box_h);
@@ -4816,7 +5589,7 @@ impl DashboardView {
         let sl_summary = match snapshot.statusline.as_ref() {
             Some(sl) => {
                 let prov = sl.provenance(now_utc);
-                let age = fmt_duration_short(sl.age_secs(now_utc) as u64);
+                let age = fmt_duration_short(sl.age_secs(now_utc).max(0) as u64);
                 let b_txt: Vec<String> = sl
                     .buckets
                     .iter()
@@ -4825,13 +5598,13 @@ impl DashboardView {
                     .filter_map(|b| b.remaining_pct().map(|p| format!("{} {:.0}%", b.label, p)))
                     .collect();
                 format!(
-                    "官方 /statusline 桥接：{}（{}前更新） · {}",
+                    "Antigravity CLI /statusline 桥接（仅 agy 官方配额）：{}（{}前更新） · {}",
                     prov.label_cn(),
                     age,
                     if b_txt.is_empty() { "尚无配额池字段".into() } else { b_txt.join(" · ") }
                 )
             }
-            None => "官方 /statusline 桥接：未接入（将右上角配置粘入 settings.json，零侵入接入真实剩余配额）".into(),
+            None => "Antigravity CLI /statusline 桥接（仅 agy 官方配额）：未接入 · 粘入 settings.json 即可同步真实余量".into(),
         };
         let bpath = if self.privacy_mode {
             "./budget.json".to_string()
@@ -4845,60 +5618,107 @@ impl DashboardView {
         draw_text(rt, &sl_summary, &fonts.ui_micro, rect_f(inner_l, edit_c.top + 90.0, inner_r - inner_l, 15.0), theme.sub);
         draw_text(
             rt,
-            &format!("预算保存位置：{} · 官方配额低余量提醒：≤{:.0}% 预警 / ≤{:.0}% 临界", bpath, snapshot.budget.quota_warn_rem_pct, snapshot.budget.quota_crit_rem_pct),
+            &format!(
+                "每日/每周美元预算汇总全部 Agent（保存至 {}）· agy 配额提醒 ≤{:.0}% / ≤{:.0}% · Tab 切框 / Enter 保存",
+                bpath, snapshot.budget.quota_warn_rem_pct, snapshot.budget.quota_crit_rem_pct
+            ),
             &fonts.ui_micro,
-            rect_f(inner_l, edit_c.top + 111.0, inner_r - inner_l, 15.0),
-            theme.muted,
-        );
-        draw_text(
-            rt,
-            "下方为最近 5 小时滚动计费窗口（Blocks）实时速率与消耗记录",
-            &fonts.ui_micro,
-            rect_f(inner_l, edit_c.top + 130.0, inner_r - inner_l, 15.0),
+            rect_f(inner_l, edit_c.top + 110.0, inner_r - inner_l, 15.0),
             theme.muted,
         );
 
         let tbl_r = rect_f(body.left, edit_c.bottom + 12.0, bw, (body.bottom - edit_c.bottom - 12.0).max(110.0));
-        let rows: Vec<Vec<String>> = snapshot
-            .recent_blocks
-            .iter()
-            .rev()
-            .map(|b| {
-                let st_l = b.start_utc.with_timezone(&Local);
-                let en_l = b.end_utc.with_timezone(&Local);
-                vec![
-                    format!("{} - {}", st_l.format("%m/%d %H:%M"), en_l.format("%H:%M")),
-                    if b.is_active { "活跃中".into() } else { "已结束".into() },
-                    b.counts.calls.to_string(),
-                    fmt_num(b.counts.total_tokens(), human),
-                    fmt_cost(&b.counts.cost, b.counts.calls, human),
-                    format!("{}/h", fmt_usd_compact(b.usd_per_hour)),
-                    if b.is_active { fmt_usd_compact(b.projected_usd) } else { "-".into() },
-                    if b.is_active { fmt_countdown(b.remaining_secs) } else { "-".into() },
-                    format!("{:.1}%", b.counts.cache_hit_rate()),
-                ]
-            })
-            .collect();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+
+        // 1) Official /statusline quota buckets (when bridged)
+        if let Some(sl) = snapshot.statusline.as_ref() {
+            let prov = sl.provenance(now_utc);
+            for b in sl.buckets.iter().filter(|b| !b.disabled) {
+                let rem_s = b
+                    .remaining_pct()
+                    .map(|p| format!("剩 {:.0}%", p))
+                    .unwrap_or_else(|| "-".into());
+                let used_s = b
+                    .used_pct()
+                    .map(|p| format!("已用 {:.0}%", p))
+                    .unwrap_or_else(|| "-".into());
+                let reset_s = b
+                    .live_remaining_secs(sl.captured_at_utc, now_utc)
+                    .map(|s| format!("{}后重置", fmt_countdown(s)))
+                    .unwrap_or_else(|| "-".into());
+                let st_s = match b.remaining_pct().map(|p| snapshot.budget.classify_quota_remaining(p)) {
+                    Some(AlertSeverity::Critical) => "临界",
+                    Some(AlertSeverity::Warn) => "预警",
+                    Some(AlertSeverity::Normal) => "正常",
+                    None => "-",
+                };
+                rows.push(vec![
+                    b.label.clone(),
+                    prov.label_cn().to_string(),
+                    rem_s,
+                    used_s,
+                    reset_s,
+                    st_s.to_string(),
+                ]);
+            }
+        }
+
+        // 2) Daily & Weekly USD budget utilization (always visible so user can benchmark caps against real spend)
+        let today_date = Local::now().date_naive();
+        let today_key = today_date.format("%Y-%m-%d").to_string();
+        let week_key = iso_week_key(today_date);
+        let today_c = snapshot.agg.by_day.get(&today_key).copied().unwrap_or_default();
+        let week_c = snapshot.agg.by_week.get(&week_key).copied().unwrap_or_default();
+
+        for (label, period, counts, cap) in [
+            ("今日预算", today_key.clone(), today_c, snapshot.budget.daily_usd),
+            ("本周预算", week_key.clone(), week_c, snapshot.budget.weekly_usd),
+        ] {
+            let spent = counts.cost.total_usd();
+            let spent_s = format!(
+                "{} ({})",
+                fmt_cost(&counts.cost, counts.calls, human),
+                fmt_num(counts.total_tokens(), human)
+            );
+            let (cap_s, pct_s, st_s) = if cap > 0.0 {
+                let pct = (spent / cap) * 100.0;
+                let sev = snapshot.budget.classify_usage_pct(pct);
+                let st = match sev {
+                    AlertSeverity::Critical => "临界",
+                    AlertSeverity::Warn => "预警",
+                    AlertSeverity::Normal => "正常",
+                };
+                (format!("${:.2}", cap), format!("{:.1}%", pct), st)
+            } else {
+                ("未限制".to_string(), "-".to_string(), "未设限")
+            };
+            rows.push(vec![
+                format!("{label} ({period})"),
+                "本地汇总 (全源)".to_string(),
+                spent_s,
+                cap_s,
+                pct_s,
+                st_s.to_string(),
+            ]);
+        }
+
         self.draw_table(
             rt,
             fonts,
             theme,
             tbl_r,
             &[
-                ("5h 窗口 (本地)", 0.19, false),
-                ("状态", 0.08, false),
-                ("调用", 0.07, true),
-                ("总 Token", 0.12, true),
-                ("估算费用", 0.11, true),
-                ("燃烧速率", 0.11, true),
-                ("窗口预计", 0.11, true),
-                ("剩余时间", 0.11, true),
-                ("命中率", 0.10, true),
+                ("配额 / 预算项", 0.28, false),
+                ("来源", 0.14, false),
+                ("当前状态 / 消耗", 0.22, true),
+                ("已用 / 上限", 0.14, true),
+                ("重置 / 进度", 0.13, true),
+                ("状态", 0.09, true),
             ],
             &rows,
             None,
             None,
-            snapshot.active_block.as_ref().map(|_| 0),
+            None,
         );
     }
 
@@ -4912,6 +5732,7 @@ impl DashboardView {
         fonts: &Fonts,
         theme: &Theme,
         body: D2D_RECT_F,
+        snapshot: &ScanSnapshot,
         human: bool,
     ) {
         let bw = body.right - body.left;
@@ -4921,11 +5742,13 @@ impl DashboardView {
         fill_round_rect(rt, top_c, 10.0, theme.surface);
         stroke_round_rect(rt, top_c, 10.0, theme.border, 1.0);
 
-        let sorted = self.display_sessions(true);
+        let sorted = self.display_sessions_for_tab();
         let (root_total, sub_total) = self.session_split_counts();
+        let pinned_total = self.pinned_ids.len();
+        let now_local = Local::now();
 
         draw_text(rt, "会话记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 9.0, 66.0, 20.0), theme.text);
-        let cnt_str = if self.session_filter.is_some() {
+        let cnt_str = if self.session_filter.is_some() || self.pinned_only {
             format!("{} 条", sorted.len())
         } else if self.group_subagents && sub_total > 0 {
             format!("{} 主 (+{}子)", root_total, sub_total)
@@ -4934,7 +5757,7 @@ impl DashboardView {
         } else {
             format!("{} 个", sorted.len())
         };
-        let cnt_w = (factories.measure_text_width(&cnt_str, &fonts.ui_micro) + 6.0).clamp(44.0, 108.0);
+        let cnt_w = (factories.measure_text_width(&cnt_str, &fonts.ui_micro) + 6.0).clamp(42.0, 102.0);
         draw_text(
             rt,
             &cnt_str,
@@ -4966,12 +5789,36 @@ impl DashboardView {
             self.hit_boxes.push(HitBox { rect: r, action: ClickAction::SelectSort(*so) });
         }
 
-        // Subagent grouping toggle button (shown whenever subagents exist or ungrouped)
         let mut left_cursor = top_c.left + 84.0 + cnt_w;
+
+        // Pinned-only quick filter chip (shown whenever at least 1 pinned session exists)
+        if pinned_total > 0 {
+            let pin_lbl = format!("★置顶 {}", pinned_total);
+            let pin_w = (factories.measure_text_width(&pin_lbl, &fonts.ui_small_center) + 14.0).clamp(56.0, 78.0);
+            if left_cursor + pin_w + 8.0 < sx {
+                let pin_r = rect_f(left_cursor, top_c.top + 8.0, pin_w, 22.0);
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    pin_r,
+                    &pin_lbl,
+                    self.pinned_only,
+                    ClickAction::TogglePinnedOnly,
+                );
+                if self.pinned_only {
+                    stroke_round_rect(rt, pin_r, 6.0, with_alpha(theme.accent, 0.65), 0.9);
+                }
+                left_cursor += pin_w + 6.0;
+            }
+        }
+
+        // Subagent grouping toggle button (shown when enough space remains for search box)
         if sub_total > 0 || !self.group_subagents {
             let grp_lbl = if self.group_subagents { "子会话:归组" } else { "子会话:独立" };
             let grp_w = 76.0;
-            if left_cursor + grp_w + 8.0 < sx {
+            let reserve_for_search = if self.session_filter.is_some() { 184.0 } else { 102.0 };
+            if left_cursor + grp_w + reserve_for_search < sx {
                 let grp_r = rect_f(left_cursor, top_c.top + 8.0, grp_w, 22.0);
                 self.draw_ghost_btn(
                     rt,
@@ -4992,7 +5839,7 @@ impl DashboardView {
             let max_w = (sx - 8.0 - left_cursor).max(0.0);
             if max_w >= 72.0 {
                 let measured = factories.measure_text_width(&chip_lbl, &fonts.ui_small_center) + 18.0;
-                let est_w = measured.clamp(84.0, max_w.min(180.0));
+                let est_w = measured.clamp(84.0, max_w.min(168.0));
                 let chip_r = rect_f(left_cursor, top_c.top + 8.0, est_w, 22.0);
                 self.draw_ghost_btn(rt, fonts, theme, chip_r, &chip_lbl, true, ClickAction::ClearSessionFilter);
                 left_cursor += est_w + 6.0;
@@ -5029,7 +5876,7 @@ impl DashboardView {
         let rr_w = bw - 24.0;
         let rx = rr_l + rr_w - 8.0;
         let list_y = top_c.top + 55.0;
-        let row_h = 27.0;
+        let row_h = 28.0;
         let vis = (((top_c.bottom - 8.0 - list_y) / row_h).floor() as usize).max(1);
         self.sessions_vis_rows = vis;
         self.max_scroll = sorted.len().saturating_sub(vis);
@@ -5043,21 +5890,22 @@ impl DashboardView {
             .skip(self.scroll_rows)
             .take(vis)
             .map(|r| factories.measure_text_width(&r.primary_model, &fonts.mono_small_right))
-            .fold(132.0_f32, f32::max);
-        let model_cap = (rr_w * 0.27).clamp(152.0, 224.0);
-        let model_w = (max_model_px + 8.0).clamp(132.0, model_cap);
+            .fold(124.0_f32, f32::max);
+        let model_cap = (rr_w * 0.24).clamp(138.0, 206.0);
+        let model_w = (max_model_px + 8.0).clamp(124.0, model_cap);
         let (sm_x, sm_w, metrics_w) = session_metric_columns(rx);
         let sm_rect = |i: usize, y: f32, h: f32| rect_f(sm_x[i], y, sm_w[i], h);
         let model_x = rx - metrics_w - model_w;
-        let title_x = rr_l + 144.0;
-        let title_w = (model_x - 10.0 - title_x).max(80.0);
+        // Reclaimed 52 DIP ID column -> 28 DIP [dot + pin star] + 56 DIP compact relative time + wider title + workspace pill
+        let time_x = rr_l + 36.0;
+        let title_x = rr_l + 96.0;
+        let title_w = (model_x - 10.0 - title_x).max(96.0);
 
         // Column headers
         let hdr_y = top_c.top + 32.0;
         let hdr_h = 19.0;
-        draw_text(rt, "ID", &fonts.ui_micro, rect_f(rr_l + 8.0, hdr_y, 52.0, hdr_h), theme.muted);
-        draw_text(rt, "时间", &fonts.ui_micro, rect_f(rr_l + 64.0, hdr_y, 74.0, hdr_h), theme.muted);
-        draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
+        draw_text(rt, "时间", &fonts.ui_micro, rect_f(time_x, hdr_y, 56.0, hdr_h), theme.muted);
+        draw_text(rt, "会话 / 项目", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
         draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
         for (i, lbl) in SESSION_METRIC_LABELS.iter().enumerate() {
             draw_text(rt, lbl, &fonts.ui_small_right, sm_rect(i, hdr_y, hdr_h), theme.muted);
@@ -5065,7 +5913,9 @@ impl DashboardView {
         draw_line(rt, top_c.left + 14.0, top_c.top + 52.0, top_c.right - 14.0, top_c.top + 52.0, theme.border, 1.0);
 
         if sorted.is_empty() {
-            let empty_txt = if self.session_filter.is_some() {
+            let empty_txt = if self.pinned_only {
+                "当前筛选条件下无置顶会话 · 点击上方「★置顶」或清除搜索查看全部"
+            } else if self.session_filter.is_some() {
                 "当前筛选条件下无匹配会话 · 点击上方筛选标签或按 Backspace 清除"
             } else {
                 "当前范围暂无会话 · 可在右上角切换 7天 / 30天 / 全部"
@@ -5078,30 +5928,67 @@ impl DashboardView {
                 theme.muted,
             );
         } else {
+            let mut prev_was_pinned = false;
             for (vi, row) in sorted.iter().skip(self.scroll_rows).take(vis).enumerate() {
                 let s = &row.session;
                 let ry = list_y + vi as f32 * row_h;
-                let rr = rect_f(rr_l, ry, rr_w, row_h - 2.0);
+                let cell_h = row_h - 2.0;
+                let rr = rect_f(rr_l, ry, rr_w, cell_h);
                 let sel = self.selected_session.as_deref() == Some(s.conversation_id.as_str());
                 let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
+
+                // Soft divider separating pinned block from regular rows
+                if vi > 0 && prev_was_pinned && !row.is_pinned {
+                    draw_line(
+                        rt,
+                        top_c.left + 16.0,
+                        ry - 1.0,
+                        top_c.right - 16.0,
+                        ry - 1.0,
+                        theme.border,
+                        1.0,
+                    );
+                }
+                prev_was_pinned = row.is_pinned;
+
                 if sel {
                     fill_round_rect(rt, rr, 6.0, theme.hover);
-                    fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, rr.bottom - rr.top - 10.0), 1.25, theme.accent);
+                    fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, cell_h - 10.0), 1.25, theme.accent);
                 } else if hov {
                     fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
                 }
-                let sid = self.format_session_id(&s.conversation_id);
-                let t_str = row.last_time.map(|t| t.format("%m/%d %H:%M").to_string()).unwrap_or_else(|| "-".into());
+
+                // 28 DIP left gutter: live/recent status dot + clickable pin star
+                let cy = ry + cell_h * 0.5;
+                draw_session_status_dot(rt, theme, rr_l + 10.5, cy, s, row.last_time, now_local);
+                let star_r = rect_f(rr_l + 16.0, ry + 3.0, 18.0, cell_h - 6.0);
+                let star_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&star_r, mx, my)).unwrap_or(false);
+                if row.is_pinned || hov || sel {
+                    if star_hov {
+                        fill_round_rect(rt, star_r, 4.5, theme.accent_soft);
+                    }
+                    let (glyph, col) = if row.is_pinned {
+                        ("★", theme.accent)
+                    } else if star_hov {
+                        ("☆", theme.accent)
+                    } else {
+                        ("☆", theme.muted)
+                    };
+                    draw_text(rt, glyph, &fonts.ui_small_center, star_r, col);
+                }
+
+                let t_str = fmt_relative_time_cn(row.last_time, now_local);
                 let hit_str = format!("{:.1}%", row.counts.cache_hit_rate());
                 let hit_col = cache_hit_color(theme, &row.counts);
                 let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
                 let base_title = self.format_session_title(s);
+                let show_multi = snapshot.has_non_antigravity();
                 let mut prefix = String::new();
                 if row.is_child_row {
                     prefix.push_str("↳ ");
                 }
-                if s.source != SourceKind::Cli {
-                    prefix.push_str(&format!("[{}] ", s.source.label_short()));
+                if let Some(tag) = format_source_tag(s.source, show_multi) {
+                    prefix.push_str(&format!("[{tag}] "));
                 }
                 if s.is_archived {
                     prefix.push_str("[归档] ");
@@ -5112,35 +5999,69 @@ impl DashboardView {
                 } else {
                     None
                 };
-
-                draw_text(rt, &sid, &fonts.mono_small, rect_f(rr_l + 8.0, ry, 52.0, row_h - 2.0), theme.muted);
-                draw_text(rt, &t_str, &fonts.mono_small, rect_f(rr_l + 64.0, ry, 74.0, row_h - 2.0), theme.sub);
-                let (actual_title_w, badge_rect) = if let Some(ref b) = sub_badge {
-                    let bw = (factories.measure_text_width(b, &fonts.ui_small_center) + 10.0).ceil();
-                    if title_w > bw + 40.0 {
-                        let tw = (title_w - bw - 6.0).max(32.0);
-                        let nat = factories.measure_text_width(&title_disp, &fonts.ui_reg);
-                        let bx = title_x + nat.min(tw) + 6.0;
-                        (tw, Some(rect_f(bx, ry + (row_h - 2.0 - 16.0) * 0.5, bw, 16.0)))
-                    } else {
-                        (title_w, None)
-                    }
-                } else {
-                    (title_w, None)
+                let ws_badge = {
+                    let ws = self.format_workspace_short(&s.workspace);
+                    if ws.is_empty() { None } else { Some(ws) }
                 };
+
+                draw_text(
+                    rt,
+                    &t_str,
+                    &fonts.mono_small,
+                    rect_f(time_x, ry, 56.0, cell_h),
+                    if row.out_of_scope { theme.muted } else { theme.sub },
+                );
+
+                // Compute trailing pill budgets cleanly: Title [workspace] [+N子]
+                let mut reserved = 0.0_f32;
+                let sub_w = sub_badge.as_deref().map(|b| {
+                    (factories.measure_text_width(b, &fonts.ui_small_center) + 10.0).ceil()
+                });
+                if let Some(sw) = sub_w {
+                    if title_w > sw + 56.0 {
+                        reserved += sw + 5.0;
+                    }
+                }
+                let ws_w = ws_badge.as_deref().and_then(|w| {
+                    let nat = (factories.measure_text_width(w, &fonts.ui_micro) + 10.0).ceil();
+                    let capped = nat.min(104.0);
+                    if title_w - reserved > capped + 76.0 {
+                        Some(capped)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ww) = ws_w {
+                    reserved += ww + 5.0;
+                }
+                let actual_title_w = (title_w - reserved).max(40.0);
                 draw_text(
                     rt,
                     &title_disp,
                     &fonts.ui_reg,
-                    rect_f(title_x, ry, actual_title_w, row_h - 2.0),
+                    rect_f(title_x, ry, actual_title_w, cell_h),
                     if row.is_child_row { theme.sub } else { theme.text },
                 );
-                if let (Some(b), Some(br)) = (sub_badge.as_deref(), badge_rect) {
-                    fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
-                    draw_text(rt, b, &fonts.ui_small_center, br, theme.accent);
+
+                let nat_title = factories.measure_text_width(&title_disp, &fonts.ui_reg);
+                let mut pill_x = title_x + nat_title.min(actual_title_w) + 6.0;
+                let pill_y = ry + (cell_h - 16.0) * 0.5;
+                if let (Some(ws), Some(ww)) = (ws_badge.as_deref(), ws_w) {
+                    let wr = rect_f(pill_x, pill_y, ww, 16.0);
+                    fill_round_rect(rt, wr, 5.0, theme.surface_subtle);
+                    stroke_round_rect(rt, wr, 5.0, theme.border, 0.7);
+                    draw_text(rt, ws, &fonts.ui_micro, rect_f(wr.left + 5.0, wr.top, ww - 10.0, 16.0), theme.sub);
+                    pill_x += ww + 5.0;
+                }
+                if let (Some(b), Some(sw)) = (sub_badge.as_deref(), sub_w) {
+                    if pill_x + sw <= title_x + title_w + 2.0 {
+                        let br = rect_f(pill_x, pill_y, sw, 16.0);
+                        fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
+                        draw_text(rt, b, &fonts.ui_small_center, br, theme.accent);
+                    }
                 }
 
-                draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, row_h - 2.0), theme.muted);
+                draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, cell_h), theme.muted);
                 draw_session_metric_cells(
                     rt,
                     fonts,
@@ -5148,7 +6069,7 @@ impl DashboardView {
                     &sm_x,
                     &sm_w,
                     ry,
-                    row_h - 2.0,
+                    cell_h,
                     &row.counts,
                     &hit_str,
                     hit_col,
@@ -5157,9 +6078,15 @@ impl DashboardView {
                     human,
                 );
 
+                self.session_row_rects.push((rr, s.conversation_id.clone()));
                 self.hit_boxes.push(HitBox {
                     rect: rr,
                     action: ClickAction::SelectSession(s.conversation_id.clone()),
+                });
+                // Push pin star hitbox AFTER row hitbox so reverse-order hit_test_click hits star first.
+                self.hit_boxes.push(HitBox {
+                    rect: star_r,
+                    action: ClickAction::TogglePinSession(s.conversation_id.clone()),
                 });
             }
 
@@ -5172,7 +6099,7 @@ impl DashboardView {
             }
         }
 
-        // Bottom: Turn-by-Turn Context Anatomy + Per-Session Cost & Subagent Drill-Down
+        // Bottom: Session Action Header + Meta/Legend + Turn-by-Turn Context Anatomy
         let bot_c = rect_f(body.left, top_c.bottom + 12.0, bw, (body.bottom - top_c.bottom - 12.0).max(140.0));
         fill_round_rect(rt, bot_c, 10.0, theme.surface);
         stroke_round_rect(rt, bot_c, 10.0, theme.border, 1.0);
@@ -5184,21 +6111,246 @@ impl DashboardView {
 
         if let Some(s) = sel {
             let (sub_cnt, sub_agg) = self.count_subagents_of(&s.conversation_id);
-            let hdr_prefix = if s.is_subagent {
-                if self.cost_mode { "逐轮费用 [子会话]" } else { "逐轮剖析 [子会话]" }
-            } else if self.cost_mode {
-                "逐轮费用剖析"
+            let is_pinned = self.pinned_ids.contains(&s.conversation_id);
+            let cap = classify_resume_capability(&s, &snapshot.sessions);
+            let valid_id = validate_conversation_id(&s.conversation_id);
+            let direct_ok = cap.is_direct_resumable() && valid_id;
+            let blocked_msg: &'static str = if !valid_id {
+                BlockedReason::InvalidConversationId.message_cn()
             } else {
-                "逐轮剖析"
+                cap.disabled_reason_cn()
+                    .or_else(|| cap.blocked_reason().map(BlockedReason::message_cn))
+                    .unwrap_or("该会话不支持终端恢复")
             };
+            let resumable_parent_id = find_resumable_parent(&s, &snapshot.sessions)
+                .map(|p| p.conversation_id.clone());
+            let has_ws = normalize_workspace_path_str(&s.workspace).is_some();
+            let show_multi = snapshot.has_non_antigravity();
+
+            // ---- Row 1 (bot_c.top + 8, h = 22): Pin + Title + #id · workspace  |  [▶ 继续] [复制命令] [目录] [···] ----
+            let r1_y = bot_c.top + 8.0;
+            let r1_h = 22.0;
+
+            let mut act_rx = bot_c.right - 14.0;
+            // [···] overflow / context menu button
+            let more_w = 28.0;
+            let more_r = rect_f(act_rx - more_w, r1_y, more_w, r1_h);
+            self.detail_more_btn_rect = Some(more_r);
+            self.draw_ghost_btn(
+                rt,
+                fonts,
+                theme,
+                more_r,
+                "···",
+                false,
+                ClickAction::SessionMoreMenu(s.conversation_id.clone()),
+            );
+            stroke_round_rect(rt, more_r, 6.0, theme.border, 0.8);
+            act_rx = more_r.left - 5.0;
+
+            // [目录] open workspace button
+            let dir_w = 40.0;
+            let dir_r = rect_f(act_rx - dir_w, r1_y, dir_w, r1_h);
+            if has_ws {
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    dir_r,
+                    "目录",
+                    false,
+                    ClickAction::OpenWorkspace(s.conversation_id.clone()),
+                );
+                stroke_round_rect(rt, dir_r, 6.0, theme.border, 0.8);
+            } else {
+                fill_round_rect(rt, dir_r, 6.0, theme.surface_subtle);
+                draw_text(rt, "目录", &fonts.ui_small_center, dir_r, theme.muted);
+                self.hit_boxes.push(HitBox {
+                    rect: dir_r,
+                    action: ClickAction::ShowBlockedReason("该会话无可用本地工作区路径".to_string()),
+                });
+            }
+            act_rx = dir_r.left - 5.0;
+
+            // [复制命令] copy resume command button
+            let cmd_copied = self
+                .resume_cmd_copied_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+            let cmd_w = 62.0;
+            let cmd_r = rect_f(act_rx - cmd_w, r1_y, cmd_w, r1_h);
+            if direct_ok {
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    cmd_r,
+                    if cmd_copied { "已复制" } else { "复制命令" },
+                    cmd_copied,
+                    ClickAction::CopyResumeCmd(s.conversation_id.clone()),
+                );
+                stroke_round_rect(
+                    rt,
+                    cmd_r,
+                    6.0,
+                    if cmd_copied { theme.accent } else { theme.border },
+                    0.8,
+                );
+            } else {
+                fill_round_rect(rt, cmd_r, 6.0, theme.surface_subtle);
+                draw_text(rt, "复制命令", &fonts.ui_small_center, cmd_r, theme.muted);
+                self.hit_boxes.push(HitBox {
+                    rect: cmd_r,
+                    action: ClickAction::ShowBlockedReason(blocked_msg.to_string()),
+                });
+            }
+            act_rx = cmd_r.left - 5.0;
+
+            // [▶ 继续] / [定位父会话] primary button
+            if direct_ok {
+                let res_w = 64.0;
+                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
+                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&res_r, mx, my)).unwrap_or(false);
+                fill_round_rect(
+                    rt,
+                    res_r,
+                    6.0,
+                    if hov { theme.accent } else { theme.accent_soft },
+                );
+                stroke_round_rect(rt, res_r, 6.0, with_alpha(theme.accent, 0.8), 0.9);
+                draw_text(
+                    rt,
+                    "▶ 继续",
+                    &fonts.ui_small_center,
+                    res_r,
+                    if hov { theme.bg } else { theme.accent },
+                );
+                self.hit_boxes.push(HitBox {
+                    rect: res_r,
+                    action: ClickAction::ResumeSession(s.conversation_id.clone()),
+                });
+                act_rx = res_r.left - 8.0;
+            } else if let Some(pid) = resumable_parent_id {
+                let res_w = 78.0;
+                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    res_r,
+                    "定位父会话 ›",
+                    true,
+                    ClickAction::InspectSession(pid),
+                );
+                stroke_round_rect(rt, res_r, 6.0, with_alpha(theme.accent, 0.65), 0.8);
+                act_rx = res_r.left - 8.0;
+            } else {
+                let res_w = 64.0;
+                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
+                fill_round_rect(rt, res_r, 6.0, theme.surface_subtle);
+                stroke_round_rect(rt, res_r, 6.0, theme.border, 0.7);
+                draw_text(rt, "▶ 继续", &fonts.ui_small_center, res_r, theme.muted);
+                self.hit_boxes.push(HitBox {
+                    rect: res_r,
+                    action: ClickAction::ShowBlockedReason(blocked_msg.to_string()),
+                });
+                act_rx = res_r.left - 8.0;
+            }
+
+            // Optional clickable `+N子` drilldown pill just left of action cluster when parent has subagents
+            let already_in_parent_group = matches!(
+                &self.session_filter,
+                Some(SessionFilter::Parent(pid, _))
+                    if *pid == s.conversation_id || s.parent_id.as_deref() == Some(pid.as_str())
+            );
+            if sub_cnt > 0 && !already_in_parent_group {
+                let lbl = format!("+{}子 ›", sub_cnt);
+                let sub_w = (factories.measure_text_width(&lbl, &fonts.ui_small_center) + 12.0).clamp(48.0, 74.0);
+                if act_rx - sub_w > bot_c.left + 200.0 {
+                    let sub_r = rect_f(act_rx - sub_w, r1_y + 1.0, sub_w, r1_h - 2.0);
+                    self.draw_ghost_btn(
+                        rt,
+                        fonts,
+                        theme,
+                        sub_r,
+                        &lbl,
+                        true,
+                        ClickAction::FilterSessions(SessionFilter::Parent(
+                            s.conversation_id.clone(),
+                            s.title.clone(),
+                        )),
+                    );
+                    act_rx = sub_r.left - 6.0;
+                }
+            }
+
+            // Left identity: clickable pin star + title + short `#id · workspace`
+            let pin_r = rect_f(bot_c.left + 12.0, r1_y, 22.0, r1_h);
+            self.draw_ghost_btn(
+                rt,
+                fonts,
+                theme,
+                pin_r,
+                if is_pinned { "★" } else { "☆" },
+                is_pinned,
+                ClickAction::TogglePinSession(s.conversation_id.clone()),
+            );
+
             let slice_note = match self.slicing_filter() {
                 Some(SessionFilter::Model(m)) => format!(" [仅 {m}]"),
                 Some(SessionFilter::Date(d)) => format!(" [仅 {d}]"),
                 Some(SessionFilter::Week(w)) => format!(" [仅 {w}]"),
                 _ => String::new(),
             };
-            let hdr = format!("{}{} · {}", hdr_prefix, slice_note, self.format_session_title(&s));
-            draw_text(rt, &hdr, &fonts.ui_section, rect_f(bot_c.left + 16.0, bot_c.top + 9.0, (bw - 320.0).max(160.0), 19.0), theme.text);
+            let mut title_prefix = String::new();
+            if let Some(tag) = format_source_tag(s.source, show_multi) {
+                title_prefix.push_str(&format!("[{tag}] "));
+            }
+            if s.is_subagent {
+                title_prefix.push_str("[子会话] ");
+            }
+            let title_str = format!("{}{}{}", title_prefix, self.format_session_title(&s), slice_note);
+            let sid_short = self.format_session_id(&s.conversation_id);
+            let ws_short = self.format_workspace_short(&s.workspace);
+            let id_ws_suffix = if ws_short.is_empty() {
+                format!("#{sid_short}")
+            } else {
+                format!("#{sid_short} · {ws_short}")
+            };
+
+            let id_left = bot_c.left + 38.0;
+            let id_avail = (act_rx - id_left).max(100.0);
+            let suffix_w = (factories.measure_text_width(&id_ws_suffix, &fonts.mono_small) + 6.0).min(210.0);
+            let show_suffix = id_avail > suffix_w + 110.0;
+            let title_max_w = if show_suffix {
+                (id_avail - suffix_w - 8.0).max(80.0)
+            } else {
+                id_avail
+            };
+            draw_text(
+                rt,
+                &title_str,
+                &fonts.ui_section,
+                rect_f(id_left, r1_y, title_max_w, r1_h),
+                theme.text,
+            );
+            if show_suffix {
+                let nat_t = factories.measure_text_width(&title_str, &fonts.ui_section);
+                let sx_pos = id_left + nat_t.min(title_max_w) + 8.0;
+                let rem_w = (act_rx - sx_pos).max(0.0);
+                if rem_w >= 48.0 {
+                    draw_text(
+                        rt,
+                        &id_ws_suffix,
+                        &fonts.mono_small,
+                        rect_f(sx_pos, r1_y + 1.0, rem_w, r1_h - 2.0),
+                        theme.muted,
+                    );
+                }
+            }
+
+            // ---- Row 2 (bot_c.top + 33, h = 22): Meta summary on left | Chart legend + 总计/仅增量 on right ----
+            let legend_left = self.draw_chart_legend_and_toggle_at(rt, fonts, theme, bot_c, bot_c.top + 32.0);
 
             let mut meta = if self.cost_mode {
                 format!(
@@ -5224,6 +6376,9 @@ impl DashboardView {
                     fmt_cost(&s.counts.cost, s.counts.calls, false),
                 )
             };
+            if let Some(lt) = s.last_time {
+                meta.push_str(&format!(" · {}", lt.format("%m/%d %H:%M")));
+            }
             if sub_cnt > 0 {
                 meta.push_str(&format!(
                     " · +{}子({})",
@@ -5266,90 +6421,21 @@ impl DashboardView {
                     .collect();
                 meta.push_str(&format!(" · 工具 {}", top_t.join("/")));
             }
-            if s.source != SourceKind::Cli {
-                meta.push_str(&format!(" · [{}]", s.source.label_short()));
+            if let Some(tag) = format_source_tag(s.source, show_multi) {
+                meta.push_str(&format!(" · [{tag}]"));
             }
             if s.is_archived {
                 meta.push_str(" · [归档]");
             }
-            let ws = self.format_workspace_short(&s.workspace);
-            if !ws.is_empty() {
-                meta.push_str(&format!(" · {}", ws));
-            }
 
-            let s_copied = self.session_copied_until.map(|t| Instant::now() < t).unwrap_or(false);
-            let copy_r = rect_f(bot_c.right - 72.0, bot_c.top + 27.0, 58.0, 17.0);
-            let mut right_edge = copy_r.left - 6.0;
-            let calls_r = rect_f(right_edge - 70.0, bot_c.top + 27.0, 70.0, 17.0);
-            self.draw_ghost_btn(
-                rt,
-                fonts,
-                theme,
-                calls_r,
-                "调用记录 ›",
-                false,
-                ClickAction::ShowSessionCalls(s.conversation_id.clone()),
-            );
-            right_edge = calls_r.left - 6.0;
-            let already_in_parent_group = matches!(
-                &self.session_filter,
-                Some(SessionFilter::Parent(pid, _))
-                    if *pid == s.conversation_id || s.parent_id.as_deref() == Some(pid.as_str())
-            );
-            if sub_cnt > 0 && !already_in_parent_group {
-                let lbl = format!("查看{}子会话 ›", sub_cnt);
-                let btn_w = (factories.measure_text_width(&lbl, &fonts.ui_small_center) + 14.0).clamp(76.0, 118.0);
-                let sub_r = rect_f(right_edge - btn_w, bot_c.top + 27.0, btn_w, 17.0);
-                self.draw_ghost_btn(
-                    rt,
-                    fonts,
-                    theme,
-                    sub_r,
-                    &lbl,
-                    true,
-                    ClickAction::FilterSessions(SessionFilter::Parent(
-                        s.conversation_id.clone(),
-                        s.title.clone(),
-                    )),
-                );
-                right_edge = sub_r.left - 6.0;
-            } else if s.is_subagent && !already_in_parent_group {
-                if let Some(pid) = s.parent_id.clone() {
-                    let ptitle = if s.parent_title.is_empty() {
-                        pid[..pid.len().min(8)].to_string()
-                    } else {
-                        s.parent_title.clone()
-                    };
-                    let sub_r = rect_f(right_edge - 82.0, bot_c.top + 27.0, 82.0, 17.0);
-                    self.draw_ghost_btn(
-                        rt,
-                        fonts,
-                        theme,
-                        sub_r,
-                        "查看所属任务 ›",
-                        true,
-                        ClickAction::FilterSessions(SessionFilter::Parent(pid, ptitle)),
-                    );
-                    right_edge = sub_r.left - 6.0;
-                }
-            }
+            let meta_w = (legend_left - 10.0 - (bot_c.left + 16.0)).max(120.0);
             draw_text(
                 rt,
                 &meta,
                 &fonts.mono_small,
-                rect_f(bot_c.left + 16.0, bot_c.top + 28.0, (right_edge - bot_c.left - 16.0).max(120.0), 15.0),
+                rect_f(bot_c.left + 16.0, bot_c.top + 35.0, meta_w, 16.0),
                 theme.sub,
             );
-            self.draw_ghost_btn(
-                rt,
-                fonts,
-                theme,
-                copy_r,
-                if s_copied { "已复制" } else { "复制明细" },
-                s_copied,
-                ClickAction::CopySessionDetail,
-            );
-            self.draw_chart_legend_and_toggle(rt, fonts, theme, bot_c);
 
             let mut prev_ts: Option<chrono::DateTime<chrono::Utc>> = None;
             let bars: Vec<BarItem> = s
@@ -5414,13 +6500,13 @@ impl DashboardView {
                         };
                         tip.push(format!("工具   : {}{}", shown_t.join(", "), more));
                     }
-                    if t.thinking_chars > 0 {
-                        tip.push(format!("思考   : {} 字", fmt_commas(t.thinking_chars)));
+                    if let Some(th) = format_turn_thinking(t) {
+                        tip.push(format!("思考   : {th}"));
                     }
                     self.make_turn_bar(lbl, t, tip)
                 })
                 .collect();
-            let plot = rect_f(bot_c.left + 12.0, bot_c.top + 48.0, bw - 24.0, (bot_c.bottom - bot_c.top - 56.0).max(60.0));
+            let plot = rect_f(bot_c.left + 12.0, bot_c.top + 56.0, bw - 24.0, (bot_c.bottom - bot_c.top - 64.0).max(60.0));
             self.plot_rects.push(plot);
             let _ = draw_editorial_bars(
                 rt,
@@ -5486,7 +6572,7 @@ impl DashboardView {
         let mut sum = TokenCounts::default();
         let (mut speed_out, mut speed_secs) = (0u64, 0u64);
         for r in &rows {
-            let t = &self.cached_sessions[r.sess_idx].turns[r.turn_idx];
+            let t = &self.call_session(r).turns[r.turn_idx];
             sum.add_call_with_cost(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost);
             if t.output_tps().is_some() {
                 speed_out += t.output_tokens;
@@ -5545,6 +6631,7 @@ impl DashboardView {
             let disp = self
                 .cached_sessions
                 .iter()
+                .chain(self.pinned_out_of_scope.iter())
                 .find(|s| s.conversation_id == cid)
                 .map(|s| self.format_session_title(s))
                 .unwrap_or_else(|| self.format_session_id(&cid));
@@ -5630,7 +6717,7 @@ impl DashboardView {
             .skip(self.scroll_rows)
             .take(vis)
             .map(|r| {
-                factories.measure_text_width(&self.cached_sessions[r.sess_idx].turns[r.turn_idx].model, &fonts.mono_small)
+                factories.measure_text_width(&self.call_session(r).turns[r.turn_idx].model, &fonts.mono_small)
             })
             .fold(96.0_f32, f32::max);
         let model_w = (max_model_px + 8.0).clamp(96.0, (avail * 0.34).max(96.0).min(176.0));
@@ -5652,19 +6739,20 @@ impl DashboardView {
         draw_line(rt, top_c.left + 14.0, top_c.top + 52.0, top_c.right - 14.0, top_c.top + 52.0, theme.border, 1.0);
 
         // ---- Rows (immutable data phase, then draw phase) ----
+        let show_multi = self.is_multi_agent();
         let disp: Vec<CallDisp> = rows
             .iter()
             .skip(self.scroll_rows)
             .take(vis)
             .map(|r| {
-                let s = &self.cached_sessions[r.sess_idx];
+                let s = self.call_session(r);
                 let t = &s.turns[r.turn_idx];
                 let mut prefix = String::new();
                 if s.is_subagent {
                     prefix.push_str("↳ ");
                 }
-                if s.source != SourceKind::Cli {
-                    prefix.push_str(&format!("[{}] ", s.source.label_short()));
+                if let Some(tag) = format_source_tag(s.source, show_multi) {
+                    prefix.push_str(&format!("[{tag}] "));
                 }
                 let ctx = t.total_input();
                 let rate = t.cache_hit_rate();
@@ -5791,14 +6879,17 @@ impl DashboardView {
             return;
         };
         let (cid, hdr, line_cost, line_tok, line_tools) = {
-            let s = &self.cached_sessions[r.sess_idx];
+            let s = self.call_session(&r);
             let t = &s.turns[r.turn_idx];
             let time = t
                 .timestamp_utc
                 .map(|u| u.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| "-".into());
             let kind = if t.is_checkpoint { " · 上下文压缩" } else { "" };
-            let hdr = format!("调用详情 · {} · Step #{}{}", self.format_session_title(s), t.step_index, kind);
+            let src_prefix = format_source_tag(s.source, show_multi)
+                .map(|tag| format!("[{tag}] "))
+                .unwrap_or_default();
+            let hdr = format!("调用详情 · {src_prefix}{} · Step #{}{}", self.format_session_title(s), t.step_index, kind);
             let cost = if t.cost.is_fully_unpriced(1) {
                 "费用 - (未定价)".to_string()
             } else {
@@ -5821,8 +6912,8 @@ impl DashboardView {
             if let Some(g) = r.gap_secs.map(fmt_gap).filter(|g| !g.is_empty()) {
                 line_cost.push_str(&format!(" · 距上一步 {g}"));
             }
-            if t.thinking_chars > 0 {
-                line_cost.push_str(&format!(" · 思考 {} 字", fmt_commas(t.thinking_chars)));
+            if let Some(th) = format_turn_thinking(t) {
+                line_cost.push_str(&format!(" · 思考 {th}"));
             }
             let mut line_tok = format!(
                 "总 Token {} · 新输入 {} · 输出 {} · 缓存读 {} ({:.1}%)",
@@ -5876,7 +6967,7 @@ impl DashboardView {
     ) {
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
-        let footer_h = 26.0;
+        let footer_h = 38.0;
         let cards_h = 128.0;
         let chart_h = (bh - cards_h - footer_h - 20.0).clamp(160.0, 320.0);
 
@@ -6002,32 +7093,29 @@ impl DashboardView {
         } else {
             String::new()
         };
-        let dirs_disp = if snapshot.data_dirs.len() > 1 {
-            format!(
-                "{} 个来源 ({})",
-                snapshot.data_dirs.len(),
-                snapshot
-                    .data_dirs
-                    .iter()
-                    .map(|(k, _)| k.label_short())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            )
-        } else if self.privacy_mode {
-            redact_data_dir(&snapshot.data_dir)
-        } else {
-            snapshot.data_dir.display().to_string()
-        };
-        let foot = format!(
-            "严格只读 ~/.gemini · 增量缓存 {}/{} ({:.1} ms){}{} · {}",
+        let foot_line1 = format!(
+            "严格只读 · 增量缓存 {}/{} ({:.1} ms){}{}",
             snapshot.files_cached,
             snapshot.files_cached + snapshot.files_reparsed,
             snapshot.scan_ms,
             pricing_note,
             arch_note,
-            dirs_disp
         );
-        draw_text(rt, &foot, &fonts.mono_small, rect_f(body.left + 4.0, c_left.bottom + 8.0, bw - 8.0, footer_h), theme.muted);
+        let foot_line2 = format_active_sources_line(&snapshot.data_dirs, &snapshot.data_dir, self.privacy_mode);
+        draw_text(
+            rt,
+            &foot_line1,
+            &fonts.mono_small,
+            rect_f(body.left + 4.0, c_left.bottom + 6.0, bw - 8.0, 16.0),
+            theme.muted,
+        );
+        draw_text(
+            rt,
+            &foot_line2,
+            &fonts.mono_small,
+            rect_f(body.left + 4.0, c_left.bottom + 22.0, bw - 8.0, 16.0),
+            theme.muted,
+        );
     }
 
     // ---------- Minimalist Editorial Table ----------
@@ -6215,7 +7303,9 @@ mod tests {
                 input_tokens: 1000,
                 cache_read_tokens: 9000,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 output_tokens: 500,
+                reasoning_tokens: 0,
                 tool_names: Vec::new(),
                 thinking_chars: 0,
                 gen_secs: None,
@@ -6238,6 +7328,8 @@ mod tests {
             models,
             first_time: ts.map(|u| u.with_timezone(&Local)),
             last_time: ts.map(|u| u.with_timezone(&Local)),
+            last_file_mtime_utc: ts,
+            is_running_hint: false,
         }
     }
 
@@ -6398,22 +7490,19 @@ mod tests {
         assert!(!csv.contains("secret-uuid"));
         assert!(!csv.contains("alice"));
 
-        let daily_csv = view.export_daily_csv();
-        assert!(daily_csv.starts_with("\u{FEFF}date,calls"));
-        assert!(daily_csv.contains("2026-11-22"));
-
         let snap = ScanSnapshot {
             data_dir: std::path::PathBuf::from(r"C:\Users\alice\.gemini\antigravity-cli"),
             data_dirs: Vec::new(),
             sessions: view.cached_sessions.clone(),
             agg,
-            active_block: None,
-            recent_blocks: Vec::new(),
             statusline: None,
             statusline_changed: false,
             budget: BudgetConfig::default(),
             budget_changed: false,
             budget_path: None,
+            session_meta: HashMap::new(),
+            session_meta_changed: false,
+            session_meta_path: None,
             archived_sessions_count: 1,
             archive_enabled: true,
             archive_path: None,
@@ -6429,6 +7518,9 @@ mod tests {
             scan_ms: 1.0,
             warning: None,
         };
+        let daily_csv = view.export_daily_csv(&snap);
+        assert!(daily_csv.starts_with("\u{FEFF}date,calls"));
+        assert!(daily_csv.contains("2026-11-22"));
         let js = view.export_snapshot_json(&snap);
         let parsed: serde_json::Value = serde_json::from_str(&js).expect("valid export json");
         assert_eq!(parsed["redacted"], serde_json::Value::Bool(true));
@@ -6730,5 +7822,562 @@ mod tests {
             "./pricing.json"
         );
         assert_eq!(redact_pricing_path(None), "./pricing.json");
+    }
+
+    #[test]
+    fn test_cross_scope_pinned_session_isolation_and_couplings() {
+        use crate::session_meta::SessionUserMeta;
+        use crate::stats::aggregate_sessions;
+        use std::path::PathBuf;
+
+        let today = Local::now().date_naive();
+        let old_day = today.checked_sub_days(chrono::Days::new(10)).unwrap();
+
+        let s_today = make_session(
+            "today-sess-0001",
+            "C:/Users/alice/repo-today",
+            "gemini-4-neon-xhigh",
+            (today.year(), today.month(), today.day()),
+            2,
+        );
+        let s_old_pinned = make_session(
+            "old-pinned-0002",
+            "C:/Users/alice/repo-pinned-old",
+            "claude-opus-4-6",
+            (old_day.year(), old_day.month(), old_day.day()),
+            4,
+        );
+        let s_old_unpinned = make_session(
+            "old-plain-0003",
+            "C:/Users/alice/repo-other",
+            "claude-sonnet-4-5",
+            (old_day.year(), old_day.month(), old_day.day()),
+            3,
+        );
+
+        let all_sessions = vec![s_today.clone(), s_old_pinned.clone(), s_old_unpinned.clone()];
+        let all_agg = aggregate_sessions(&all_sessions);
+        let mut session_meta = HashMap::new();
+        session_meta.insert(
+            s_old_pinned.conversation_id.clone(),
+            SessionUserMeta { pinned: true, updated_at: None },
+        );
+
+        let snap = ScanSnapshot {
+            data_dir: PathBuf::from("."),
+            data_dirs: Vec::new(),
+            sessions: all_sessions,
+            agg: all_agg,
+            statusline: None,
+            statusline_changed: false,
+            budget: BudgetConfig::default(),
+            budget_changed: false,
+            budget_path: None,
+            session_meta,
+            session_meta_changed: false,
+            session_meta_path: None,
+            archived_sessions_count: 0,
+            archive_enabled: false,
+            archive_path: None,
+            model_rate_labels: HashMap::new(),
+            pricing_rows: Vec::new(),
+            pricing_path: None,
+            custom_pricing_count: 0,
+            pricing_changed: false,
+            skipped_empty: 0,
+            skipped_lines: 0,
+            files_cached: 0,
+            files_reparsed: 0,
+            scan_ms: 0.0,
+            warning: None,
+        };
+
+        let mut view = DashboardView::new(false, DateScope::Today, false, true, false);
+        view.active_tab = Tab::Sessions;
+        view.ensure_filtered(&snap);
+
+        // 1) Hero aggregates and in-scope session count MUST NOT be polluted by out-of-scope pin
+        assert_eq!(view.cached_sessions.len(), 1);
+        assert_eq!(view.cached_agg.total.calls, 2);
+        assert_eq!(view.pinned_out_of_scope.len(), 1);
+
+        // 2) Sessions tab list shows pinned session FIRST, followed by in-scope session; unpinned old stays excluded
+        let tab_rows = view.display_sessions_for_tab();
+        assert_eq!(tab_rows.len(), 2);
+        assert_eq!(tab_rows[0].session.conversation_id, "old-pinned-0002");
+        assert!(tab_rows[0].is_pinned);
+        assert!(tab_rows[0].out_of_scope);
+        assert_eq!(tab_rows[1].session.conversation_id, "today-sess-0001");
+        assert!(!tab_rows[1].is_pinned);
+        assert!(!tab_rows[1].out_of_scope);
+
+        // 3) Exports exclude out-of-scope pinned rows so totals match overview exactly
+        let csv = view.export_sessions_csv();
+        assert!(csv.contains("today-se"));
+        assert!(!csv.contains("old-pinn"));
+        let json_out = view.export_snapshot_json(&snap);
+        assert!(json_out.contains("today-se"));
+        assert!(!json_out.contains("old-pinn"));
+
+        // 4) Redactor covers out-of-scope pinned session (never `S-???` / `项目 ?`)
+        view.privacy_mode = true;
+        let red_id = view.format_session_id("old-pinned-0002");
+        let red_title = view.format_session_title(&s_old_pinned);
+        let red_ws = view.format_workspace_label(&s_old_pinned.workspace);
+        assert_ne!(red_id, "S-???");
+        assert!(red_id.starts_with("S-"));
+        assert!(red_title.starts_with("会话 #"));
+        assert!(!red_ws.contains('?'));
+        assert!(red_ws.starts_with("项目 "));
+        view.privacy_mode = false;
+
+        // 5) session_for_detail, step_session, and ShowSessionCalls / call_rows all work on out-of-scope pin
+        assert!(view.session_for_detail("old-pinned-0002").is_some());
+        view.selected_session = Some("old-pinned-0002".into());
+        assert!(view.step_session(1));
+        assert_eq!(view.selected_session.as_deref(), Some("today-sess-0001"));
+        assert!(view.step_session(-1));
+        assert_eq!(view.selected_session.as_deref(), Some("old-pinned-0002"));
+
+        // Default unfiltered call_rows only includes in-scope calls (2)
+        assert_eq!(view.call_rows().len(), 2);
+        // Drilling into the out-of-scope pinned session's calls reveals its 4 turns
+        view.call_session_filter = Some("old-pinned-0002".into());
+        assert_eq!(view.call_rows().len(), 4);
+
+        // 6) Dangling/pruned pinned ID in session_meta must NOT inflate pinned_ids count
+        let mut snap_dangling = snap.clone();
+        snap_dangling.session_meta.insert(
+            "pruned-ghost-9999".into(),
+            SessionUserMeta { pinned: true, updated_at: None },
+        );
+        view.mark_data_dirty();
+        view.ensure_filtered(&snap_dangling);
+        assert_eq!(view.pinned_ids.len(), 1);
+        assert!(!view.pinned_ids.contains("pruned-ghost-9999"));
+
+        // 7) InspectSession / FilterSessions clear `pinned_only` so unpinned targets stay visible;
+        //    ClearSessionFilter clears `pinned_only` when no drill-down filter is active.
+        let mut human = true;
+        let mut light = false;
+        view.pinned_only = true;
+        let _ = view.apply_action(
+            HWND::default(),
+            ClickAction::InspectSession("today-sess-0001".into()),
+            &mut human,
+            &mut light,
+        );
+        assert!(!view.pinned_only);
+        assert_eq!(view.selected_session.as_deref(), Some("today-sess-0001"));
+
+        view.pinned_only = true;
+        let _ = view.apply_action(
+            HWND::default(),
+            ClickAction::FilterSessions(SessionFilter::Model("gemini-4-neon-xhigh".into())),
+            &mut human,
+            &mut light,
+        );
+        assert!(!view.pinned_only);
+        assert_eq!(view.selected_session.as_deref(), Some("today-sess-0001"));
+
+        // First ClearSessionFilter clears session_filter; second clears pinned_only
+        view.pinned_only = true;
+        let _ = view.apply_action(HWND::default(), ClickAction::ClearSessionFilter, &mut human, &mut light);
+        assert!(view.session_filter.is_none());
+        assert!(view.pinned_only);
+        let _ = view.apply_action(HWND::default(), ClickAction::ClearSessionFilter, &mut human, &mut light);
+        assert!(!view.pinned_only);
+    }
+
+    #[test]
+    fn test_fmt_relative_time_cn() {
+        let now = Local.with_ymd_and_hms(2026, 11, 24, 14, 30, 0).single().unwrap();
+        assert_eq!(fmt_relative_time_cn(None, now), "-");
+        assert_eq!(
+            fmt_relative_time_cn(Some(now - chrono::Duration::seconds(20)), now),
+            "刚刚"
+        );
+        assert_eq!(
+            fmt_relative_time_cn(Some(now - chrono::Duration::minutes(12)), now),
+            "12m前"
+        );
+        assert_eq!(
+            fmt_relative_time_cn(Some(now - chrono::Duration::hours(3)), now),
+            "3h前"
+        );
+        assert_eq!(
+            fmt_relative_time_cn(Some(Local.with_ymd_and_hms(2026, 11, 23, 21, 0, 0).single().unwrap()), now),
+            "昨天"
+        );
+        assert_eq!(
+            fmt_relative_time_cn(Some(Local.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).single().unwrap()), now),
+            "04/12"
+        );
+    }
+
+    #[test]
+    fn test_daily_weekly_decoupled_from_scope_and_drilldown_expands() {
+        use crate::stats::aggregate_sessions;
+        use std::path::PathBuf;
+
+        let today = Local::now().date_naive();
+        let old_day = today.checked_sub_days(chrono::Days::new(14)).unwrap();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let old_day_str = old_day.format("%Y-%m-%d").to_string();
+        let old_week_str = iso_week_key(old_day);
+
+        let mut s_today = make_session(
+            "today-uuid-0001",
+            "C:/Users/alice/today-app",
+            "gemini-4-neon-xhigh",
+            (today.year(), today.month(), today.day()),
+            2,
+        );
+        s_today.title = "今天任务".into();
+
+        let mut s_old = make_session(
+            "secret-hist-0002",
+            "C:/Users/alice/secret-client",
+            "claude-opus-5-5",
+            (old_day.year(), old_day.month(), old_day.day()),
+            3,
+        );
+        s_old.title = "历史机密排查".into();
+
+        let all_sessions = vec![s_today, s_old];
+        let all_agg = aggregate_sessions(&all_sessions);
+        let snap = ScanSnapshot {
+            data_dir: PathBuf::from("."),
+            data_dirs: Vec::new(),
+            sessions: all_sessions,
+            agg: all_agg,
+            statusline: None,
+            statusline_changed: false,
+            budget: BudgetConfig::default(),
+            budget_changed: false,
+            budget_path: None,
+            session_meta: HashMap::new(),
+            session_meta_changed: false,
+            session_meta_path: None,
+            archived_sessions_count: 0,
+            archive_enabled: false,
+            archive_path: None,
+            model_rate_labels: HashMap::new(),
+            pricing_rows: Vec::new(),
+            pricing_path: None,
+            custom_pricing_count: 0,
+            pricing_changed: false,
+            skipped_empty: 0,
+            skipped_lines: 0,
+            files_cached: 0,
+            files_reparsed: 0,
+            scan_ms: 0.0,
+            warning: None,
+        };
+
+        let mut view = DashboardView::new(false, DateScope::Today, false, true, false);
+        view.ensure_filtered(&snap);
+        assert_eq!(view.all_sessions_count, 2);
+        assert_eq!(view.all_total.calls, 5);
+        assert_eq!(view.cached_agg.total.calls, 2);
+
+        // 1) Overview/Models/Sessions/Calls/System respect DateScope; Daily/Weekly are decoupled
+        for tab in [Tab::Overview, Tab::Models, Tab::Sessions, Tab::Calls, Tab::System] {
+            view.active_tab = tab;
+            assert!(view.tab_uses_scope());
+        }
+        for tab in [Tab::Daily, Tab::Weekly] {
+            view.active_tab = tab;
+            assert!(!view.tab_uses_scope());
+            assert_eq!(view.scope, DateScope::Today);
+        }
+
+        // 2) Custom date bar hides on Daily/Weekly and returns on scoped tabs without losing scope
+        view.scope = DateScope::Custom;
+        view.active_tab = Tab::Daily;
+        assert!(!view.is_custom_date_active());
+        view.active_tab = Tab::Weekly;
+        assert!(!view.is_custom_date_active());
+        view.active_tab = Tab::Overview;
+        assert!(view.is_custom_date_active());
+        view.scope = DateScope::Today;
+
+        // 3) Daily CSV & JSON exports follow full history on Daily/Weekly and stay scoped on Overview
+        view.active_tab = Tab::Overview;
+        let scoped_csv = view.export_daily_csv(&snap);
+        assert!(scoped_csv.contains(&today_str));
+        assert!(!scoped_csv.contains(&old_day_str));
+
+        view.active_tab = Tab::Daily;
+        let full_csv = view.export_daily_csv(&snap);
+        assert!(full_csv.contains(&today_str));
+        assert!(full_csv.contains(&old_day_str));
+
+        view.privacy_mode = true;
+        let full_json = view.export_snapshot_json(&snap);
+        let parsed: serde_json::Value = serde_json::from_str(&full_json).expect("valid json");
+        assert_eq!(parsed["scope"], serde_json::json!("All"));
+        assert_eq!(parsed["overview"]["calls"], serde_json::json!(5));
+        assert_eq!(parsed["sessions"].as_array().map(|a| a.len()), Some(2));
+        assert!(!full_json.contains("历史机密排查"));
+        assert!(!full_json.contains("secret-hist"));
+        assert!(!full_json.contains("secret-client"));
+        assert!(!full_json.contains("alice"));
+        assert!(!full_json.contains("S-???"));
+        assert!(!full_json.contains("项目 ?"));
+        view.privacy_mode = false;
+
+        // 4) scope_covers_filter accurately detects truncated weeks and out-of-scope dates
+        let wed = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(); // Wednesday of 2026-W48
+        let cur_wk = iso_week_key(wed);
+        let prev_wk = iso_week_key(wed.checked_sub_days(chrono::Days::new(7)).unwrap());
+        assert!(DashboardView::scope_covers_filter(
+            DateScope::Today,
+            None,
+            None,
+            &SessionFilter::Date("2026-11-25".into()),
+            wed,
+        ));
+        assert!(!DashboardView::scope_covers_filter(
+            DateScope::Today,
+            None,
+            None,
+            &SessionFilter::Date("2026-11-24".into()),
+            wed,
+        ));
+        // On Wednesday, Today does NOT cover Monday-Tuesday of the current ISO week, while Days7 does
+        assert!(!DashboardView::scope_covers_filter(
+            DateScope::Today,
+            None,
+            None,
+            &SessionFilter::Week(cur_wk.clone()),
+            wed,
+        ));
+        assert!(DashboardView::scope_covers_filter(
+            DateScope::Days7,
+            None,
+            None,
+            &SessionFilter::Week(cur_wk),
+            wed,
+        ));
+        // Days7 does NOT cover all of the previous ISO week
+        assert!(!DashboardView::scope_covers_filter(
+            DateScope::Days7,
+            None,
+            None,
+            &SessionFilter::Week(prev_wk),
+            wed,
+        ));
+
+        // 5) Drilling into today keeps DateScope::Today; drilling into an older day/week auto-expands to All
+        let mut human = true;
+        let mut light = false;
+        view.active_tab = Tab::Daily;
+        view.scope = DateScope::Today;
+        let (_, prefs_changed_today) = view.apply_action(
+            HWND::default(),
+            ClickAction::FilterSessions(SessionFilter::Date(today_str.clone())),
+            &mut human,
+            &mut light,
+        );
+        assert!(!prefs_changed_today);
+        assert_eq!(view.scope, DateScope::Today);
+        assert_eq!(view.active_tab, Tab::Sessions);
+
+        view.active_tab = Tab::Daily;
+        let (_, prefs_changed_old) = view.apply_action(
+            HWND::default(),
+            ClickAction::FilterSessions(SessionFilter::Date(old_day_str.clone())),
+            &mut human,
+            &mut light,
+        );
+        assert!(!prefs_changed_old);
+        assert_eq!(view.scope, DateScope::All);
+        assert!(view.dirty_filter);
+        view.ensure_filtered(&snap);
+        let rows = view.display_sessions_for_tab();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session.conversation_id, "secret-hist-0002");
+        assert_eq!(view.selected_session.as_deref(), Some("secret-hist-0002"));
+
+        // Drilling into an older ISO week from Today also expands to All and returns full week sessions
+        view.scope = DateScope::Today;
+        view.dirty_filter = true;
+        view.ensure_filtered(&snap);
+        view.active_tab = Tab::Weekly;
+        let (_, prefs_changed_wk) = view.apply_action(
+            HWND::default(),
+            ClickAction::FilterSessions(SessionFilter::Week(old_week_str)),
+            &mut human,
+            &mut light,
+        );
+        assert!(!prefs_changed_wk);
+        assert_eq!(view.scope, DateScope::All);
+        view.ensure_filtered(&snap);
+        let wk_rows = view.display_sessions_for_tab();
+        assert_eq!(wk_rows.len(), 1);
+        assert_eq!(wk_rows[0].session.conversation_id, "secret-hist-0002");
+    }
+
+    #[test]
+    fn test_agent_filter_search_aliases_and_privacy_mode() {
+        let mut s_agy = make_session("agy-uuid-0001", "C:/Users/alice/secret-agy", "gemini-4-neon-xhigh", (2026, 11, 24), 2);
+        s_agy.title = "机密 AGY 任务".into();
+        s_agy.source = SourceKind::Cli;
+
+        let mut s_claude = make_session("claude-uuid-0002", "C:/Users/alice/secret-cc", "claude-sonnet-4-6", (2026, 11, 24), 2);
+        s_claude.title = "机密 Claude 任务".into();
+        s_claude.source = SourceKind::ClaudeCode;
+
+        let mut s_codex = make_session("codex-uuid-0003", "C:/Users/alice/secret-cx", "gpt-5.3-codex", (2026, 11, 24), 1);
+        s_codex.title = "机密 Codex 任务".into();
+        s_codex.source = SourceKind::Codex;
+
+        let mut s_gemini = make_session("gem-uuid-0004", "C:/Users/alice/secret-gm", "gemini-2.5-pro", (2026, 11, 24), 1);
+        s_gemini.title = "机密 Gemini 任务".into();
+        s_gemini.source = SourceKind::GeminiCli;
+
+        let sessions = vec![s_agy.clone(), s_claude.clone(), s_codex.clone(), s_gemini.clone()];
+        let agg = crate::stats::aggregate_sessions(&sessions);
+        let redactor = Redactor::build(&sessions, &agg);
+
+        // 1) SessionFilter::Agent matches family & chip label is privacy-safe
+        let f_claude = SessionFilter::Agent(AgentFamily::ClaudeCode);
+        assert_eq!(f_claude.label(None), "来源: Claude  ×");
+        assert_eq!(f_claude.label(Some(&redactor)), "来源: Claude  ×");
+        assert!(!f_claude.slices_turns());
+        assert!(f_claude.matches(&s_claude));
+        assert!(!f_claude.matches(&s_agy));
+        assert!(!f_claude.matches(&s_codex));
+        assert_eq!(SessionFilter::Agent(AgentFamily::Antigravity).label(Some(&redactor)), "来源: AGY  ×");
+        assert_eq!(SessionFilter::Agent(AgentFamily::Codex).label(Some(&redactor)), "来源: Codex  ×");
+        assert_eq!(SessionFilter::Agent(AgentFamily::GeminiCli).label(Some(&redactor)), "来源: Gemini  ×");
+
+        let mut view = DashboardView::new(false, DateScope::All, false, true, true);
+        view.cached_sessions = sessions;
+        view.cached_agg = agg;
+        view.redactor = redactor;
+
+        // SessionFilter::Agent filters display_sessions cleanly
+        view.session_filter = Some(SessionFilter::Agent(AgentFamily::Codex));
+        let codex_rows = view.display_sessions(true);
+        assert_eq!(codex_rows.len(), 1);
+        assert_eq!(codex_rows[0].session.conversation_id, "codex-uuid-0003");
+        view.session_filter = None;
+
+        // 2) Under privacy_mode, agent aliases & SourceKind::label_short() still match in Sessions & Calls
+        for (q, expected_cid, expected_calls) in [
+            ("claudecode", "claude-uuid-0002", 2usize),
+            ("claude-code", "claude-uuid-0002", 2usize),
+            ("openai-codex", "codex-uuid-0003", 1usize),
+            ("gemini-cli", "gem-uuid-0004", 1usize),
+            ("antigravity", "agy-uuid-0001", 2usize),
+        ] {
+            view.search_query = q.into();
+            let s_hits = view.display_sessions(true);
+            assert_eq!(s_hits.len(), 1, "sessions query={q}");
+            assert_eq!(s_hits[0].session.conversation_id, expected_cid);
+            let c_hits = view.call_rows();
+            assert_eq!(c_hits.len(), expected_calls, "calls query={q}");
+            assert!(c_hits.iter().all(|r| view.call_session(r).conversation_id == expected_cid));
+        }
+
+        // Private raw title/workspace remains completely unsearchable under privacy_mode
+        view.search_query = "secret-cc".into();
+        assert!(view.display_sessions(true).is_empty());
+        assert!(view.call_rows().is_empty());
+        view.search_query = "机密".into();
+        assert!(view.display_sessions(true).is_empty());
+        assert!(view.call_rows().is_empty());
+
+        // 3) Multi-agent prefix tags preserve legacy AGY-only mode vs multi-agent mode
+        assert_eq!(format_source_tag(SourceKind::Cli, false), None);
+        assert_eq!(format_source_tag(SourceKind::App, false), Some("App"));
+        assert_eq!(format_source_tag(SourceKind::Ide, false), Some("IDE"));
+        assert_eq!(format_source_tag(SourceKind::Cli, true), Some("AGY"));
+        assert_eq!(format_source_tag(SourceKind::App, true), Some("App"));
+        assert_eq!(format_source_tag(SourceKind::Ide, true), Some("IDE"));
+        assert_eq!(format_source_tag(SourceKind::ClaudeCode, true), Some("Claude"));
+        assert_eq!(format_source_tag(SourceKind::Codex, true), Some("Codex"));
+        assert_eq!(format_source_tag(SourceKind::GeminiCli, true), Some("Gemini"));
+    }
+
+    #[test]
+    fn test_redact_data_dir_and_active_sources_all_agents() {
+        assert_eq!(redact_data_dir(Path::new(r"C:\Users\alice\.claude")), "~/.claude");
+        assert_eq!(redact_data_dir(Path::new("/home/alice/.claude/")), "~/.claude");
+        assert_eq!(redact_data_dir(Path::new(r"C:\Users\alice\.config\claude")), "~/.config/claude");
+        assert_eq!(redact_data_dir(Path::new("/home/alice/.config/claude/")), "~/.config/claude");
+        assert_eq!(redact_data_dir(Path::new(r"C:\Users\alice\.codex")), "~/.codex");
+        assert_eq!(redact_data_dir(Path::new("/Users/alice/.codex/")), "~/.codex");
+        assert_eq!(redact_data_dir(Path::new(r"C:\Users\alice\.gemini\tmp")), "~/.gemini/tmp");
+        assert_eq!(redact_data_dir(Path::new("/home/alice/.gemini/tmp/")), "~/.gemini/tmp");
+        assert_eq!(
+            redact_data_dir(Path::new(r"C:\Users\alice\.gemini\antigravity")),
+            "~/.gemini/antigravity"
+        );
+        assert_eq!(
+            redact_data_dir(Path::new(r"C:\Users\alice\.gemini\antigravity-ide")),
+            "~/.gemini/antigravity-ide"
+        );
+        // Custom paths stay redacted
+        assert_eq!(redact_data_dir(Path::new(r"D:\Private\my-codex-home")), "<已脱敏目录>");
+        assert_eq!(redact_data_dir(Path::new(r"C:\Users\alice\.gemini")), "<已脱敏目录>");
+
+        let dirs = vec![
+            (SourceKind::Cli, std::path::PathBuf::from(r"C:\Users\alice\.gemini\antigravity-cli")),
+            (SourceKind::ClaudeCode, std::path::PathBuf::from(r"C:\Users\alice\.claude")),
+            (SourceKind::Codex, std::path::PathBuf::from(r"C:\Users\alice\.codex")),
+            (SourceKind::GeminiCli, std::path::PathBuf::from(r"C:\Users\alice\.gemini")),
+        ];
+        let red_line = format_active_sources_line(&dirs, Path::new("."), true);
+        assert!(red_line.contains("~/.gemini/antigravity-cli"));
+        assert!(red_line.contains("~/.claude"));
+        assert!(red_line.contains("~/.codex"));
+        assert!(red_line.contains("~/.gemini/tmp"));
+        assert!(!red_line.contains("alice"));
+    }
+
+    #[test]
+    fn test_reasoning_tokens_thinking_and_non_agy_gen_secs_formatting() {
+        let mut s_codex = make_session("codex-1", "C:/Users/alice/app", "gpt-5.3-codex", (2026, 11, 24), 1);
+        s_codex.source = SourceKind::Codex;
+        s_codex.turns[0].reasoning_tokens = 1_250;
+        s_codex.turns[0].thinking_chars = 0;
+        s_codex.turns[0].gen_secs = None;
+        assert!(s_codex.turns[0].has_thinking());
+        assert_eq!(format_turn_thinking(&s_codex.turns[0]).as_deref(), Some("1,250 tok"));
+
+        // Even when both reasoning_tokens and thinking_chars are set (e.g. Gemini CLI), prefer `X tok`
+        let mut t_gem = s_codex.turns[0].clone();
+        t_gem.thinking_chars = 88;
+        assert!(t_gem.has_thinking());
+        assert_eq!(format_turn_thinking(&t_gem).as_deref(), Some("1,250 tok"));
+
+        // Antigravity / Claude plaintext thinking shows `X 字`
+        let mut s_agy = make_session("agy-1", "C:/Users/alice/app", "gemini-4-neon-xhigh", (2026, 11, 24), 1);
+        s_agy.source = SourceKind::Cli;
+        s_agy.turns[0].reasoning_tokens = 0;
+        s_agy.turns[0].thinking_chars = 420;
+        s_agy.turns[0].gen_secs = None;
+        assert!(s_agy.turns[0].has_thinking());
+        assert_eq!(format_turn_thinking(&s_agy.turns[0]).as_deref(), Some("420 字"));
+
+        // No thinking -> None
+        let mut t_plain = s_agy.turns[0].clone();
+        t_plain.thinking_chars = 0;
+        assert!(!t_plain.has_thinking());
+        assert_eq!(format_turn_thinking(&t_plain), None);
+
+        // Clipboard notes: non-AGY turn with gen_secs=None uses "当前日志无生成耗时记录" & reasoning tokens
+        let view = DashboardView::new(false, DateScope::All, false, true, false);
+        let codex_clip = view.format_call_detail_clipboard(&s_codex, &s_codex.turns[0], None);
+        assert!(codex_clip.contains("当前日志无生成耗时记录"));
+        assert!(codex_clip.contains("思考: 1,250 tok"));
+        assert!(!codex_clip.contains("1,250 字"));
+
+        let agy_clip = view.format_call_detail_clipboard(&s_agy, &s_agy.turns[0], None);
+        assert!(agy_clip.contains("纯回复 / 压缩步骤无结束时间"));
+        assert!(agy_clip.contains("思考: 420 字"));
     }
 }

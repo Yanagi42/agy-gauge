@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-//! Ultra-lightweight, strictly read-only Antigravity CLI (`agy`) Token & System Monitor.
+//! Ultra-lightweight, strictly read-only multi-agent Token & System Monitor
+//! (Antigravity CLI/App/IDE + Claude Code + OpenAI Codex CLI + Gemini CLI).
 //!
 //! Craft & Architecture:
 //!   - Bottom-right per-pixel-alpha floating pill (live CPU sparkline + radial RAM ring)
@@ -14,10 +15,10 @@ mod dashboard;
 mod pill;
 mod telemetry;
 
-pub use agy_gauge::{archive, pricing, quota, stats};
+pub use agy_gauge::{archive, launcher, pricing, quota, session_meta, stats};
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -34,27 +35,46 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_RETURN, VK_SHIFT, VK_TAB,
-    VK_UP,
+    TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_MENU, VK_RETURN, VK_SHIFT,
+    VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, MoveWindow,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, SetForegroundWindow,
-    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HICON, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
-    IDC_HAND, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPOS, WM_ACTIVATEAPP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
+    LoadImageW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HICON, HMENU,
+    HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, SM_CXICON, SM_CXSMICON,
+    SM_CYICON, SM_CYSMICON, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE,
+    SW_SHOW, SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPOS,
+    WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WM_SETICON,
+    WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
+
+const WM_APP_SYNC_META: u32 = WM_APP_TRAY + 1;
+const RES_ICON_NORMAL: u16 = 1;
+const RES_ICON_WARN: u16 = 2;
+const RES_ICON_CRIT: u16 = 3;
+
+const CMD_SESS_RESUME: u32 = 6201;
+const CMD_SESS_RESUME_PARENT: u32 = 6202;
+const CMD_SESS_INSPECT_PARENT: u32 = 6203;
+const CMD_SESS_COPY_CMD: u32 = 6204;
+const CMD_SESS_OPEN_WS: u32 = 6205;
+const CMD_SESS_TOGGLE_PIN: u32 = 6206;
+const CMD_SESS_SHOW_CALLS: u32 = 6207;
+const CMD_SESS_COPY_DETAIL: u32 = 6208;
+const CMD_SESS_COPY_ID: u32 = 6209;
+const CMD_SESS_SHOW_SUBS: u32 = 6210;
 
 const WM_SETTINGCHANGE: u32 = 0x001A;
 const SPI_SETWORKAREA: usize = 0x002F;
@@ -80,14 +100,15 @@ const CMD_EXPORT_CALLS_CSV: u32 = 6105;
 
 use d2d::{theme_for, D2DFactories, Fonts};
 use dashboard::{
-    BreakdownMode, ClickAction, DailyViewMode, DashboardView, ModelViewMode, OverviewTopMode, Tab,
-    WeeklyMode,
+    fmt_relative_time_cn, BreakdownMode, ClickAction, DailyViewMode, DashboardView, ModelViewMode,
+    OverviewTopMode, Tab, WeeklyMode,
 };
 use pill::{
-    show_context_menu, PillRenderer, CMD_MONITOR_BASE, CMD_OPEN_DETAIL, CMD_PILL_ITEMS_RESET,
-    CMD_PILL_ITEM_BASE, CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_AUTOSTART,
-    CMD_TOGGLE_HIDE_FULLSCREEN, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_NOTIFICATIONS,
-    CMD_TOGGLE_PILL_VISIBLE, CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST, CMD_TOGGLE_TRAY_HOVER,
+    show_context_menu, PillRenderer, QuickSessionMenuItem, CMD_MONITOR_BASE, CMD_OPEN_DETAIL,
+    CMD_OPEN_SESSIONS_TAB, CMD_PILL_ITEMS_RESET, CMD_PILL_ITEM_BASE, CMD_QUICK_RESUME_BASE,
+    CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_AUTOSTART, CMD_TOGGLE_HIDE_FULLSCREEN,
+    CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_NOTIFICATIONS, CMD_TOGGLE_PILL_VISIBLE,
+    CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST, CMD_TOGGLE_TRAY_HOVER,
 };
 use pricing::ModelRate;
 use stats::{DateScope, IncrementalScanner, ScanSnapshot};
@@ -124,7 +145,8 @@ struct PricingEditControls {
     bg_brush: HBRUSH,
     brush_light: bool,
     visible: bool,
-    editor_mode: u8, // 0 = none, 1 = pricing, 2 = budget
+    active_count: usize,
+    editor_mode: u8, // 0 = none, 1 = pricing (5 fields), 2 = budget (4 fields)
     initialized_values: bool,
     last_rects_px: [(i32, i32, i32, i32); 5],
     search_visible: bool,
@@ -146,6 +168,7 @@ impl Default for PricingEditControls {
             bg_brush: HBRUSH::default(),
             brush_light: false,
             visible: false,
+            active_count: 0,
             editor_mode: 0,
             initialized_values: false,
             last_rects_px: [(0, 0, 0, 0); 5],
@@ -299,7 +322,7 @@ impl PricingEditControls {
             return;
         }
         if let Some(h) = self.create_single_edit(parent, IDC_SEARCH_EDIT) {
-            let cue = to_wide_null("搜索标题 / 模型 / 工具 (/)");
+            let cue = to_wide_null("搜索标题 / 模型 / 工具 / 来源 (/)");
             unsafe {
                 let _ = SendMessageW(h, EM_SETCUEBANNER, WPARAM(1), LPARAM(cue.as_ptr() as isize));
             }
@@ -329,15 +352,21 @@ impl PricingEditControls {
         parent: HWND,
         dpi: f32,
         light: bool,
-        rects_dip: Option<[D2D_RECT_F; 5]>,
+        rects_dip: Option<&[D2D_RECT_F]>,
     ) {
         let Some(rects) = rects_dip else {
             self.hide_five_edits(parent);
             return;
         };
+        let count = rects.len().min(5);
+        if count == 0 {
+            self.hide_five_edits(parent);
+            return;
+        }
         self.ensure_created(parent, dpi, light);
         let scale = dpi / 96.0;
-        for (i, r) in rects.iter().enumerate() {
+        let prev_count = self.active_count;
+        for (i, r) in rects.iter().take(count).enumerate() {
             let h = self.edits[i];
             if h.0.is_null() {
                 continue;
@@ -347,19 +376,34 @@ impl PricingEditControls {
             let w = ((r.right - r.left) * scale).round().max(12.0) as i32;
             let hh = ((r.bottom - r.top) * scale).round().max(12.0) as i32;
             let tuple = (x, y, w, hh);
-            if !self.visible || self.last_rects_px[i] != tuple {
+            let was_shown = self.visible && i < prev_count;
+            if !was_shown || self.last_rects_px[i] != tuple {
                 unsafe {
                     let _ = MoveWindow(h, x, y, w, hh, true);
                 }
                 self.last_rects_px[i] = tuple;
             }
-            if !self.visible {
+            if !was_shown {
                 unsafe {
                     let _ = ShowWindow(h, SW_SHOW);
                 }
             }
         }
+        // Hide any trailing edits beyond `count` (e.g. 5th edit when switching Pricing -> 4-field Budget)
+        for i in count..5 {
+            let h = self.edits[i];
+            if !h.0.is_null() {
+                unsafe {
+                    if GetFocus() == h && !parent.0.is_null() {
+                        let _ = SetFocus(parent);
+                    }
+                    let _ = ShowWindow(h, SW_HIDE);
+                }
+            }
+            self.last_rects_px[i] = (0, 0, 0, 0);
+        }
         self.visible = true;
+        self.active_count = count;
     }
 
     fn sync_search_layout(
@@ -462,6 +506,7 @@ impl PricingEditControls {
     fn hide_five_edits(&mut self, parent: HWND) {
         if !self.visible {
             self.editor_mode = 0;
+            self.active_count = 0;
             return;
         }
         unsafe {
@@ -477,6 +522,7 @@ impl PricingEditControls {
             }
         }
         self.visible = false;
+        self.active_count = 0;
         self.editor_mode = 0;
     }
 
@@ -513,6 +559,7 @@ impl PricingEditControls {
         self.search_edit = HWND::default();
         self.date_edits = [HWND::default(); 2];
         self.visible = false;
+        self.active_count = 0;
         self.editor_mode = 0;
         self.initialized_values = false;
         self.last_rects_px = [(0, 0, 0, 0); 5];
@@ -547,6 +594,24 @@ impl PricingEditControls {
                 unsafe {
                     let _ = SetWindowTextW(h, wide_pcwstr(&wide));
                 }
+            }
+        }
+        self.initialized_values = true;
+    }
+
+    fn set_budget_values(&mut self, vals: &[String; 4]) {
+        for (i, v) in vals.iter().enumerate() {
+            let h = self.edits[i];
+            if !h.0.is_null() {
+                let wide = to_wide_null(v);
+                unsafe {
+                    let _ = SetWindowTextW(h, wide_pcwstr(&wide));
+                }
+            }
+        }
+        if !self.edits[4].0.is_null() {
+            unsafe {
+                let _ = SetWindowTextW(self.edits[4], w!(""));
             }
         }
         self.initialized_values = true;
@@ -627,7 +692,8 @@ impl PricingEditControls {
         if hwnd.0.is_null() {
             return None;
         }
-        self.edits.iter().position(|&h| h == hwnd)
+        let n = self.active_count.min(5);
+        self.edits[..n].iter().position(|&h| h == hwnd)
     }
 
     fn is_search_hwnd(&self, hwnd: HWND) -> bool {
@@ -662,9 +728,254 @@ impl PricingEditControls {
     }
 }
 
+fn load_res_icon(res_id: u16, w_px: i32, h_px: i32) -> HICON {
+    unsafe {
+        let Ok(hinst) = GetModuleHandleW(None) else {
+            return HICON::default();
+        };
+        LoadImageW(
+            hinst,
+            PCWSTR(res_id as usize as *const u16),
+            IMAGE_ICON,
+            w_px.max(16),
+            h_px.max(16),
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
+    }
+}
+
+fn system_icon_metrics_for_dpi(dpi: u32) -> ((i32, i32), (i32, i32)) {
+    let dpi = dpi.max(96);
+    unsafe {
+        let big_w = GetSystemMetricsForDpi(SM_CXICON, dpi).max(16);
+        let big_h = GetSystemMetricsForDpi(SM_CYICON, dpi).max(16);
+        let sm_w = GetSystemMetricsForDpi(SM_CXSMICON, dpi).max(16);
+        let sm_h = GetSystemMetricsForDpi(SM_CYSMICON, dpi).max(16);
+        ((big_w, big_h), (sm_w, sm_h))
+    }
+}
+
+/// Owns HiDPI tray icons (Normal/Warn/Critical) and per-window dashboard icons safely without
+/// ever destroying `WNDCLASSEXW` class icons or double-freeing fallback handles.
+struct AppIcons {
+    class_sm_fallback: HICON,
+    tray_normal: HICON,
+    tray_warn: HICON,
+    tray_crit: HICON,
+    tray_dpi: u32,
+    owned_tray: Vec<HICON>,
+    dash_big: Option<HICON>,
+    dash_sm: Option<HICON>,
+    dash_dpi: u32,
+}
+
+impl AppIcons {
+    fn new(class_sm_fallback: HICON, sys_dpi: u32) -> Self {
+        let mut icons = Self {
+            class_sm_fallback,
+            tray_normal: class_sm_fallback,
+            tray_warn: class_sm_fallback,
+            tray_crit: class_sm_fallback,
+            tray_dpi: 0,
+            owned_tray: Vec::new(),
+            dash_big: None,
+            dash_sm: None,
+            dash_dpi: 0,
+        };
+        icons.reload_tray_for_dpi(sys_dpi);
+        icons
+    }
+
+    fn push_owned_unique(list: &mut Vec<HICON>, h: HICON) {
+        if !h.0.is_null() && !list.contains(&h) {
+            list.push(h);
+        }
+    }
+
+    fn reload_tray_for_dpi(&mut self, dpi: u32) -> bool {
+        let dpi = dpi.max(96);
+        if self.tray_dpi == dpi && !self.tray_normal.0.is_null() {
+            return false;
+        }
+        let fallback = self.class_sm_fallback;
+        let (_, (sm_w, sm_h)) = system_icon_metrics_for_dpi(dpi);
+        let normal_raw = load_res_icon(RES_ICON_NORMAL, sm_w, sm_h);
+        let warn_raw = load_res_icon(RES_ICON_WARN, sm_w, sm_h);
+        let crit_raw = load_res_icon(RES_ICON_CRIT, sm_w, sm_h);
+
+        let new_normal = if !normal_raw.0.is_null() { normal_raw } else { fallback };
+        let new_warn = if !warn_raw.0.is_null() { warn_raw } else { new_normal };
+        let new_crit = if !crit_raw.0.is_null() { crit_raw } else { new_normal };
+
+        let mut new_owned = Vec::new();
+        Self::push_owned_unique(&mut new_owned, normal_raw);
+        Self::push_owned_unique(&mut new_owned, warn_raw);
+        Self::push_owned_unique(&mut new_owned, crit_raw);
+
+        let old_owned = std::mem::replace(&mut self.owned_tray, new_owned);
+        self.tray_normal = new_normal;
+        self.tray_warn = new_warn;
+        self.tray_crit = new_crit;
+        self.tray_dpi = dpi;
+
+        for h in old_owned {
+            if !self.owned_tray.contains(&h) && h != fallback {
+                unsafe {
+                    let _ = DestroyIcon(h);
+                }
+            }
+        }
+        true
+    }
+
+    fn tray_for_severity(&self, sev: quota::AlertSeverity) -> HICON {
+        match sev {
+            quota::AlertSeverity::Critical => self.tray_crit,
+            quota::AlertSeverity::Warn => self.tray_warn,
+            quota::AlertSeverity::Normal => self.tray_normal,
+        }
+    }
+
+    fn apply_dashboard_icons_for_dpi(&mut self, hwnd: HWND, dpi: u32) {
+        let dpi = dpi.max(96);
+        if hwnd.0.is_null() || self.dash_dpi == dpi {
+            return;
+        }
+        let ((big_w, big_h), (sm_w, sm_h)) = system_icon_metrics_for_dpi(dpi);
+        let big = load_res_icon(RES_ICON_NORMAL, big_w, big_h);
+        let sm = load_res_icon(RES_ICON_NORMAL, sm_w, sm_h);
+        if big.0.is_null() && sm.0.is_null() {
+            return;
+        }
+        let prev_big = self.dash_big.take();
+        let prev_sm = self.dash_sm.take();
+        unsafe {
+            if !big.0.is_null() {
+                let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(big.0 as isize));
+                self.dash_big = Some(big);
+            }
+            if !sm.0.is_null() {
+                let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(sm.0 as isize));
+                self.dash_sm = Some(sm);
+            }
+            if let Some(old) = prev_big {
+                if !old.0.is_null() && Some(old) != prev_sm {
+                    let _ = DestroyIcon(old);
+                }
+            }
+            if let Some(old) = prev_sm {
+                if !old.0.is_null() {
+                    let _ = DestroyIcon(old);
+                }
+            }
+        }
+        self.dash_dpi = dpi;
+    }
+
+    fn clear_dashboard_icons(&mut self) {
+        let prev_big = self.dash_big.take();
+        let prev_sm = self.dash_sm.take();
+        self.dash_dpi = 0;
+        unsafe {
+            if let Some(old) = prev_big {
+                if !old.0.is_null() && Some(old) != prev_sm {
+                    let _ = DestroyIcon(old);
+                }
+            }
+            if let Some(old) = prev_sm {
+                if !old.0.is_null() {
+                    let _ = DestroyIcon(old);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AppIcons {
+    fn drop(&mut self) {
+        self.clear_dashboard_icons();
+        for h in self.owned_tray.drain(..) {
+            if !h.0.is_null() {
+                unsafe {
+                    let _ = DestroyIcon(h);
+                }
+            }
+        }
+    }
+}
+
+fn broadcast_meta_sync(exclude: HWND) {
+    unsafe {
+        for cls in [w!("AgyTokenPillClass"), w!("AgyTokenDashboardClass")] {
+            if let Ok(target) = FindWindowW(cls, None) {
+                if !target.0.is_null() && target != exclude {
+                    let _ = PostMessageW(target, WM_APP_SYNC_META, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+fn build_quick_session_menu_items(snapshot: &ScanSnapshot) -> Vec<QuickSessionMenuItem> {
+    let now = Local::now();
+    let show_multi = snapshot.has_non_antigravity();
+    let mut cands: Vec<(bool, Option<chrono::DateTime<Local>>, &stats::SessionInfo)> = snapshot
+        .sessions
+        .iter()
+        .filter(|s| {
+            launcher::classify_resume_capability(s, &snapshot.sessions).is_direct_resumable()
+                && launcher::validate_conversation_id(&s.conversation_id)
+        })
+        .map(|s| {
+            let pinned = snapshot
+                .session_meta
+                .get(&s.conversation_id)
+                .is_some_and(|m| m.pinned);
+            (pinned, s.last_time, s)
+        })
+        .collect();
+    cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+    cands
+        .into_iter()
+        .take(5)
+        .map(|(pinned, last_t, s)| {
+            let star = if pinned { "★ " } else { "" };
+            let src_prefix = dashboard::format_source_tag(s.source, show_multi)
+                .map(|t| format!("[{t}] "))
+                .unwrap_or_default();
+            let title = truncate_chars(s.title.trim(), 24);
+            let ws = s.workspace_short();
+            let rel = fmt_relative_time_cn(last_t, now);
+            let label = if ws.is_empty() {
+                format!("{star}{src_prefix}{title} ({rel})")
+            } else {
+                format!("{star}{src_prefix}{title} · {} ({rel})", truncate_chars(&ws, 14))
+            };
+            QuickSessionMenuItem {
+                conversation_id: s.conversation_id.clone(),
+                label,
+            }
+        })
+        .collect()
+}
+
 struct AppState {
     factories: D2DFactories,
     fonts: Fonts,
+    icons: AppIcons,
     scanner: IncrementalScanner,
     snapshot: ScanSnapshot,
     telemetry: SystemTelemetry,
@@ -890,7 +1201,9 @@ fn create_dashboard_window_local() {
         ) {
             let th = theme_for(light);
             apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
+            let win_dpi = (window_dpi_scale(hwnd) * 96.0).round() as u32;
             with_app(|app| {
+                app.icons.apply_dashboard_icons_for_dpi(hwnd, win_dpi);
                 app.dash_hwnd = Some(hwnd);
                 app.dash_view = Some(DashboardView::new(
                     app.fresh_only,
@@ -910,6 +1223,19 @@ fn create_dashboard_window_local() {
             ensure_pill_topmost_if_needed(false);
         }
     }
+}
+
+fn open_dashboard_to_sessions_tab_safe() {
+    open_or_focus_dashboard_safe();
+    with_app(|app| {
+        if let Some(view) = &mut app.dash_view {
+            view.open_sessions_tab();
+        }
+        if let Some(dh) = app.dash_hwnd {
+            app.pricing_edits.hide_five_edits(dh);
+        }
+        app.invalidate_dashboard();
+    });
 }
 
 fn hide_dashboard_safe() {
@@ -954,6 +1280,7 @@ fn destroy_dashboard_safe() {
         app.dash_visible = false;
         app.dash_view = None;
         app.pricing_edits.reset_handles();
+        app.icons.clear_dashboard_icons();
         (app.dash_hwnd.take(), app.dash_owner_hwnd.take(), app.dashboard_only)
     })
     .unwrap_or((None, None, false));
@@ -1338,12 +1665,6 @@ impl AppState {
             stats::fmt_compact(tc.total_tokens()),
             pricing::fmt_cost_compact(&tc.cost, tc.calls),
         );
-        if let Some(blk) = &self.snapshot.active_block {
-            tip.push_str(&format!(
-                " · 5h {}",
-                pricing::fmt_cost_compact(&blk.counts.cost, blk.counts.calls)
-            ));
-        }
         if let Some(sl) = &self.snapshot.statusline {
             if let Some(b) = sl.tightest_bucket() {
                 if let Some(rp) = b.remaining_pct() {
@@ -1366,9 +1687,6 @@ impl AppState {
             self.last_tray_tip = tip;
         }
 
-        if !self.notifications_enabled {
-            return;
-        }
         let today_date = Local::now().date_naive();
         let today_key = today_date.format("%Y-%m-%d").to_string();
         let week_key = stats::iso_week_key(today_date);
@@ -1388,7 +1706,6 @@ impl AppState {
             .unwrap_or(0.0);
         let events = quota::evaluate_alerts(
             &self.snapshot.budget,
-            self.snapshot.active_block.as_ref(),
             &today_key,
             today_usd,
             &week_key,
@@ -1396,6 +1713,21 @@ impl AppState {
             self.snapshot.statusline.as_ref(),
             Utc::now(),
         );
+        // Always sync the 3-state tray icon BEFORE the notifications_enabled early-return so
+        // muting balloon popups never freezes tray alert color feedback.
+        let max_sev = events
+            .iter()
+            .map(|e| e.severity)
+            .max()
+            .unwrap_or(quota::AlertSeverity::Normal);
+        let target_icon = self.icons.tray_for_severity(max_sev);
+        if let Some(tray) = &mut self.tray {
+            tray.update_icon(target_icon);
+        }
+
+        if !self.notifications_enabled {
+            return;
+        }
         for ev in events {
             if self.fired_alerts.insert(ev.dedup_key) {
                 if let Some(tray) = &self.tray {
@@ -1421,13 +1753,36 @@ impl AppState {
     }
 
     fn refresh_tokens(&mut self, force: bool) {
+        let prev_running: HashMap<String, bool> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|s| s.is_running_hint)
+            .map(|s| (s.conversation_id.clone(), true))
+            .collect();
         let fresh = self.scanner.scan();
+        let running_changed = {
+            let mut cur_running_cnt = 0usize;
+            let mut diff = false;
+            for s in &fresh.sessions {
+                if s.is_running_hint {
+                    cur_running_cnt += 1;
+                    if !prev_running.contains_key(&s.conversation_id) {
+                        diff = true;
+                        break;
+                    }
+                }
+            }
+            diff || cur_running_cnt != prev_running.len()
+        };
         let changed = force
             || fresh.pricing_changed
             || fresh.statusline_changed
             || fresh.budget_changed
+            || fresh.session_meta_changed
             || fresh.files_reparsed > 0
-            || fresh.sessions.len() != self.snapshot.sessions.len();
+            || fresh.sessions.len() != self.snapshot.sessions.len()
+            || running_changed;
         self.snapshot = fresh;
         if changed {
             let cur_tot = self.snapshot.agg.total.total_tokens();
@@ -1441,6 +1796,197 @@ impl AppState {
             self.sync_tray_and_alerts();
             self.redraw_pill();
             self.invalidate_dashboard();
+        }
+    }
+
+    fn lookup_session(&self, cid: &str) -> Option<stats::SessionInfo> {
+        self.snapshot
+            .sessions
+            .iter()
+            .find(|s| s.conversation_id == cid)
+            .cloned()
+    }
+
+    fn notify_banner(&mut self, msg: impl Into<String>, is_err: bool) {
+        let text = msg.into();
+        if let Some(view) = &mut self.dash_view {
+            view.set_banner_status(text, is_err);
+        }
+        self.invalidate_dashboard();
+    }
+
+    fn handle_toggle_pin(&mut self, sender: HWND, cid: &str) {
+        match self.scanner.toggle_session_pin(cid) {
+            Ok(now_pinned) => {
+                self.refresh_tokens(true);
+                broadcast_meta_sync(sender);
+                self.notify_banner(
+                    if now_pinned { "已置顶该会话" } else { "已取消置顶" },
+                    false,
+                );
+            }
+            Err(err) => {
+                self.notify_banner(err, true);
+            }
+        }
+    }
+
+    fn handle_copy_resume_cmd(&mut self, hwnd: HWND, cid: &str) {
+        if self.privacy_mode {
+            self.notify_banner("脱敏模式已拦截，按 P 关闭后重试", true);
+            return;
+        }
+        let Some(s) = self.lookup_session(cid) else {
+            self.notify_banner("未找到该会话", true);
+            return;
+        };
+        let cap = launcher::classify_resume_capability(&s, &self.snapshot.sessions);
+        if !cap.is_direct_resumable() {
+            let reason = cap
+                .disabled_reason_cn()
+                .or_else(|| cap.blocked_reason().map(launcher::BlockedReason::message_cn))
+                .unwrap_or("该会话不支持终端恢复");
+            self.notify_banner(reason, true);
+            return;
+        }
+        match launcher::format_resume_command_for_session(&s) {
+            Ok(cmd) => {
+                if copy_text_to_clipboard(hwnd, &cmd) {
+                    if let Some(view) = &mut self.dash_view {
+                        view.resume_cmd_copied_until =
+                            Some(Instant::now() + Duration::from_millis(1600));
+                    }
+                    let cli_name = launcher::cli_binary_name_for_source(s.source).unwrap_or("终端");
+                    self.notify_banner(
+                        format!("已复制 {cli_name} 恢复命令，粘贴至终端即可继续"),
+                        false,
+                    );
+                } else {
+                    self.notify_banner("写入剪贴板失败", true);
+                }
+            }
+            Err(err) => self.notify_banner(err, true),
+        }
+    }
+
+    fn handle_open_workspace(&mut self, hwnd: HWND, cid: &str) {
+        if self.privacy_mode {
+            self.notify_banner("脱敏模式已拦截，按 P 关闭后重试", true);
+            return;
+        }
+        let Some(s) = self.lookup_session(cid) else {
+            self.notify_banner("未找到该会话", true);
+            return;
+        };
+        match launcher::open_workspace_folder(hwnd, &s.workspace) {
+            Ok(_) => self.notify_banner("已在资源管理器打开工作区目录", false),
+            Err(err) => self.notify_banner(err, true),
+        }
+    }
+
+    fn handle_copy_full_session_id(&mut self, hwnd: HWND, cid: &str) {
+        if self.privacy_mode {
+            self.notify_banner("脱敏模式已拦截，按 P 关闭后重试", true);
+            return;
+        }
+        if copy_text_to_clipboard(hwnd, cid) {
+            self.notify_banner("已复制完整会话 ID", false);
+        } else {
+            self.notify_banner("写入剪贴板失败", true);
+        }
+    }
+
+    /// Launches a terminal to resume `cid`. Returns `true` when invoked from the dashboard and
+    /// launch succeeds so the dashboard auto-hides (stays open on privacy block or launch error
+    /// so the error toast remains visible; emits a quiet tray balloon on workspace fallback).
+    fn handle_resume_session(&mut self, hwnd: HWND, cid: &str, from_dashboard: bool) -> bool {
+        if self.privacy_mode {
+            if from_dashboard {
+                self.notify_banner("脱敏模式已拦截，按 P 关闭后重试", true);
+            } else if self.notifications_enabled {
+                if let Some(tray) = &self.tray {
+                    tray.show_balloon("AGY Gauge", "脱敏模式已拦截，请先关闭脱敏模式", false, true);
+                }
+            }
+            return false;
+        }
+        let Some(s) = self.lookup_session(cid) else {
+            self.notify_banner("未找到该会话", true);
+            return false;
+        };
+        let cap = launcher::classify_resume_capability(&s, &self.snapshot.sessions);
+        if !cap.is_direct_resumable() {
+            let reason = cap
+                .disabled_reason_cn()
+                .or_else(|| cap.blocked_reason().map(launcher::BlockedReason::message_cn))
+                .unwrap_or("该会话不支持终端恢复");
+            self.notify_banner(reason, true);
+            return false;
+        }
+        let had_ws_spec = launcher::normalize_workspace_path_str(&s.workspace).is_some();
+        match launcher::launch_resume_for_session(&s) {
+            Ok(outcome) => {
+                if outcome.workspace_fallback && had_ws_spec {
+                    let msg = format!(
+                        "原工作区目录不存在，已通过 {} 在用户主目录恢复会话",
+                        outcome.backend.label()
+                    );
+                    if from_dashboard {
+                        self.notify_banner(msg, false);
+                    } else if self.notifications_enabled {
+                        if let Some(tray) = &self.tray {
+                            tray.show_balloon("AGY Gauge", &msg, false, false);
+                        }
+                    }
+                    // Auto-hide dashboard on launch; also emit quiet balloon if enabled so user sees fallback notice.
+                    if from_dashboard && self.notifications_enabled {
+                        if let Some(tray) = &self.tray {
+                            tray.show_balloon(
+                                "AGY Gauge",
+                                "原工作区目录不存在，已在用户主目录恢复会话",
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    from_dashboard
+                } else {
+                    if from_dashboard {
+                        self.notify_banner(
+                            format!("已通过 {} 打开会话", outcome.backend.label()),
+                            false,
+                        );
+                    }
+                    from_dashboard
+                }
+            }
+            Err(err) => {
+                if launcher::resolve_cli_exe_for_source(s.source).is_none() {
+                    if let Ok(cmd) = launcher::format_resume_command_for_session(&s) {
+                        if copy_text_to_clipboard(hwnd, &cmd) {
+                            let cli_name =
+                                launcher::cli_binary_name_for_source(s.source).unwrap_or("CLI");
+                            let msg = format!("未找到 {cli_name} 命令，已自动复制恢复命令到剪贴板");
+                            if from_dashboard {
+                                self.notify_banner(msg, true);
+                            } else if self.notifications_enabled {
+                                if let Some(tray) = &self.tray {
+                                    tray.show_balloon("AGY Gauge", &msg, false, true);
+                                }
+                            }
+                            return false;
+                        }
+                    }
+                }
+                if from_dashboard {
+                    self.notify_banner(err, true);
+                } else if self.notifications_enabled {
+                    if let Some(tray) = &self.tray {
+                        tray.show_balloon("AGY Gauge", &err, false, true);
+                    }
+                }
+                false
+            }
         }
     }
 
@@ -1636,7 +2182,7 @@ impl AppState {
             self.pricing_edits.ensure_created(dh, dpi, self.light_theme);
         }
         self.pricing_edits.editor_mode = 2;
-        self.pricing_edits.set_values(&fields);
+        self.pricing_edits.set_budget_values(&fields);
     }
 
     fn save_budget_from_editor(&mut self) {
@@ -1666,43 +2212,35 @@ impl AppState {
             }
         };
 
-        let Ok(block_5h_usd) = parse_usd(&vals[0]) else {
+        let Ok(daily_usd) = parse_usd(&vals[0]) else {
             if let Some(view) = &mut self.dash_view {
-                view.set_pricing_status("「5h 预算 ($)」格式无效，请输入非负数字或留空", true);
+                view.set_pricing_status("「每日预算 ($)」格式无效，请输入非负数字或留空", true);
             }
             self.pricing_edits.focus_field(0);
             self.invalidate_dashboard();
             return;
         };
-        let Ok(daily_usd) = parse_usd(&vals[1]) else {
+        let Ok(weekly_usd) = parse_usd(&vals[1]) else {
             if let Some(view) = &mut self.dash_view {
-                view.set_pricing_status("「每日预算 ($)」格式无效，请输入非负数字或留空", true);
+                view.set_pricing_status("「每周预算 ($)」格式无效，请输入非负数字或留空", true);
             }
             self.pricing_edits.focus_field(1);
             self.invalidate_dashboard();
             return;
         };
-        let Ok(weekly_usd) = parse_usd(&vals[2]) else {
+        let Ok(warn_pct) = parse_pct(&vals[2], 80.0) else {
             if let Some(view) = &mut self.dash_view {
-                view.set_pricing_status("「每周预算 ($)」格式无效，请输入非负数字或留空", true);
+                view.set_pricing_status("「预警比例 (%)」需在 1 到 500 之间", true);
             }
             self.pricing_edits.focus_field(2);
             self.invalidate_dashboard();
             return;
         };
-        let Ok(warn_pct) = parse_pct(&vals[3], 80.0) else {
-            if let Some(view) = &mut self.dash_view {
-                view.set_pricing_status("「预警比例 (%)」需在 1 到 500 之间", true);
-            }
-            self.pricing_edits.focus_field(3);
-            self.invalidate_dashboard();
-            return;
-        };
-        let Ok(critical_pct) = parse_pct(&vals[4], 100.0) else {
+        let Ok(critical_pct) = parse_pct(&vals[3], 100.0) else {
             if let Some(view) = &mut self.dash_view {
                 view.set_pricing_status("「临界比例 (%)」需在 1 到 500 之间", true);
             }
-            self.pricing_edits.focus_field(4);
+            self.pricing_edits.focus_field(3);
             self.invalidate_dashboard();
             return;
         };
@@ -1710,13 +2248,12 @@ impl AppState {
             if let Some(view) = &mut self.dash_view {
                 view.set_pricing_status("临界比例不能低于预警比例", true);
             }
-            self.pricing_edits.focus_field(4);
+            self.pricing_edits.focus_field(3);
             self.invalidate_dashboard();
             return;
         }
 
         let cfg = quota::BudgetConfig {
-            block_5h_usd,
             daily_usd,
             weekly_usd,
             warn_pct,
@@ -1843,7 +2380,8 @@ impl AppState {
                 self.pricing_edits.editor_mode = 1;
                 self.pricing_edits.initialized_values = false;
             }
-            self.pricing_edits.sync_layout(hwnd, dpi, self.light_theme, p_rects);
+            self.pricing_edits
+                .sync_layout(hwnd, dpi, self.light_theme, p_rects.as_ref().map(|r| r.as_slice()));
             if !self.pricing_edits.initialized_values && !self.snapshot.pricing_rows.is_empty() {
                 self.load_pricing_row_into_editor(0, false);
             }
@@ -1852,7 +2390,8 @@ impl AppState {
                 self.pricing_edits.editor_mode = 2;
                 self.pricing_edits.initialized_values = false;
             }
-            self.pricing_edits.sync_layout(hwnd, dpi, self.light_theme, b_rects);
+            self.pricing_edits
+                .sync_layout(hwnd, dpi, self.light_theme, b_rects.as_ref().map(|r| r.as_slice()));
             if !self.pricing_edits.initialized_values {
                 self.load_budget_into_editor();
             }
@@ -1931,7 +2470,7 @@ fn show_export_menu_safe(hwnd: HWND) {
             with_app(|app| {
                 if let Some(view) = &mut app.dash_view {
                     view.set_banner_status(
-                        "已复制 /statusline 配置片段（粘贴至 settings.json 即可接入官方配额）",
+                        "已复制 /statusline 配置（粘入 ~/.gemini/antigravity-cli/settings.json 接入 agy 官方配额）",
                         false,
                     );
                 }
@@ -1979,7 +2518,7 @@ fn show_export_menu_safe(hwnd: HWND) {
         match cmd {
             CMD_EXPORT_JSON => Some(view.export_snapshot_json(&app.snapshot)),
             CMD_EXPORT_SESSIONS_CSV => Some(view.export_sessions_csv()),
-            CMD_EXPORT_DAILY_CSV => Some(view.export_daily_csv()),
+            CMD_EXPORT_DAILY_CSV => Some(view.export_daily_csv(&app.snapshot)),
             CMD_EXPORT_CALLS_CSV => Some(view.export_calls_csv()),
             _ => None,
         }
@@ -2011,9 +2550,236 @@ fn show_export_menu_safe(hwnd: HWND) {
     });
 }
 
+fn show_session_context_menu_safe(hwnd: HWND, cid: String, anchor: Option<POINT>) {
+    let info = with_app(|app| {
+        let s = app.lookup_session(&cid)?;
+        let cap = launcher::classify_resume_capability(&s, &app.snapshot.sessions);
+        let has_ws = launcher::normalize_workspace_path_str(&s.workspace).is_some();
+        let is_pinned = app
+            .snapshot
+            .session_meta
+            .get(&cid)
+            .is_some_and(|m| m.pinned);
+        let sub_cnt = app
+            .dash_view
+            .as_ref()
+            .map(|v| v.count_subagents_of(&cid).0)
+            .unwrap_or(0);
+        let title = s.title.clone();
+        let source = s.source;
+        let show_multi = app.snapshot.has_non_antigravity();
+        let resumable_parent_id = launcher::find_resumable_parent(&s, &app.snapshot.sessions)
+            .map(|p| p.conversation_id.clone());
+        let parent_id = resumable_parent_id.clone().or_else(|| match &cap {
+            launcher::ResumeCapability::Subagent { parent_id, .. } => parent_id.clone(),
+            _ => None,
+        });
+        Some((
+            cap,
+            has_ws,
+            is_pinned,
+            sub_cnt,
+            title,
+            source,
+            show_multi,
+            resumable_parent_id,
+            parent_id,
+        ))
+    })
+    .flatten();
+
+    let Some((
+        cap,
+        has_ws,
+        is_pinned,
+        sub_cnt,
+        title,
+        source,
+        show_multi,
+        resumable_parent_id,
+        parent_id,
+    )) = info
+    else {
+        return;
+    };
+
+    let pt = anchor.unwrap_or_else(|| {
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        p
+    });
+
+    // Run TrackPopupMenu completely OUTSIDE `with_app` to avoid re-entrant `APP` RefCell panics.
+    let chosen = unsafe {
+        let Ok(hmenu) = CreatePopupMenu() else {
+            return;
+        };
+        let add_item = |id: u32, label: &str, enabled: bool| {
+            let w = to_wide_null(label);
+            let flags = MF_STRING | if enabled { Default::default() } else { MF_GRAYED };
+            let _ = AppendMenuW(hmenu, flags, id as usize, wide_pcwstr(&w));
+        };
+
+        let blocked_msg = cap
+            .disabled_reason_cn()
+            .or_else(|| cap.blocked_reason().map(launcher::BlockedReason::message_cn))
+            .unwrap_or("不支持终端恢复");
+        let cli_bin = launcher::cli_binary_name_for_source(source);
+
+        match &cap {
+            launcher::ResumeCapability::CliDirect => {
+                let lbl = match (show_multi, cli_bin) {
+                    (true, Some(bin)) => format!("在终端继续会话 ({bin})\tEnter"),
+                    _ => "在终端继续会话\tEnter".to_string(),
+                };
+                add_item(CMD_SESS_RESUME, &lbl, true);
+            }
+            launcher::ResumeCapability::Subagent { .. } if resumable_parent_id.is_some() => {
+                let lbl = match (show_multi, cli_bin) {
+                    (true, Some(bin)) => format!("在终端继续所属父会话 ({bin})"),
+                    _ => "在终端继续所属父会话".to_string(),
+                };
+                add_item(CMD_SESS_RESUME_PARENT, &lbl, true);
+                add_item(CMD_SESS_INSPECT_PARENT, "定位所属父会话", true);
+            }
+            launcher::ResumeCapability::Subagent {
+                parent_id: Some(_), ..
+            } => {
+                add_item(CMD_SESS_INSPECT_PARENT, "定位所属父会话", true);
+                add_item(0, blocked_msg, false);
+            }
+            _ => {
+                add_item(0, blocked_msg, false);
+            }
+        }
+        let copy_cmd_lbl = match (show_multi, cli_bin) {
+            (true, Some(bin)) if cap.is_direct_resumable() => {
+                format!("复制 {bin} 恢复命令\tCtrl+Shift+C")
+            }
+            _ => "复制恢复命令\tCtrl+Shift+C".to_string(),
+        };
+        add_item(CMD_SESS_COPY_CMD, &copy_cmd_lbl, cap.is_direct_resumable());
+        add_item(CMD_SESS_OPEN_WS, "打开工作区目录\tO", has_ws);
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+        add_item(
+            CMD_SESS_TOGGLE_PIN,
+            if is_pinned { "取消置顶\tS" } else { "置顶会话\tS" },
+            true,
+        );
+        if sub_cnt > 0 {
+            add_item(CMD_SESS_SHOW_SUBS, &format!("查看 {} 个子会话", sub_cnt), true);
+        }
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+        add_item(CMD_SESS_SHOW_CALLS, "查看调用记录", true);
+        add_item(CMD_SESS_COPY_DETAIL, "复制会话明细", true);
+        add_item(CMD_SESS_COPY_ID, "复制完整会话 ID", true);
+
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            None,
+        )
+        .0 as u32;
+        let _ = DestroyMenu(hmenu);
+        if cmd == 0 { None } else { Some(cmd) }
+    };
+
+    let Some(cmd) = chosen else {
+        return;
+    };
+
+    let mut auto_hide = false;
+    with_app(|app| match cmd {
+        CMD_SESS_RESUME => {
+            auto_hide = app.handle_resume_session(hwnd, &cid, true);
+        }
+        CMD_SESS_RESUME_PARENT => {
+            if let Some(pid) = resumable_parent_id.as_deref() {
+                auto_hide = app.handle_resume_session(hwnd, pid, true);
+            }
+        }
+        CMD_SESS_INSPECT_PARENT => {
+            if let Some(pid) = parent_id {
+                if let Some(view) = &mut app.dash_view {
+                    let _ = view.apply_action(
+                        hwnd,
+                        ClickAction::InspectSession(pid),
+                        &mut app.human,
+                        &mut app.light_theme,
+                    );
+                }
+                app.invalidate_dashboard();
+            }
+        }
+        CMD_SESS_COPY_CMD => {
+            app.handle_copy_resume_cmd(hwnd, &cid);
+        }
+        CMD_SESS_OPEN_WS => {
+            app.handle_open_workspace(hwnd, &cid);
+        }
+        CMD_SESS_TOGGLE_PIN => {
+            app.handle_toggle_pin(hwnd, &cid);
+        }
+        CMD_SESS_SHOW_SUBS => {
+            if let Some(view) = &mut app.dash_view {
+                let _ = view.apply_action(
+                    hwnd,
+                    ClickAction::FilterSessions(dashboard::SessionFilter::Parent(cid.clone(), title)),
+                    &mut app.human,
+                    &mut app.light_theme,
+                );
+            }
+            app.invalidate_dashboard();
+        }
+        CMD_SESS_SHOW_CALLS => {
+            if let Some(view) = &mut app.dash_view {
+                let _ = view.apply_action(
+                    hwnd,
+                    ClickAction::ShowSessionCalls(cid.clone()),
+                    &mut app.human,
+                    &mut app.light_theme,
+                );
+            }
+            app.invalidate_dashboard();
+        }
+        CMD_SESS_COPY_DETAIL => {
+            if let Some(view) = &mut app.dash_view {
+                view.selected_session = Some(cid.clone());
+                let _ = view.apply_action(
+                    hwnd,
+                    ClickAction::CopySessionDetail,
+                    &mut app.human,
+                    &mut app.light_theme,
+                );
+                view.set_banner_status("已复制会话明细到剪贴板", false);
+            }
+            app.invalidate_dashboard();
+        }
+        CMD_SESS_COPY_ID => {
+            app.handle_copy_full_session_id(hwnd, &cid);
+        }
+        _ => {}
+    });
+    if auto_hide {
+        hide_dashboard_safe();
+    }
+}
+
 fn handle_pill_or_tray_context_menu(hwnd: HWND) {
     let state = with_app(|app| {
         app.pill_menu_open = true;
+        let quick_sessions = if app.privacy_mode {
+            Vec::new()
+        } else {
+            build_quick_session_menu_items(&app.snapshot)
+        };
         (
             app.light_theme,
             app.topmost,
@@ -2026,6 +2792,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             app.monitor_index,
             app.dash_visible,
             app.pill_items,
+            quick_sessions,
         )
     });
     if let Some((
@@ -2040,6 +2807,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
         mon,
         local_vis,
         items,
+        quick_sessions,
     )) = state
     {
         let autostart = is_autostart_enabled();
@@ -2063,12 +2831,22 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             autostart,
             mon,
             items,
+            &quick_sessions,
         );
         with_app(|app| app.pill_menu_open = false);
         let mut handled_topmost = false;
         if let Some(cmd) = chosen {
             match cmd {
                 CMD_OPEN_DETAIL => toggle_dashboard_safe(),
+                CMD_OPEN_SESSIONS_TAB => open_dashboard_to_sessions_tab_safe(),
+                c if (CMD_QUICK_RESUME_BASE..CMD_QUICK_RESUME_BASE + 5).contains(&c) => {
+                    let idx = (c - CMD_QUICK_RESUME_BASE) as usize;
+                    if let Some(item) = quick_sessions.get(idx) {
+                        with_app(|app| {
+                            let _ = app.handle_resume_session(hwnd, &item.conversation_id, false);
+                        });
+                    }
+                }
                 CMD_TOGGLE_TRAY_HOVER => {
                     let restored_top = with_app(|app| {
                         app.tray_hover_mode = !app.tray_hover_mode;
@@ -2508,6 +3286,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             set_pill_topmost_safe(top, false);
             LRESULT(0)
         }
+        WM_APP_SYNC_META => {
+            with_app(|app| {
+                app.scanner.reload_session_meta();
+                app.refresh_tokens(true);
+            });
+            LRESULT(0)
+        }
         WM_TIMER => {
             match wparam.0 {
                 TIMER_TELEMETRY => {
@@ -2537,7 +3322,11 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            let sys_dpi = GetDpiForSystem().max(96);
             let keep_top = with_app(|app| {
+                if app.icons.reload_tray_for_dpi(sys_dpi) {
+                    app.sync_tray_and_alerts();
+                }
                 app.pill_renderer.invalidate_position();
                 app.redraw_pill();
                 app.topmost
@@ -2616,13 +3405,44 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
             LRESULT(0)
         }
-        WM_SIZE | WM_DPICHANGED => {
+        WM_SIZE => {
             with_app(|app| {
                 if let Some(view) = &mut app.dash_view {
                     view.invalidate_surface();
                 }
             });
             let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let wp_dpi = (wparam.0 & 0xFFFF) as u32;
+            let new_dpi = if wp_dpi >= 96 {
+                wp_dpi
+            } else {
+                (window_dpi_scale(hwnd) * 96.0).round() as u32
+            };
+            with_app(|app| {
+                app.icons.apply_dashboard_icons_for_dpi(hwnd, new_dpi);
+                if let Some(view) = &mut app.dash_view {
+                    view.invalidate_surface();
+                }
+            });
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let x_px = (lparam.0 & 0xFFFF) as i16 as f32;
+            let y_px = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+            let scale = window_dpi_scale(hwnd);
+            let hit_cid = with_app(|app| {
+                app.dash_view
+                    .as_ref()
+                    .and_then(|v| v.hit_test_session_row(x_px / scale, y_px / scale))
+            })
+            .flatten();
+            if let Some(cid) = hit_cid {
+                show_session_context_menu_safe(hwnd, cid, None);
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2695,6 +3515,26 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     show_export_menu_safe(hwnd);
                     return LRESULT(0);
                 }
+                if let ClickAction::SessionMoreMenu(cid) = act {
+                    let anchor = with_app(|app| {
+                        app.dash_view
+                            .as_ref()
+                            .and_then(|v| v.detail_more_btn_rect)
+                            .map(|r| {
+                                let sc = window_dpi_scale(hwnd);
+                                let mut p = POINT {
+                                    x: (r.left * sc).round() as i32,
+                                    y: ((r.bottom + 4.0) * sc).round() as i32,
+                                };
+                                let _ = ClientToScreen(hwnd, &mut p);
+                                p
+                            })
+                    })
+                    .flatten();
+                    show_session_context_menu_safe(hwnd, cid, anchor);
+                    return LRESULT(0);
+                }
+                let mut auto_hide = false;
                 with_app(|app| {
                     match act {
                         ClickAction::PickPricingRow(idx) => {
@@ -2734,6 +3574,22 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                                 view.scroll_rows = 0;
                             }
                             app.invalidate_dashboard();
+                            return;
+                        }
+                        ClickAction::TogglePinSession(cid) => {
+                            app.handle_toggle_pin(hwnd, &cid);
+                            return;
+                        }
+                        ClickAction::ResumeSession(cid) => {
+                            auto_hide = app.handle_resume_session(hwnd, &cid, true);
+                            return;
+                        }
+                        ClickAction::CopyResumeCmd(cid) => {
+                            app.handle_copy_resume_cmd(hwnd, &cid);
+                            return;
+                        }
+                        ClickAction::OpenWorkspace(cid) => {
+                            app.handle_open_workspace(hwnd, &cid);
                             return;
                         }
                         _ => {}
@@ -2780,6 +3636,9 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     app.redraw_pill();
                     app.invalidate_dashboard();
                 });
+                if auto_hide {
+                    hide_dashboard_safe();
+                }
             }
             LRESULT(0)
         }
@@ -2848,6 +3707,13 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
+        WM_APP_SYNC_META => {
+            with_app(|app| {
+                app.scanner.reload_session_meta();
+                app.refresh_tokens(true);
+            });
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             with_app(|app| {
@@ -2861,11 +3727,13 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_KEYDOWN => {
             let vk = wparam.0 as u16;
             let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+            let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+            let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
             if vk == VK_ESCAPE.0 {
                 hide_dashboard_safe();
                 return LRESULT(0);
             }
-            if vk == 0xBF && !ctrl {
+            if vk == 0xBF && !ctrl && !alt {
                 // '/' -> focus inline search (stays on Calls tab, otherwise jumps to Sessions)
                 with_app(|app| {
                     if let Some(view) = &mut app.dash_view {
@@ -2884,22 +3752,58 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 });
                 return LRESULT(0);
             }
+
+            // Sessions tab management shortcuts:
+            //   Enter          -> Resume selected session in terminal (auto-hide on success)
+            //   Ctrl+Shift+C   -> Copy resume command
+            //   O (!ctrl !alt) -> Open workspace folder
+            //   S (!ctrl !alt) -> Toggle pin
+            let sess_ctx = with_app(|app| {
+                app.dash_view
+                    .as_ref()
+                    .filter(|v| v.active_tab == Tab::Sessions)
+                    .and_then(|v| v.selected_session.clone())
+            })
+            .flatten();
+            if let Some(cid) = sess_ctx {
+                if vk == VK_RETURN.0 && !ctrl && !alt {
+                    let auto_hide = with_app(|app| app.handle_resume_session(hwnd, &cid, true))
+                        .unwrap_or(false);
+                    if auto_hide {
+                        hide_dashboard_safe();
+                    }
+                    return LRESULT(0);
+                }
+                if vk == 0x43 && ctrl && shift && !alt {
+                    with_app(|app| app.handle_copy_resume_cmd(hwnd, &cid));
+                    return LRESULT(0);
+                }
+                if vk == 0x4F && !ctrl && !alt && !shift {
+                    with_app(|app| app.handle_open_workspace(hwnd, &cid));
+                    return LRESULT(0);
+                }
+                if vk == 0x53 && !ctrl && !alt && !shift {
+                    with_app(|app| app.handle_toggle_pin(hwnd, &cid));
+                    return LRESULT(0);
+                }
+            }
+
             let action = match vk {
-                0x31 => Some(ClickAction::SelectTab(Tab::Overview)),  // '1'
-                0x32 => Some(ClickAction::SelectTab(Tab::Daily)),     // '2'
-                0x33 => Some(ClickAction::SelectTab(Tab::Weekly)),    // '3'
-                0x34 => Some(ClickAction::SelectTab(Tab::Models)),    // '4'
-                0x35 => Some(ClickAction::SelectTab(Tab::Sessions)),  // '5'
-                0x36 => Some(ClickAction::ToggleSystemView),          // '6'
-                0x4C if !ctrl => Some(ClickAction::SelectTab(Tab::Calls)), // 'L' (call log)
-                0x42 if !ctrl => Some(ClickAction::OpenBudgetView),    // 'B'
-                0x44 if !ctrl => Some(ClickAction::ToggleCostMode),    // 'D'
-                0x50 if !ctrl => Some(ClickAction::TogglePrivacyMode), // 'P'
-                0x54 if !ctrl => Some(ClickAction::ToggleFreshOnly),   // 'T'
-                0x52 => Some(ClickAction::Refresh),                   // 'R'
+                0x31 if !ctrl && !alt => Some(ClickAction::SelectTab(Tab::Overview)), // '1'
+                0x32 if !ctrl && !alt => Some(ClickAction::SelectTab(Tab::Daily)),    // '2'
+                0x33 if !ctrl && !alt => Some(ClickAction::SelectTab(Tab::Weekly)),   // '3'
+                0x34 if !ctrl && !alt => Some(ClickAction::SelectTab(Tab::Models)),   // '4'
+                0x35 if !ctrl && !alt => Some(ClickAction::SelectTab(Tab::Sessions)), // '5'
+                0x36 if !ctrl && !alt => Some(ClickAction::ToggleSystemView),         // '6'
+                0x4C if !ctrl && !alt => Some(ClickAction::SelectTab(Tab::Calls)),    // 'L' (call log)
+                0x42 if !ctrl && !alt => Some(ClickAction::OpenBudgetView),           // 'B'
+                0x44 if !ctrl && !alt => Some(ClickAction::ToggleCostMode),           // 'D'
+                0x50 if !ctrl && !alt => Some(ClickAction::TogglePrivacyMode),        // 'P'
+                0x54 if !ctrl && !alt => Some(ClickAction::ToggleFreshOnly),          // 'T'
+                0x52 if !alt => Some(ClickAction::Refresh),                           // 'R'
                 x if x == VK_F5.0 => Some(ClickAction::Refresh),
                 x if x == VK_BACK.0 => Some(ClickAction::ClearSessionFilter),
-                0x43 if ctrl => Some(ClickAction::CopySummary),       // Ctrl+C
+                0x43 if ctrl && !shift && !alt => Some(ClickAction::CopySummary),     // Ctrl+C
                 _ => None,
             };
             if let Some(act) = action {
@@ -3037,6 +3941,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 app.dash_hwnd = None;
                 app.dash_view = None;
                 app.pricing_edits.reset_handles();
+                app.icons.clear_dashboard_icons();
                 app.dashboard_only
             })
             .unwrap_or(false);
@@ -3051,6 +3956,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
 
 struct CliOpts {
     data_dirs: Vec<(stats::SourceKind, PathBuf)>,
+    discovery_filter: stats::SourceDiscoveryFilter,
     pricing_path: Option<PathBuf>,
     no_archive: bool,
     mini: Option<bool>,
@@ -3066,9 +3972,14 @@ struct CliOpts {
     self_test: bool,
 }
 
-fn parse_args() -> CliOpts {
+fn parse_args_from<I, S>(iter: I, discover_if_empty: bool) -> CliOpts
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut opts = CliOpts {
         data_dirs: Vec::new(),
+        discovery_filter: stats::SourceDiscoveryFilter::All,
         pricing_path: None,
         no_archive: false,
         mini: None,
@@ -3083,8 +3994,17 @@ fn parse_args() -> CliOpts {
         allow_multiple: false,
         self_test: false,
     };
-    let mut args = std::env::args().skip(1);
+    let mut agy_only = false;
+    let mut agent_specs: Vec<String> = Vec::new();
+    let mut args = iter.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
+        if let Some(csv) = arg
+            .strip_prefix("--agents=")
+            .or_else(|| arg.strip_prefix("--agent="))
+        {
+            agent_specs.push(csv.to_string());
+            continue;
+        }
         match arg.as_str() {
             "--mini" => opts.mini = Some(true),
             "--tray-hover" => opts.tray_hover = Some(true),
@@ -3096,6 +4016,12 @@ fn parse_args() -> CliOpts {
             "--redact" | "--privacy" => opts.privacy_mode = Some(true),
             "--no-redact" => opts.privacy_mode = Some(false),
             "--no-archive" => opts.no_archive = true,
+            "--agy-only" => agy_only = true,
+            "--agents" | "--agent" => {
+                if let Some(v) = args.next() {
+                    agent_specs.push(v);
+                }
+            }
             "--open-detail" => opts.open_detail = true,
             "--dashboard-only" => opts.dashboard_only = true,
             "--exact" => opts.human = Some(false),
@@ -3121,10 +4047,22 @@ fn parse_args() -> CliOpts {
             _ => {}
         }
     }
-    if opts.data_dirs.is_empty() {
-        opts.data_dirs = IncrementalScanner::default_data_dirs();
+    opts.discovery_filter = if agy_only {
+        stats::SourceDiscoveryFilter::AgyOnly
+    } else if !agent_specs.is_empty() {
+        stats::SourceDiscoveryFilter::parse_csv(&agent_specs.join(","))
+            .unwrap_or(stats::SourceDiscoveryFilter::All)
+    } else {
+        stats::SourceDiscoveryFilter::All
+    };
+    if discover_if_empty && opts.data_dirs.is_empty() {
+        opts.data_dirs = IncrementalScanner::discover_data_dirs(&opts.discovery_filter);
     }
     opts
+}
+
+fn parse_args() -> CliOpts {
+    parse_args_from(std::env::args().skip(1), true)
 }
 
 fn run_app(opts: CliOpts) -> Result<()> {
@@ -3187,20 +4125,26 @@ fn run_app(opts: CliOpts) -> Result<()> {
         quota::BudgetStore::default_path(),
         archive::UsageArchive::default_path(),
         !opts.no_archive && !opts.self_test,
-    );
+    )
+    .with_session_meta(if opts.self_test {
+        None
+    } else {
+        session_meta::SessionMetaStore::default_path()
+    });
     let snapshot = scanner.scan();
     let telemetry = SystemTelemetry::new(90);
 
     unsafe {
         let hinst = GetModuleHandleW(None)?;
         let arrow = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        let icon_res = PCWSTR(1 as *const u16);
-        let icon_big = LoadImageW(hinst, icon_res, IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR)
-            .map(|h| HICON(h.0))
-            .unwrap_or_default();
-        let icon_sm = LoadImageW(hinst, icon_res, IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR)
-            .map(|h| HICON(h.0))
-            .unwrap_or(icon_big);
+        let sys_dpi = GetDpiForSystem().max(96);
+        let ((big_w, big_h), (sm_w, sm_h)) = system_icon_metrics_for_dpi(sys_dpi);
+        let icon_big = load_res_icon(RES_ICON_NORMAL, big_w, big_h);
+        let icon_sm = {
+            let sm = load_res_icon(RES_ICON_NORMAL, sm_w, sm_h);
+            if !sm.0.is_null() { sm } else { icon_big }
+        };
+        let icons = AppIcons::new(icon_sm, sys_dpi);
 
         let pill_cls = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -3272,7 +4216,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
         let taskbar_created_msg = register_taskbar_created_msg();
         let tray = if !opts.dashboard_only && !opts.self_test && !pill_hwnd.0.is_null() {
             let init_tip = if prefs.tray_hover_mode { "" } else { "AGY Gauge · 初始化中" };
-            Some(TrayIcon::new(pill_hwnd, icon_sm, init_tip))
+            Some(TrayIcon::new(pill_hwnd, icons.tray_normal, init_tip))
         } else {
             None
         };
@@ -3281,6 +4225,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
         let state = AppState {
             factories,
             fonts,
+            icons,
             scanner,
             snapshot,
             telemetry,
@@ -3401,6 +4346,18 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 );
                                 view.overview_top = OverviewTopMode::QuotaPace;
                                 view.breakdown_mode = BreakdownMode::Tools;
+                                let _ = view.render_to_hdc(
+                                    &app.factories,
+                                    &app.fonts,
+                                    hwnd,
+                                    None,
+                                    dpi,
+                                    &app.snapshot,
+                                    &app.telemetry,
+                                    app.human,
+                                    app.light_theme,
+                                );
+                                view.breakdown_mode = BreakdownMode::Source;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
                                     &app.fonts,
@@ -3548,7 +4505,12 @@ fn run_app(opts: CliOpts) -> Result<()> {
                     match t {
                         EditTarget::Five(idx, mode) => {
                             if vk == VK_TAB.0 {
-                                let next = if shift { (idx + 4) % 5 } else { (idx + 1) % 5 };
+                                let count = if mode == 2 { 4 } else { 5 };
+                                let next = if shift {
+                                    (idx + count - 1) % count
+                                } else {
+                                    (idx + 1) % count
+                                };
                                 with_app(|app| app.pricing_edits.focus_field(next));
                                 continue;
                             }
@@ -3643,4 +4605,125 @@ fn run_app(opts: CliOpts) -> Result<()> {
 fn main() {
     let opts = parse_args();
     let _ = run_app(opts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn mk_snap(sessions: Vec<stats::SessionInfo>, data_dirs: Vec<(stats::SourceKind, PathBuf)>) -> ScanSnapshot {
+        let agg = stats::aggregate_sessions(&sessions);
+        ScanSnapshot {
+            data_dir: PathBuf::from("."),
+            data_dirs,
+            sessions,
+            agg,
+            statusline: None,
+            statusline_changed: false,
+            budget: quota::BudgetConfig::default(),
+            budget_changed: false,
+            budget_path: None,
+            session_meta: HashMap::new(),
+            session_meta_changed: false,
+            session_meta_path: None,
+            archived_sessions_count: 0,
+            archive_enabled: false,
+            archive_path: None,
+            model_rate_labels: HashMap::new(),
+            pricing_rows: Vec::new(),
+            pricing_path: None,
+            custom_pricing_count: 0,
+            pricing_changed: false,
+            skipped_empty: 0,
+            skipped_lines: 0,
+            files_cached: 0,
+            files_reparsed: 0,
+            scan_ms: 0.0,
+            warning: None,
+        }
+    }
+
+    fn mk_sess(cid: &str, title: &str, source: stats::SourceKind, is_subagent: bool) -> stats::SessionInfo {
+        let now = Some(Local::now());
+        stats::SessionInfo {
+            conversation_id: cid.to_string(),
+            title: title.to_string(),
+            workspace: String::new(),
+            source,
+            is_archived: false,
+            is_subagent,
+            parent_id: None,
+            parent_title: String::new(),
+            turns: Vec::new(),
+            counts: stats::TokenCounts::default(),
+            models: BTreeSet::new(),
+            first_time: now,
+            last_time: now,
+            last_file_mtime_utc: None,
+            is_running_hint: false,
+        }
+    }
+
+    #[test]
+    fn test_cli_discovery_filter_flags() {
+        let def = parse_args_from(Vec::<String>::new(), false);
+        assert_eq!(def.discovery_filter, stats::SourceDiscoveryFilter::All);
+
+        let agy = parse_args_from(["--agy-only"], false);
+        assert_eq!(agy.discovery_filter, stats::SourceDiscoveryFilter::AgyOnly);
+
+        let csv = parse_args_from(["--agents", "claude,codex"], false);
+        assert_eq!(
+            csv.discovery_filter,
+            stats::SourceDiscoveryFilter::Families(vec![
+                stats::AgentFamily::ClaudeCode,
+                stats::AgentFamily::Codex,
+            ])
+        );
+
+        let eq_and_alias = parse_args_from(["--agent=gemini", "--agents", "agy"], false);
+        assert_eq!(
+            eq_and_alias.discovery_filter,
+            stats::SourceDiscoveryFilter::Families(vec![
+                stats::AgentFamily::GeminiCli,
+                stats::AgentFamily::Antigravity,
+            ])
+        );
+
+        // --agy-only takes precedence over --agents (parity with Python CLI)
+        let agy_wins = parse_args_from(["--agents", "claude,codex", "--agy-only"], false);
+        assert_eq!(agy_wins.discovery_filter, stats::SourceDiscoveryFilter::AgyOnly);
+
+        // --data-dir stays backward compatible
+        let dd = parse_args_from(["--data-dir", r"C:\Users\alice\.claude"], false);
+        assert_eq!(dd.data_dirs.len(), 1);
+        assert_eq!(dd.data_dirs[0].0, stats::SourceKind::ClaudeCode);
+    }
+
+    #[test]
+    fn test_quick_session_menu_prefixes_single_vs_multi_agent() {
+        let s_agy = mk_sess("11111111-1111-1111-1111-111111111111", "AGY task", stats::SourceKind::Cli, false);
+        let s_app = mk_sess("22222222-2222-2222-2222-222222222222", "App task", stats::SourceKind::App, false);
+        let snap_agy = mk_snap(vec![s_agy.clone(), s_app.clone()], Vec::new());
+        let items_agy = build_quick_session_menu_items(&snap_agy);
+        assert_eq!(items_agy.len(), 1);
+        assert!(!items_agy[0].label.contains("[AGY]"));
+        assert!(items_agy[0].label.starts_with("AGY task"));
+
+        let s_claude = mk_sess("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Claude task", stats::SourceKind::ClaudeCode, false);
+        let s_codex = mk_sess("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Codex task", stats::SourceKind::Codex, false);
+        let s_gemini = mk_sess("cccccccc-cccc-cccc-cccc-cccccccccccc", "Gemini task", stats::SourceKind::GeminiCli, false);
+        let s_sub = mk_sess("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa__sub1", "Sub task", stats::SourceKind::ClaudeCode, true);
+        let snap_multi = mk_snap(
+            vec![s_agy, s_app, s_claude, s_codex, s_gemini, s_sub],
+            Vec::new(),
+        );
+        let items_multi = build_quick_session_menu_items(&snap_multi);
+        assert_eq!(items_multi.len(), 4);
+        assert!(items_multi.iter().any(|i| i.label.starts_with("[AGY] AGY task")));
+        assert!(items_multi.iter().any(|i| i.label.starts_with("[Claude] Claude task")));
+        assert!(items_multi.iter().any(|i| i.label.starts_with("[Codex] Codex task")));
+        assert!(items_multi.iter().any(|i| i.label.starts_with("[Gemini] Gemini task")));
+    }
 }

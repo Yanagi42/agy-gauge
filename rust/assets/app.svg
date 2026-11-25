@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Anodized Obsidian Circular Bezel -->
+    <linearGradient id="bezelC" x1="0.15" y1="0.05" x2="0.85" y2="0.95">
+      <stop offset="0%" stop-color="#34353D"/>
+      <stop offset="45%" stop-color="#1B1B20"/>
+      <stop offset="100%" stop-color="#0E0E11"/>
+    </linearGradient>
+    <!-- Warm Alabaster Paper Dial Face (matches THEME_PAPER #F5F4F0) -->
+    <linearGradient id="paperC" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FAF9F5"/>
+      <stop offset="65%" stop-color="#F2EFE8"/>
+      <stop offset="100%" stop-color="#E6E2D8"/>
+    </linearGradient>
+    <radialGradient id="paperShadowC" cx="50%" cy="50%" r="50%">
+      <stop offset="82%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="96%" stop-color="#1A1A1C" stop-opacity="0.09"/>
+      <stop offset="100%" stop-color="#1A1A1C" stop-opacity="0.18"/>
+    </radialGradient>
+    <linearGradient id="arcC" x1="0.12" y1="0.88" x2="0.88" y2="0.20">
+      <stop offset="0%" stop-color="#C4561E"/>
+      <stop offset="55%" stop-color="#D96B2C"/>
+      <stop offset="100%" stop-color="#EB8A49"/>
+    </linearGradient>
+    <filter id="handShadowC" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="2.5" stdDeviation="2.5" flood-color="#1A1A1C" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <!-- Pure Circular Obsidian Machined Bezel -->
+  <circle cx="128" cy="128" r="113" fill="url(#bezelC)" stroke="#0A0A0D" stroke-width="2"/>
+  <circle cx="128" cy="128" r="110.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.15" stroke-width="1.5"/>
+
+  <!-- Warm Paper Dial Face -->
+  <circle cx="128" cy="128" r="93" fill="url(#paperC)"/>
+  <circle cx="128" cy="128" r="93" fill="url(#paperShadowC)"/>
+
+  <!-- Minimal Dieter Rams Cardinal Indices -->
+  <g stroke="#8E8B82" stroke-width="2.6" stroke-linecap="round">
+    <line x1="128" y1="43" x2="128" y2="50" stroke="#1A1A1C" stroke-width="3.2"/>
+    <line x1="43" y1="128" x2="50" y2="128"/>
+    <line x1="206" y1="128" x2="213" y2="128"/>
+  </g>
+
+  <!-- 270° Calm Stone Gauge Track -->
+  <path d="M 82.75 176.25 A 64 64 0 1 1 173.25 176.25"
+        fill="none" stroke="#D5D1C7" stroke-width="17" stroke-linecap="round"/>
+
+  <!-- Active Deep Terracotta Quota Arc -->
+  <path d="M 82.75 176.25 A 64 64 0 1 1 182.28 97.09"
+        fill="none" stroke="url(#arcC)" stroke-width="17" stroke-linecap="round"/>
+
+  <!-- Restrained Secondary Inner Nordic Steel Telemetry Ring -->
+  <path d="M 89.03 149.17 A 43 43 0 0 1 152.66 95.77"
+        fill="none" stroke="#5C7992" stroke-opacity="0.56" stroke-width="5.5" stroke-linecap="round"/>
+
+  <!-- Deep Ink Precision Watch Needle -->
+  <g filter="url(#handShadowC)">
+    <polygon points="116.2,143.2 112.4,136.4 168.5,103.3 170.7,106.7" fill="#1A1A1C"/>
+    <circle cx="169.6" cy="105.0" r="2.0" fill="#1A1A1C"/>
+    <circle cx="128" cy="131" r="13.5" fill="#1A1A1C"/>
+    <circle cx="128" cy="131" r="5.8" fill="#D96B2C"/>
+  </g>
+
+  <!-- Botanical Sage Healthy Status Pip -->
+  <circle cx="128" cy="191" r="7.5" fill="#4A8768"/>
+</svg>

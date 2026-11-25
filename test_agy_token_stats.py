@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import io
 import json
+import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 import agy_token_stats as mod
 
@@ -658,7 +661,7 @@ class AgyTokenStatsTests(unittest.TestCase):
             # 5. Custom non-standard data_dir does not leak folder name
             self.assertEqual(mod._redact_data_dir(pathlib.Path(r"D:\PrivateClient\agy-data")), "<redacted>")
 
-    def test_blocks_tools_multi_source_statusline_archive_and_budget(self) -> None:
+    def test_tools_multi_source_statusline_archive_and_budget(self) -> None:
         tz_utc = dt.timezone.utc
         now = dt.datetime.now(tz_utc).replace(microsecond=0)
         with tempfile.TemporaryDirectory() as tmp:
@@ -776,11 +779,6 @@ class AgyTokenStatsTests(unittest.TestCase):
             self.assertIn("app", agg["by_source"])
             self.assertIn("ide", agg["by_source"])
 
-            blocks = mod.compute_billing_blocks(rep.sessions, now_utc=now)
-            self.assertGreaterEqual(len(blocks), 2)
-            self.assertTrue(blocks[-1]["is_active"])
-            self.assertGreater(blocks[-1]["usd_per_hour"], 0.0)
-
             sl = mod.load_statusline_state(sl_path, now_utc=now)
             self.assertIsNotNone(sl)
             assert sl is not None
@@ -790,29 +788,1098 @@ class AgyTokenStatsTests(unittest.TestCase):
             txt = mod.render_text(
                 rep, agg, view="all", sort_by="time", limit=10, human=True,
                 tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
-                color=False, statusline=sl, blocks=blocks,
+                color=False, statusline=sl,
             )
-            self.assertIn("Active 5h Block", txt)
             self.assertIn("Official Quota", txt)
-            self.assertIn("5-Hour Rolling Blocks", txt)
             self.assertIn("By Tool Calls", txt)
+            self.assertNotIn("Active 5h Block", txt)
+            self.assertNotIn("5-Hour Rolling Blocks", txt)
 
-            compact = mod.render_compact(rep, agg, tz=tz_utc, statusline=sl, blocks=blocks)
+            compact = mod.render_compact(rep, agg, tz=tz_utc, statusline=sl)
             self.assertIn("AGY today=", compact)
-            self.assertIn("5h=", compact)
+            self.assertNotIn("5h=", compact)
             self.assertIn("quota=gemini-weekly:91%", compact)
 
-            # Budget check exit codes: warn (10) & critical (20)
+            js = json.loads(
+                mod.render_json(
+                    rep, agg, sort_by="time", tz_label="UTC", include_turns=False, statusline=sl
+                )
+            )
+            self.assertNotIn("blocks_5h", js)
+            self.assertIsNotNone(js["official_quota"])
+
+            # Legacy budget.json with block_5h_usd is ignored safely
+            legacy_budget = pathlib.Path(tmp) / "budget.json"
+            legacy_budget.write_text(
+                json.dumps({"block_5h_usd": 15.0, "daily_usd": 25.0, "weekly_usd": 100.0}),
+                encoding="utf-8",
+            )
+            bcfg = mod.load_budget_config(legacy_budget)
+            self.assertNotIn("block_5h_usd", bcfg)
+            self.assertAlmostEqual(bcfg["daily_usd"], 25.0)
+            self.assertAlmostEqual(bcfg["weekly_usd"], 100.0)
+
+            # Budget check exit codes: warn (10) & critical (20) on daily budget
             code_crit, notes_crit = mod.evaluate_budget_exit_code(
-                agg, blocks, tz=tz_utc, block_5h_usd=1.0, warn_pct=70.0, crit_pct=90.0
+                agg, tz=tz_utc, daily_usd=1.0, warn_pct=70.0, crit_pct=90.0
             )
             self.assertEqual(code_crit, 20)
             self.assertTrue(any("CRITICAL" in n for n in notes_crit))
 
+    def test_claude_code_parser_dedup_synthetic_ttl_and_subagents(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_root = pathlib.Path(tmp) / "Users" / "alice" / ".claude"
+            proj_dir = claude_root / "projects" / "C--Users-alice-secret-app"
+            parent_uuid = "11111111-1111-4111-8111-111111111111"
+            sub_dir = proj_dir / parent_uuid / "subagents"
+            sub_dir.mkdir(parents=True)
+
+            # Decoy credential / settings / history files that must never be touched (both root and under projects/<proj>/)
+            (claude_root / ".credentials.json").write_text("{broken json", encoding="utf-8")
+            (claude_root / "settings.json").write_text("{broken json", encoding="utf-8")
+            (claude_root / "history.jsonl").write_text("{broken json\n", encoding="utf-8")
+            trap_line = json.dumps({
+                "type": "assistant",
+                "uuid": "trap-1",
+                "sessionId": "history",
+                "requestId": "req_trap",
+                "timestamp": "2026-11-23T10:00:00Z",
+                "message": {
+                    "id": "msg_trap",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "usage": {"input_tokens": 66_000_000, "output_tokens": 666_667},
+                },
+            }) + "\n"
+            for decoy_name in ("history.jsonl", "settings.jsonl", "auth-tokens.jsonl", "my-credentials.jsonl", "debug-trace.jsonl", "agent-orphan.jsonl"):
+                (proj_dir / decoy_name).write_text(trap_line, encoding="utf-8")
+
+            (proj_dir / "sessions-index.json").write_text(
+                json.dumps({
+                    "version": 1,
+                    "entries": [{
+                        "sessionId": parent_uuid,
+                        "summary": "Indexed Parent Title",
+                        "projectPath": "C:/Users/alice/secret-app",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            # Main session: streaming duplicates sharing (message.id, requestId),
+            # synthetic error turn, isApiErrorMessage turn, ephemeral 1h cache write, custom-title
+            main_lines = [
+                json.dumps({
+                    "type": "user",
+                    "uuid": "u-1",
+                    "sessionId": parent_uuid,
+                    "cwd": "C:/Users/alice/secret-app",
+                    "timestamp": "2026-11-23T10:00:00Z",
+                    "message": {"role": "user", "content": "Refactor billing module"},
+                }),
+                # Streaming chunk 0: usage-less chunk sharing (msg_001, req_001) carries extra tool_use + thinking
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-1z",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_001",
+                    "timestamp": "2026-11-23T10:00:01Z",
+                    "message": {
+                        "id": "msg_001",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "stop_reason": None,
+                        "content": [
+                            {"type": "thinking", "thinking": "Initial thought before usage arrives"},
+                            {"type": "tool_use", "id": "toolu_0", "name": "Grep"},
+                        ],
+                    },
+                }),
+                # Streaming chunk 1: thinking + partial output_tokens=4 + stop_reason=null
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-1a",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_001",
+                    "timestamp": "2026-11-23T10:00:02Z",
+                    "message": {
+                        "id": "msg_001",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "stop_reason": None,
+                        "content": [{"type": "thinking", "thinking": "Plan changes carefully"}],
+                        "usage": {
+                            "input_tokens": 1000,
+                            "cache_read_input_tokens": 2000,
+                            "cache_creation_input_tokens": 1000,
+                            "output_tokens": 4,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 600,
+                                "ephemeral_1h_input_tokens": 400,
+                            },
+                        },
+                    },
+                }),
+                # Streaming chunk 2: same (msg_001, req_001), tool_use Read + partial output=25
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-1b",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_001",
+                    "timestamp": "2026-11-23T10:00:03Z",
+                    "message": {
+                        "id": "msg_001",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "stop_reason": None,
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read"}],
+                        "usage": {
+                            "input_tokens": 1000,
+                            "cache_read_input_tokens": 2000,
+                            "cache_creation_input_tokens": 1000,
+                            "output_tokens": 25,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 600,
+                                "ephemeral_1h_input_tokens": 400,
+                            },
+                        },
+                    },
+                }),
+                # Streaming chunk 3: final chunk, repeats toolu_1 + adds toolu_2 Edit, output=200
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-1c",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_001",
+                    "timestamp": "2026-11-23T10:00:05Z",
+                    "message": {
+                        "id": "msg_001",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "stop_reason": "tool_use",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_1", "name": "Read"},
+                            {"type": "tool_use", "id": "toolu_2", "name": "Edit"},
+                        ],
+                        "usage": {
+                            "input_tokens": 1000,
+                            "cache_read_input_tokens": 2000,
+                            "cache_creation_input_tokens": 1000,
+                            "output_tokens": 200,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 600,
+                                "ephemeral_1h_input_tokens": 400,
+                            },
+                        },
+                    },
+                }),
+                # Synthetic error turn must be skipped
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-err-1",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_err1",
+                    "isApiErrorMessage": False,
+                    "timestamp": "2026-11-23T10:00:06Z",
+                    "message": {
+                        "id": "msg_syn",
+                        "model": "<synthetic>",
+                        "content": [{"type": "text", "text": "No response requested."}],
+                        "usage": {
+                            "input_tokens": 999,
+                            "output_tokens": 999,
+                            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0},
+                        },
+                    },
+                }),
+                # isApiErrorMessage=true turn must be skipped even with non-synthetic model
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-err-2",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_err2",
+                    "isApiErrorMessage": True,
+                    "timestamp": "2026-11-23T10:00:07Z",
+                    "message": {
+                        "id": "msg_apierr",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "usage": {"input_tokens": 500, "output_tokens": 50},
+                    },
+                }),
+                # isApiErrorMessage=true inside message object must also be skipped
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a-err-3",
+                    "sessionId": parent_uuid,
+                    "requestId": "req_err3",
+                    "timestamp": "2026-11-23T10:00:07Z",
+                    "message": {
+                        "id": "msg_apierr2",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "isApiErrorMessage": True,
+                        "usage": {"input_tokens": 777, "output_tokens": 77},
+                    },
+                }),
+                # User toolUseResult with nested subagent usage must NOT be counted on parent
+                json.dumps({
+                    "type": "user",
+                    "uuid": "u-2",
+                    "sessionId": parent_uuid,
+                    "timestamp": "2026-11-23T10:00:08Z",
+                    "toolUseResult": {"usage": {"input_tokens": 99999, "output_tokens": 88888}},
+                    "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+                }),
+                json.dumps({
+                    "type": "custom-title",
+                    "sessionId": parent_uuid,
+                    "customTitle": "Billing Refactor Custom Title",
+                }),
+            ]
+            (proj_dir / f"{parent_uuid}.jsonl").write_text("\n".join(main_lines) + "\n", encoding="utf-8")
+
+            # Subagent file + meta.json
+            (sub_dir / "agent-a1b2c3.meta.json").write_text(
+                json.dumps({"agentType": "Explore", "description": "Scan billing handlers"}),
+                encoding="utf-8",
+            )
+            (sub_dir / "agent-a1b2c3.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "sub-1",
+                    "sessionId": parent_uuid,
+                    "isSidechain": True,
+                    "agentId": "a1b2c3",
+                    "requestId": "req_sub1",
+                    "timestamp": "2026-11-23T10:00:04Z",
+                    "message": {
+                        "id": "msg_sub1",
+                        "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Found 3 handlers"}],
+                        "usage": {
+                            "input_tokens": 500,
+                            "cache_read_input_tokens": 1500,
+                            "cache_creation_input_tokens": 0,
+                            "output_tokens": 100,
+                        },
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            spec = mod.SourceSpec("claude", claude_root, "claude")
+            rep = mod.scan_usage(claude_root, tz=tz_utc, pricing_path=None, sources=[spec])
+            self.assertEqual(len(rep.sessions), 2)
+
+            main_s = next(s for s in rep.sessions if not s.is_subagent)
+            sub_s = next(s for s in rep.sessions if s.is_subagent)
+
+            self.assertEqual(main_s.conversation_id, parent_uuid)
+            self.assertEqual(main_s.source, "claude")
+            self.assertEqual(main_s.agent_family, "claude")
+            self.assertEqual(main_s.title, "Billing Refactor Custom Title")
+            self.assertEqual(main_s.workspace, "C:/Users/alice/secret-app")
+            self.assertEqual(main_s.counts.calls, 1)
+            self.assertEqual(main_s.counts.input_tokens, 1000)
+            self.assertEqual(main_s.counts.cache_read_tokens, 2000)
+            # cache_creation_input_tokens is 1000 (NOT 1000 + 600 + 400!)
+            self.assertEqual(main_s.counts.cache_write_tokens, 1000)
+            self.assertEqual(main_s.counts.output_tokens, 200)
+            self.assertEqual(main_s.counts.total_tokens, 4200)
+            self.assertEqual(main_s.thinking_turns, 1)
+            self.assertEqual(main_s.turns[0].cache_write_1h_tokens, 400)
+            self.assertEqual(main_s.turns[0].tool_names, ("Grep", "Read", "Edit"))
+
+            # Verify claude-sonnet-4 pricing: in=$3/M, cr=$0.30/M, cw_5m=$3.75/M, cw_1h=$6.00/M (2x), out=$15/M
+            # Expected: in=0.003 + cr=0.0006 + cw=(600*3.75 + 400*6.00)/1M=0.00465 + out=0.003 = 0.01125
+            self.assertAlmostEqual(main_s.counts.total_cost_usd, 0.01125, places=8)
+
+            # Subagent linkage and Bedrock prefix pricing
+            self.assertEqual(sub_s.conversation_id, f"{parent_uuid}__a1b2c3")
+            self.assertEqual(sub_s.parent_id, parent_uuid)
+            self.assertEqual(sub_s.parent_title, "Billing Refactor Custom Title")
+            self.assertEqual(sub_s.workspace, "C:/Users/alice/secret-app")
+            self.assertEqual(sub_s.title, "[Explore] Scan billing handlers")
+            # claude-haiku-4-5: in=$1/M, cr=$0.10/M, out=$5/M -> (500*1 + 1500*0.1 + 100*5)/1M = 0.00115
+            self.assertAlmostEqual(sub_s.counts.total_cost_usd, 0.00115, places=8)
+
+    def test_codex_cli_parser_deltas_dupes_reset_tools_and_subagents(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_root = pathlib.Path(tmp) / "Users" / "alice" / ".codex"
+            day_dir = codex_root / "sessions" / "2026" / "11" / "23"
+            arch_dir = codex_root / "archived_sessions"
+            day_dir.mkdir(parents=True)
+            arch_dir.mkdir(parents=True)
+
+            # Decoy SQLite & credential files that must never be touched
+            (codex_root / "state_5.sqlite").write_bytes(b"SQLite format 3\x00")
+            (codex_root / "state_5.sqlite-wal").write_bytes(b"wal")
+            (codex_root / "auth.json").write_text('{"api_key": "sk-secret"}', encoding="utf-8")
+            (codex_root / "config.toml").write_text("model = 'gpt-5.3-codex'\n", encoding="utf-8")
+
+            parent_id = "22222222-2222-4222-8222-222222222222"
+            child_id = "33333333-3333-4333-8333-333333333333"
+            (codex_root / "session_index.jsonl").write_text(
+                json.dumps({"id": parent_id, "thread_name": "Codex Main Refactor"}) + "\n",
+                encoding="utf-8",
+            )
+
+            main_lines = [
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": parent_id, "cwd": "C:/Users/alice/codex-repo", "source": "cli"},
+                }),
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": "C:/Users/alice/codex-repo", "model": "gpt-5.3-codex"},
+                }),
+                # Rate-limit-only event with info: null must be skipped
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": None},
+                }),
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:03Z",
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "name": "shell_command"},
+                }),
+                # Turn 1: input=1000 (includes cached=400), output=300 (includes reasoning=120)
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:04Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 400,
+                                "output_tokens": 300,
+                                "reasoning_output_tokens": 120,
+                                "total_tokens": 1300,
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 400,
+                                "output_tokens": 300,
+                                "reasoning_output_tokens": 120,
+                                "total_tokens": 1300,
+                            },
+                        },
+                    },
+                }),
+                # Exact duplicate token_count refresh must be skipped!
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:05Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 400,
+                                "output_tokens": 300,
+                                "reasoning_output_tokens": 120,
+                                "total_tokens": 1300,
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 400,
+                                "output_tokens": 300,
+                                "reasoning_output_tokens": 120,
+                                "total_tokens": 1300,
+                            },
+                        },
+                    },
+                }),
+                # Switch model mid-session via turn_context
+                json.dumps({
+                    "timestamp": "2026-11-23T11:01:00Z",
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.4"},
+                }),
+                json.dumps({
+                    "timestamp": "2026-11-23T11:01:02Z",
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "name": "apply_patch"},
+                }),
+                # Turn 2: cumulative total advances monotonically -> delta in=1500, cached=1200, out=500, reason=200
+                json.dumps({
+                    "timestamp": "2026-11-23T11:01:05Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 2500,
+                                "cached_input_tokens": 1600,
+                                "output_tokens": 800,
+                                "reasoning_output_tokens": 320,
+                                "total_tokens": 3300,
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 1500,
+                                "cached_input_tokens": 1200,
+                                "output_tokens": 500,
+                                "reasoning_output_tokens": 200,
+                                "total_tokens": 2000,
+                            },
+                        },
+                    },
+                }),
+                # Turn 3: simulated reset (total smaller than prev_total) -> falls back to last_token_usage
+                json.dumps({
+                    "timestamp": "2026-11-23T11:02:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 200,
+                                "cached_input_tokens": 50,
+                                "output_tokens": 40,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 240,
+                            },
+                            "last_token_usage": {
+                                "input_tokens": 200,
+                                "cached_input_tokens": 50,
+                                "output_tokens": 40,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": 240,
+                            },
+                        },
+                    },
+                }),
+            ]
+            (day_dir / f"rollout-2026-11-23T11-00-00-{parent_id}.jsonl").write_text(
+                "\n".join(main_lines) + "\n", encoding="utf-8"
+            )
+
+            # Subagent rollout in archived_sessions linked via thread_spawn.parent_thread_id
+            sub_lines = [
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:30Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "parent_thread_id": parent_id,
+                                    "depth": 1,
+                                    "agent_nickname": "auditor",
+                                    "agent_role": "explorer",
+                                }
+                            }
+                        },
+                    },
+                }),
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:31Z",
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.1-codex-mini"},
+                }),
+                json.dumps({
+                    "timestamp": "2026-11-23T11:00:35Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 500,
+                                "cached_input_tokens": 100,
+                                "output_tokens": 100,
+                                "reasoning_output_tokens": 30,
+                            }
+                        },
+                    },
+                }),
+            ]
+            (arch_dir / f"rollout-2026-11-23T11-00-30-{child_id}.jsonl").write_text(
+                "\n".join(sub_lines) + "\n", encoding="utf-8"
+            )
+
+            spec = mod.SourceSpec("codex", codex_root, "codex")
+            rep = mod.scan_usage(codex_root, tz=tz_utc, pricing_path=None, sources=[spec])
+            self.assertEqual(len(rep.sessions), 2)
+
+            main_s = next(s for s in rep.sessions if s.conversation_id == parent_id)
+            sub_s = next(s for s in rep.sessions if s.conversation_id == child_id)
+
+            self.assertEqual(main_s.source, "codex")
+            self.assertEqual(main_s.title, "Codex Main Refactor")
+            self.assertEqual(main_s.counts.calls, 3)
+            # Turn 1: uncached=600, cached=400, out=300, reason=120
+            # Turn 2: uncached=300, cached=1200, out=500, reason=200
+            # Turn 3: uncached=150, cached=50, out=40, reason=0
+            self.assertEqual(main_s.counts.input_tokens, 1050)
+            self.assertEqual(main_s.counts.cache_read_tokens, 1650)
+            self.assertEqual(main_s.counts.cache_write_tokens, 0)
+            self.assertEqual(main_s.counts.output_tokens, 840)
+            self.assertEqual(main_s.counts.total_tokens, 3540)
+            self.assertEqual(main_s.turns[0].model, "gpt-5.3-codex")
+            self.assertEqual(main_s.turns[0].tool_names, ("shell_command",))
+            self.assertEqual(main_s.turns[0].reasoning_tokens, 120)
+            self.assertEqual(main_s.turns[1].model, "gpt-5.4")
+            self.assertEqual(main_s.turns[1].tool_names, ("apply_patch",))
+            self.assertEqual(main_s.turns[1].reasoning_tokens, 200)
+            self.assertEqual(main_s.thinking_turns, 2)
+
+            # Subagent inherits parent title & workspace
+            self.assertTrue(sub_s.is_subagent)
+            self.assertEqual(sub_s.parent_id, parent_id)
+            self.assertEqual(sub_s.parent_title, "Codex Main Refactor")
+            self.assertEqual(sub_s.workspace, "C:/Users/alice/codex-repo")
+            self.assertEqual(sub_s.title, "auditor · explorer")
+            self.assertEqual(sub_s.counts.input_tokens, 400)
+            self.assertEqual(sub_s.counts.cache_read_tokens, 100)
+            self.assertEqual(sub_s.counts.output_tokens, 100)
+            self.assertEqual(sub_s.thinking_turns, 1)
+
+    def test_gemini_cli_parser_thoughts_tool_tokens_and_jsonl_rewind(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            gem_home = pathlib.Path(tmp) / "Users" / "alice" / ".gemini"
+            tmp_dir = gem_home / "tmp"
+            proj_a_chats = tmp_dir / "proj-alpha" / "chats"
+            proj_b_chats = tmp_dir / "proj-beta" / "chats"
+            proj_a_chats.mkdir(parents=True)
+            proj_b_chats.mkdir(parents=True)
+
+            # Decoy OAuth/settings files that must never be touched
+            (gem_home / "oauth_creds.json").write_text("{broken", encoding="utf-8")
+            (gem_home / "google_accounts.json").write_text("{broken", encoding="utf-8")
+            (gem_home / "jetski-standalone-oauth-token").write_text("secret-token", encoding="utf-8")
+            (gem_home / "settings.json").write_text("{broken", encoding="utf-8")
+
+            # Workspace via .project_root for proj-alpha, projects.json for proj-beta
+            (tmp_dir / "proj-alpha" / ".project_root").write_text("C:/Users/alice/alpha-repo\n", encoding="utf-8")
+            (gem_home / "projects.json").write_text(
+                json.dumps({"projects": {"C:/Users/alice/beta-repo": "proj-beta"}}),
+                encoding="utf-8",
+            )
+
+            # Session 1: classic .json with thoughts + tool tokens + duplicate message.id
+            (proj_a_chats / "session-2026-11-23-s1.json").write_text(
+                json.dumps({
+                    "sessionId": "gem-sess-001",
+                    "summary": "Gemini Reasoning Session",
+                    "messages": [
+                        {"id": "u1", "type": "user", "content": "Explain cache math"},
+                        {
+                            "id": "g1",
+                            "type": "gemini",
+                            "timestamp": "2026-11-23T12:00:00Z",
+                            "model": "gemini-2.5-pro",
+                            "tokens": {"input": 1000, "cached": 600, "tool": 100, "output": 50, "thoughts": 10},
+                        },
+                        # Duplicate id "g1" should override earlier partial record
+                        {
+                            "id": "g1",
+                            "type": "gemini",
+                            "timestamp": "2026-11-23T12:00:05Z",
+                            "model": "gemini-2.5-pro",
+                            "thoughts": [{"subject": "Plan", "description": "Check formula"}],
+                            "toolCalls": [{"id": "tc1", "name": "read_file", "status": "ok"}],
+                            "tokens": {"input": 1000, "cached": 600, "tool": 150, "output": 200, "thoughts": 800},
+                        },
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+            # Session 2: append-only .jsonl with $set and $rewindTo rolling back turn 2
+            jsonl_lines = [
+                json.dumps({"sessionId": "gem-sess-002", "projectHash": "proj-beta"}),
+                json.dumps({"id": "m1", "type": "user", "content": "Initial question"}),
+                json.dumps({
+                    "id": "m2",
+                    "type": "gemini",
+                    "timestamp": "2026-11-23T13:00:00Z",
+                    "model": "gemini-2.0-flash",
+                    "tokens": {"input": 500, "cached": 200, "tool": 0, "output": 100, "thoughts": 50},
+                }),
+                json.dumps({"id": "m3", "type": "user", "content": "Wrong branch prompt"}),
+                json.dumps({
+                    "id": "m4",
+                    "type": "gemini",
+                    "timestamp": "2026-11-23T13:01:00Z",
+                    "model": "gemini-2.0-flash",
+                    "tokens": {"input": 99999, "cached": 0, "tool": 0, "output": 99999, "thoughts": 99999},
+                }),
+                # Rewind to m3 -> drops m3 and m4!
+                json.dumps({"$rewindTo": "m3"}),
+                # Update summary via $set
+                json.dumps({"$set": {"summary": "Rewound Gemini Session"}}),
+                # New branch after rewind
+                json.dumps({
+                    "id": "m5",
+                    "type": "gemini",
+                    "timestamp": "2026-11-23T13:02:00Z",
+                    "model": "gemini-2.0-flash-lite",
+                    "tokens": {"input": 400, "cached": 100, "tool": 50, "output": 80, "thoughts": 20},
+                }),
+            ]
+            (proj_b_chats / "session-2026-11-23-s2.jsonl").write_text(
+                "\n".join(jsonl_lines) + "\n", encoding="utf-8"
+            )
+
+            spec = mod.SourceSpec("gemini", tmp_dir, "gemini")
+            rep = mod.scan_usage(tmp_dir, tz=tz_utc, pricing_path=None, sources=[spec])
+            self.assertEqual(len(rep.sessions), 2)
+
+            s1 = next(s for s in rep.sessions if s.conversation_id == "gem-sess-001")
+            s2 = next(s for s in rep.sessions if s.conversation_id == "gem-sess-002")
+
+            self.assertEqual(s1.source, "gemini")
+            self.assertEqual(s1.workspace, "C:/Users/alice/alpha-repo")
+            self.assertEqual(s1.counts.calls, 1)
+            # uncached_in = (1000 - 600) + 150 = 550; cache_read = 600; output = 200 + 800 = 1000
+            self.assertEqual(s1.counts.input_tokens, 550)
+            self.assertEqual(s1.counts.cache_read_tokens, 600)
+            self.assertEqual(s1.counts.cache_write_tokens, 0)
+            self.assertEqual(s1.counts.output_tokens, 1000)
+            self.assertEqual(s1.turns[0].reasoning_tokens, 800)
+            self.assertEqual(s1.turns[0].tool_names, ("read_file",))
+            self.assertEqual(s1.thinking_turns, 1)
+
+            self.assertEqual(s2.workspace, "C:/Users/alice/beta-repo")
+            self.assertEqual(s2.title, "Rewound Gemini Session")
+            # m4 (99999 tokens) must be completely gone after $rewindTo m3!
+            self.assertEqual(s2.counts.calls, 2)
+            # m2: uncached=300, cr=200, out=150; m5: uncached=350, cr=100, out=100
+            self.assertEqual(s2.counts.input_tokens, 650)
+            self.assertEqual(s2.counts.cache_read_tokens, 300)
+            self.assertEqual(s2.counts.output_tokens, 250)
+
+    def test_pricing_parity_codex_gemini_bedrock_vertex_and_1h_ttl(self) -> None:
+        cat = mod.PricingCatalog(None)
+        d = dt.date(2026, 11, 24)
+
+        # OpenAI / Codex models must NOT be shadowed by "gpt-5"
+        expected_rates = {
+            "gpt-5.4": (2.50, 0.25, 2.50, 15.00),
+            "gpt-5.4-high": (2.50, 0.25, 2.50, 15.00),
+            "gpt-5.3-codex": (1.75, 0.175, 1.75, 14.00),
+            "gpt-5.2-codex": (1.75, 0.175, 1.75, 14.00),
+            "gpt-5.2": (1.75, 0.175, 1.75, 14.00),
+            "gpt-5.1-codex-mini": (0.25, 0.025, 0.25, 2.00),
+            "gpt-5.1-codex": (1.25, 0.125, 1.25, 10.00),
+            "gpt-5.1": (1.25, 0.125, 1.25, 10.00),
+            "gpt-5-codex": (1.25, 0.125, 1.25, 10.00),
+            "gpt-5-nano": (0.05, 0.005, 0.05, 0.40),
+            "codex-mini-latest": (1.50, 0.375, 1.50, 6.00),
+            "gpt-4.1": (2.00, 0.50, 2.00, 8.00),
+            "gpt-4.1-mini": (0.40, 0.10, 0.40, 1.60),
+            "gpt-4.1-nano": (0.10, 0.025, 0.10, 0.40),
+            "gemini-2.0-flash": (0.10, 0.025, 0.10, 0.40),
+            "gemini-2.0-flash-lite": (0.075, 0.01875, 0.075, 0.30),
+        }
+        for model_name, (ri, rcr, rcw, ro) in expected_rates.items():
+            rate = cat.resolve_rate(model_name, 10_000, d)
+            self.assertIsNotNone(rate, f"Missing rate for {model_name}")
+            assert rate is not None
+            self.assertAlmostEqual(rate.input, ri, places=6, msg=model_name)
+            self.assertAlmostEqual(rate.cache_read, rcr, places=6, msg=model_name)
+            self.assertAlmostEqual(rate.cache_write, rcw, places=6, msg=model_name)
+            self.assertAlmostEqual(rate.output, ro, places=6, msg=model_name)
+
+        # Bedrock & Vertex prefix stripping + '@' date normalization
+        for raw_m, exp_in in (
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", 3.00),
+            ("eu.anthropic.claude-opus-4-6-v1", 5.00),
+            ("global.anthropic.claude-haiku-4-5-20251001-v1:0", 1.00),
+            ("anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00),
+            ("claude-opus-4-6@20260205", 5.00),
+            ("projects/p/locations/us/models/claude-3-7-sonnet@20250219", 3.00),
+        ):
+            r = cat.resolve_rate(raw_m, 10_000, d)
+            self.assertIsNotNone(r, f"Unpriced provider-prefixed model: {raw_m}")
+            assert r is not None
+            self.assertAlmostEqual(r.input, exp_in, places=6, msg=raw_m)
+
+        # 1h cache write pricing at 2.0x base input (5m at normal 1.25x cache_write)
+        cost_1h = cat.price_turn("claude-sonnet-4-6", 0, 0, 1_000_000, 0, d, cache_write_1h_tokens=400_000)
+        # 600K * $3.75/M + 400K * $6.00/M = $2.25 + $2.40 = $4.65
+        self.assertAlmostEqual(cost_1h.cache_write_usd, 4.65, places=6)
+        # Clamping when cache_write_1h > cache_write
+        cost_clamped = cat.price_turn("claude-sonnet-4-6", 0, 0, 500_000, 0, d, cache_write_1h_tokens=900_000)
+        self.assertAlmostEqual(cost_clamped.cache_write_usd, 3.00, places=6)
+
+    def test_multi_agent_cli_filters_sources_view_env_discovery_and_redaction(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / "Users" / "alice"
+            agy_dir = base / ".gemini" / "antigravity-cli"
+            claude_dir = base / ".claude"
+            claude_cfg_dir = base / ".config" / "claude"
+            codex_dir = base / ".codex"
+            gemini_home = base / "custom-gemini-home"
+            gemini_tmp = gemini_home / ".gemini" / "tmp"
+
+            # 1. Antigravity fixture
+            agy_logs = agy_dir / "brain" / "aaa00001-0000-0000-0000-000000000001" / ".system_generated" / "logs"
+            agy_logs.mkdir(parents=True)
+            (agy_logs / "transcript.jsonl").write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-24T01:00:00Z",
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 1000,
+                    "cache_read_tokens": 2000,
+                    "output_tokens": 200,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # 2. Claude fixture
+            cl_proj = claude_dir / "projects" / "C--Users-alice-secret-claude"
+            cl_proj.mkdir(parents=True)
+            (cl_proj / "bbb00002-0000-0000-0000-000000000002.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "c1",
+                    "sessionId": "bbb00002-0000-0000-0000-000000000002",
+                    "cwd": "C:/Users/alice/secret-claude",
+                    "requestId": "r1",
+                    "timestamp": "2026-11-24T02:00:00Z",
+                    "message": {
+                        "id": "m1",
+                        "model": "claude-opus-4-6",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {
+                            "input_tokens": 500,
+                            "cache_read_input_tokens": 1000,
+                            "cache_creation_input_tokens": 200,
+                            "output_tokens": 100,
+                        },
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # 3. Codex fixture
+            cx_day = codex_dir / "sessions" / "2026" / "11" / "24"
+            cx_day.mkdir(parents=True)
+            (cx_day / "rollout-2026-11-24T03-00-00-ccc00003-0000-0000-0000-000000000003.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "timestamp": "2026-11-24T03:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": "ccc00003-0000-0000-0000-000000000003", "cwd": "C:/Users/alice/secret-codex"},
+                    }),
+                    json.dumps({
+                        "timestamp": "2026-11-24T03:00:01Z",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.3-codex"},
+                    }),
+                    json.dumps({
+                        "timestamp": "2026-11-24T03:00:05Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 800,
+                                    "cached_input_tokens": 300,
+                                    "output_tokens": 150,
+                                    "reasoning_output_tokens": 40,
+                                }
+                            },
+                        },
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # 4. Gemini CLI fixture (under $GEMINI_CLI_HOME/.gemini/tmp)
+            gm_chats = gemini_tmp / "secret-gem-slug" / "chats"
+            gm_chats.mkdir(parents=True)
+            (gemini_tmp / "secret-gem-slug" / ".project_root").write_text(
+                "C:/Users/alice/secret-gemini\n", encoding="utf-8"
+            )
+            (gm_chats / "session-2026-11-24-g1.json").write_text(
+                json.dumps({
+                    "sessionId": "ddd00004-0000-0000-0000-000000000004",
+                    "summary": "Secret Gemini Launch Plan",
+                    "messages": [{
+                        "id": "gm1",
+                        "type": "gemini",
+                        "timestamp": "2026-11-24T04:00:00Z",
+                        "model": "gemini-2.5-flash",
+                        "tokens": {"input": 600, "cached": 200, "tool": 0, "output": 100, "thoughts": 50},
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            # Env discovery checks
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CLAUDE_CONFIG_DIR": f"{claude_dir},{claude_cfg_dir}",
+                    "CODEX_HOME": str(codex_dir),
+                    "GEMINI_CLI_HOME": str(gemini_home),
+                },
+                clear=False,
+            ):
+                self.assertEqual(mod.discover_claude_dirs(), [claude_dir])
+                self.assertEqual(mod.discover_codex_dirs(), [codex_dir])
+                self.assertEqual(mod.discover_gemini_dirs(), [gemini_tmp])
+
+            all_sources = [
+                mod.SourceSpec("antigravity", agy_dir, "cli"),
+                mod.SourceSpec("claude", claude_dir, "claude"),
+                mod.SourceSpec("codex", codex_dir, "codex"),
+                mod.SourceSpec("gemini", gemini_tmp, "gemini"),
+            ]
+
+            # Incremental scanner caches all 4 agents cleanly
+            scanner = mod.IncrementalScanner(agy_dir, pricing_path=None, sources=all_sources)
+            rep1 = scanner.scan(tz=tz_utc)
+            self.assertEqual(len(rep1.sessions), 4)
+            self.assertEqual(rep1.files_reparsed, 4)
+            self.assertEqual(rep1.files_cached, 0)
+            rep2 = scanner.scan(tz=tz_utc)
+            self.assertEqual(rep2.files_reparsed, 0)
+            self.assertEqual(rep2.files_cached, 4)
+
+            agg = mod.aggregate_sessions(rep1.sessions)
+            self.assertEqual(set(agg["by_source"].keys()), {"cli", "claude", "codex", "gemini"})
+            self.assertEqual(set(agg["by_agent"].keys()), {"antigravity", "claude", "codex", "gemini"})
+
+            # --view sources & --view all & CSV sources & JSON by_source/by_agent
+            txt_sources = mod.render_text(
+                rep1, agg, view="sources", sort_by="time", limit=10, human=True,
+                tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None, color=False,
+            )
+            self.assertIn("By Source", txt_sources)
+            self.assertIn("Claude Code", txt_sources)
+            self.assertIn("Codex CLI", txt_sources)
+            self.assertIn("Gemini CLI", txt_sources)
+
+            csv_sources = mod.render_csv(rep1, agg, view="sources", sort_by="time")
+            self.assertIn("source,agent,sessions", csv_sources.splitlines()[0])
+            self.assertEqual(len(csv_sources.splitlines()), 5)
+
+            # --redact zero-PII check across all 4 agents (text, JSON, warnings)
+            rep1.warnings.append(
+                f"Could not read {claude_dir / 'projects' / 'C--Users-alice-secret-claude' / 'bbb00002.jsonl'}: perm"
+            )
+            secrets = (
+                "alice",
+                "secret-claude",
+                "secret-codex",
+                "secret-gemini",
+                "Secret Gemini Launch Plan",
+                "custom-gemini-home",
+                "aaa00001",
+                "bbb00002",
+                "ccc00003",
+                "ddd00004",
+            )
+            txt_red = mod.render_text(
+                rep1, agg, view="all", sort_by="time", limit=10, human=True,
+                tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                color=False, redact=True,
+            )
+            js_red_raw = mod.render_json(rep1, agg, sort_by="time", tz_label="UTC", include_turns=True, redact=True)
+            for sec in secrets:
+                self.assertNotIn(sec, txt_red)
+                self.assertNotIn(sec, js_red_raw)
+            self.assertIn("~/.claude", txt_red)
+            self.assertIn("~/.codex", txt_red)
+            self.assertIn("~/.gemini/tmp", txt_red)
+            self.assertIn("By Source", txt_red)
+            js_red = json.loads(js_red_raw)
+            self.assertEqual(set(js_red["by_agent"].keys()), {"antigravity", "claude", "codex", "gemini"})
+            self.assertIn("~/.claude/<redacted-path>", js_red["warnings"][0])
+            self.assertEqual(mod._redact_data_dir(claude_cfg_dir), "~/.config/claude")
+
+            # CLI flag parsing: --agy-only and --agent / --agents
+            self.assertEqual(mod.parse_agent_filter(["agy,claude"]), {"antigravity", "claude"})
+            self.assertEqual(mod.parse_agent_filter(["codex", "gemini"]), {"codex", "gemini"})
+            with self.assertRaises(ValueError):
+                mod.parse_agent_filter(["unknown-agent"])
+
+            with mock.patch.object(mod, "discover_default_sources", side_effect=lambda f: [
+                s for s in all_sources if f is None or s.kind in f
+            ]):
+                buf_agy = io.StringIO()
+                with mock.patch("sys.stdout", buf_agy):
+                    rc = mod.main(["--agy-only", "--no-archive", "--format", "json", "--utc"])
+                self.assertEqual(rc, 0)
+                js_agy = json.loads(buf_agy.getvalue())
+                self.assertEqual(js_agy["session_count"], 1)
+                self.assertEqual(js_agy["sessions"][0]["source"], "cli")
+
+                buf_cc = io.StringIO()
+                with mock.patch("sys.stdout", buf_cc):
+                    rc2 = mod.main(["--agents", "claude,codex", "--no-archive", "--format", "json", "--utc"])
+                self.assertEqual(rc2, 0)
+                js_cc = json.loads(buf_cc.getvalue())
+                self.assertEqual(js_cc["session_count"], 2)
+                self.assertEqual(set(js_cc["by_agent"].keys()), {"claude", "codex"})
+
+    def test_rust_multi_agent_archive_backfill_and_zero_double_count(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / "Users" / "alice"
+            claude_dir = base / ".claude"
+            cl_proj = claude_dir / "projects" / "C--Users-alice-proj"
+            cl_proj.mkdir(parents=True)
+            live_claude_id = "11111111-1111-4111-8111-111111111111"
+            (cl_proj / f"{live_claude_id}.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "live-1",
+                    "sessionId": live_claude_id,
+                    "cwd": "C:/Users/alice/proj",
+                    "requestId": "req-live",
+                    "timestamp": "2026-11-24T05:00:00Z",
+                    "message": {
+                        "id": "msg-live",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "usage": {
+                            "input_tokens": 1000,
+                            "cache_read_input_tokens": 2000,
+                            "cache_creation_input_tokens": 500,
+                            "output_tokens": 100,
+                            "cache_creation": {"ephemeral_1h_input_tokens": 200},
+                        },
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # Rust archive.json uses "<family>:<cid>" keys + "conversation_id" + "claude-code"/"gemini-cli" sources
+            arch_path = base / "archive.json"
+            arch_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "sessions": {
+                        # Duplicate of live Claude session -> MUST be deduplicated (zero double-count!)
+                        f"claude-code:{live_claude_id}": {
+                            "conversation_id": live_claude_id,
+                            "title": "Live Claude Archived Copy",
+                            "workspace": "C:/Users/alice/proj",
+                            "source": "claude-code",
+                            "turns": [{
+                                "step": 1,
+                                "ts": "2026-11-24T05:00:00Z",
+                                "m": "claude-sonnet-4-5-20250929",
+                                "in": 1000,
+                                "cr": 2000,
+                                "cw": 500,
+                                "cw1h": 200,
+                                "out": 100,
+                            }],
+                        },
+                        # Pruned Claude session (with key prefix fallback, no explicit conversation_id) -> backfilled & normalized to "claude"
+                        "claude-code:22222222-2222-4222-8222-222222222222": {
+                            "title": "Pruned Claude Session",
+                            "workspace": "C:/Users/alice/old-claude",
+                            "source": "claude-code",
+                            "turns": [{
+                                "step": 1,
+                                "ts": "2026-11-22T05:00:00Z",
+                                "m": "claude-opus-4-6",
+                                "in": 200,
+                                "cr": 800,
+                                "cw": 100,
+                                "cw1h": 100,
+                                "out": 50,
+                            }],
+                        },
+                        # Pruned Gemini CLI session -> backfilled & normalized to "gemini" with reasoning tokens
+                        "gemini-cli:gem-pruned-001": {
+                            "conversation_id": "gem-pruned-001",
+                            "title": "Pruned Gemini Session",
+                            "workspace": "C:/Users/alice/old-gemini",
+                            "source": "gemini-cli",
+                            "turns": [{
+                                "step": 1,
+                                "ts": "2026-11-22T06:00:00Z",
+                                "m": "gemini-2.5-pro",
+                                "in": 300,
+                                "cr": 700,
+                                "out": 400,
+                                "rt": 250,
+                            }],
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            spec = mod.SourceSpec("claude", claude_dir, "claude")
+            rep = mod.scan_usage(
+                claude_dir,
+                tz=tz_utc,
+                pricing_path=None,
+                sources=[spec],
+                archive_path=arch_path,
+            )
+            # 1 live Claude + 2 pruned archived (1 claude + 1 gemini), ZERO double-count of live Claude!
+            self.assertEqual(len(rep.sessions), 3)
+            self.assertEqual(rep.archived_sessions_count, 2)
+            agg = mod.aggregate_sessions(rep.sessions)
+            self.assertEqual(set(agg["by_source"].keys()), {"claude", "gemini"})
+            self.assertNotIn("claude-code", agg["by_source"])
+            self.assertNotIn("gemini-cli", agg["by_source"])
+            self.assertEqual(agg["source_sessions"]["claude"], 2)
+            self.assertEqual(agg["source_sessions"]["gemini"], 1)
+
+            pruned_cl = next(s for s in rep.sessions if s.conversation_id == "22222222-2222-4222-8222-222222222222")
+            self.assertEqual(pruned_cl.source, "claude")
+            self.assertEqual(pruned_cl.turns[0].cache_write_1h_tokens, 100)
+            pruned_gm = next(s for s in rep.sessions if s.conversation_id == "gem-pruned-001")
+            self.assertEqual(pruned_gm.source, "gemini")
+            self.assertEqual(pruned_gm.turns[0].reasoning_tokens, 250)
+            self.assertEqual(pruned_gm.thinking_turns, 1)
+
+            # Agent filter on Claude excludes pruned Gemini archive backfill
+            rep_cl_only = mod.scan_usage(
+                claude_dir,
+                tz=tz_utc,
+                pricing_path=None,
+                sources=[spec],
+                archive_path=arch_path,
+                agent_filter={"claude"},
+            )
+            self.assertEqual(len(rep_cl_only.sessions), 2)
+            self.assertTrue(all(s.source == "claude" for s in rep_cl_only.sessions))
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
-        forbidden_imports = {"sqlite3", "subprocess", "urllib.request", "socket", "http", "shutil"}
-        forbidden_attrs = {"write_text", "write_bytes", "unlink", "rmdir", "mkdir", "rename"}
+        forbidden_imports = {
+            "sqlite3",
+            "subprocess",
+            "urllib.request",
+            "socket",
+            "http",
+            "http.client",
+            "ftplib",
+            "smtplib",
+            "ssl",
+            "shutil",
+        }
+        forbidden_attrs = {
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "rmdir",
+            "mkdir",
+            "makedirs",
+            "remove",
+            "rename",
+            "replace_file",
+        }
 
         for filename in ("agy_token_stats.py",):
             src = (base_dir / filename).read_text(encoding="utf-8")

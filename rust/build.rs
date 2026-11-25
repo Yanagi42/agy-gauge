@@ -5,6 +5,8 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=assets/app.ico");
+    println!("cargo:rerun-if-changed=assets/app_warn.ico");
+    println!("cargo:rerun-if-changed=assets/app_crit.ico");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let res_obj = out_dir.join("app_res.o");

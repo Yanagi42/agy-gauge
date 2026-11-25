@@ -1,32 +1,27 @@
-//! Rolling 5-hour billing blocks, burn rate & pace analytics, official `/statusline`
-//! quota bridge reader, and local budget threshold evaluation.
+//! Official `/statusline` quota bridge reader and local daily/weekly budget threshold evaluation.
 //!
 //! Safety guarantee:
 //!   - Strictly read-only on all Antigravity data under `~/.gemini`.
 //!   - Reads/writes optional local companion files (`statusline_state.json`, `budget.json`)
 //!     ONLY inside the application's own directory.
 
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::stats::{SessionInfo, TokenCounts};
-
-pub const BLOCK_WINDOW_SECS: i64 = 5 * 3600;
 const STATUSLINE_STALE_SECS: i64 = 600; // 10 minutes before official statusline snapshot is marked cached/stale
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileSig {
-    mtime_secs: u64,
-    mtime_nanos: u32,
-    len: u64,
+pub(crate) struct FileSig {
+    pub(crate) mtime_secs: u64,
+    pub(crate) mtime_nanos: u32,
+    pub(crate) len: u64,
 }
 
-fn regular_file_sig(path: &Path) -> Option<FileSig> {
+pub(crate) fn regular_file_sig(path: &Path) -> Option<FileSig> {
     let meta = fs::symlink_metadata(path).ok()?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
@@ -73,175 +68,6 @@ pub fn atomic_write_json(path: &Path, text: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
     }
     Ok(())
-}
-
-// ---------- Rolling 5-Hour Billing Blocks & Burn Rate ----------
-
-#[derive(Debug, Clone)]
-pub struct BillingBlock {
-    pub start_utc: DateTime<Utc>,
-    pub end_utc: DateTime<Utc>,
-    pub last_turn_utc: DateTime<Utc>,
-    pub is_active: bool,
-    pub counts: TokenCounts,
-    pub session_count: usize,
-    pub models: BTreeSet<String>,
-    pub elapsed_secs: i64,
-    pub remaining_secs: i64,
-    pub tokens_per_min: f64,
-    pub non_cached_per_min: f64,
-    pub usd_per_hour: f64,
-    pub projected_tokens: u64,
-    pub projected_usd: f64,
-}
-
-impl BillingBlock {
-    pub fn time_progress_pct(&self) -> f64 {
-        ((self.elapsed_secs as f64 / BLOCK_WINDOW_SECS as f64) * 100.0).clamp(0.0, 100.0)
-    }
-
-    pub fn block_key(&self) -> String {
-        self.start_utc.format("%Y-%m-%dT%H:%MZ").to_string()
-    }
-
-    pub fn local_range_label(&self) -> String {
-        let s = self.start_utc.with_timezone(&Local);
-        let e = self.end_utc.with_timezone(&Local);
-        format!("{} - {}", s.format("%H:%M"), e.format("%H:%M"))
-    }
-}
-
-/// Builds chronological 5-hour rolling billing blocks from all session turns.
-/// Returns `(active_block, all_blocks_oldest_first)`.
-pub fn compute_billing_blocks(
-    sessions: &[SessionInfo],
-    now_utc: DateTime<Utc>,
-) -> (Option<BillingBlock>, Vec<BillingBlock>) {
-    struct FlatTurn<'a> {
-        ts: DateTime<Utc>,
-        cid: &'a str,
-        model: &'a str,
-        input: u64,
-        cache_read: u64,
-        cache_write: u64,
-        output: u64,
-        cost: crate::pricing::CostBreakdown,
-    }
-
-    let mut turns: Vec<FlatTurn<'_>> = Vec::new();
-    for s in sessions {
-        for t in &s.turns {
-            let Some(ts) = t.timestamp_utc else { continue };
-            turns.push(FlatTurn {
-                ts,
-                cid: s.conversation_id.as_str(),
-                model: t.model.as_str(),
-                input: t.input_tokens,
-                cache_read: t.cache_read_tokens,
-                cache_write: t.cache_write_tokens,
-                output: t.output_tokens,
-                cost: t.cost,
-            });
-        }
-    }
-    if turns.is_empty() {
-        return (None, Vec::new());
-    }
-    turns.sort_by_key(|t| t.ts);
-
-    let window = Duration::seconds(BLOCK_WINDOW_SECS);
-    let mut blocks: Vec<BillingBlock> = Vec::new();
-
-    struct OpenBlock<'a> {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        last: DateTime<Utc>,
-        counts: TokenCounts,
-        cids: BTreeSet<&'a str>,
-        models: BTreeSet<String>,
-    }
-
-    let finalize = |ob: OpenBlock<'_>, now: DateTime<Utc>| -> BillingBlock {
-        let is_active = now >= ob.start && now < ob.end;
-        let elapsed_secs = if is_active {
-            (now - ob.start).num_seconds().clamp(0, BLOCK_WINDOW_SECS)
-        } else {
-            (ob.last - ob.start).num_seconds().clamp(60, BLOCK_WINDOW_SECS)
-        };
-        let remaining_secs = if is_active {
-            (ob.end - now).num_seconds().max(0)
-        } else {
-            0
-        };
-        let denom_secs = elapsed_secs.max(60) as f64;
-        let tokens_per_min = ob.counts.total_tokens() as f64 / (denom_secs / 60.0);
-        let non_cached_per_min = ob.counts.non_cached_tokens() as f64 / (denom_secs / 60.0);
-        let usd_per_hour = ob.counts.cost.total_usd() / (denom_secs / 3600.0);
-        let (projected_tokens, projected_usd) = if is_active && (elapsed_secs >= 300 || ob.counts.calls >= 2) {
-            let rem_mins = remaining_secs as f64 / 60.0;
-            let rem_hrs = remaining_secs as f64 / 3600.0;
-            (
-                ob.counts
-                    .total_tokens()
-                    .saturating_add((tokens_per_min * rem_mins).round().max(0.0) as u64),
-                ob.counts.cost.total_usd() + usd_per_hour * rem_hrs,
-            )
-        } else {
-            (ob.counts.total_tokens(), ob.counts.cost.total_usd())
-        };
-        BillingBlock {
-            start_utc: ob.start,
-            end_utc: ob.end,
-            last_turn_utc: ob.last,
-            is_active,
-            counts: ob.counts,
-            session_count: ob.cids.len(),
-            models: ob.models,
-            elapsed_secs,
-            remaining_secs,
-            tokens_per_min,
-            non_cached_per_min,
-            usd_per_hour,
-            projected_tokens,
-            projected_usd,
-        }
-    };
-
-    let mut cur: Option<OpenBlock<'_>> = None;
-    for t in turns {
-        let need_new = match &cur {
-            None => true,
-            Some(ob) => t.ts >= ob.end,
-        };
-        if need_new {
-            if let Some(prev) = cur.take() {
-                blocks.push(finalize(prev, now_utc));
-            }
-            cur = Some(OpenBlock {
-                start: t.ts,
-                end: t.ts + window,
-                last: t.ts,
-                counts: TokenCounts::default(),
-                cids: BTreeSet::new(),
-                models: BTreeSet::new(),
-            });
-        }
-        if let Some(ob) = &mut cur {
-            ob.last = t.ts;
-            ob.counts
-                .add_call_with_cost(t.input, t.cache_read, t.cache_write, t.output, t.cost);
-            ob.cids.insert(t.cid);
-            if !crate::stats::is_compaction_model(t.model) && t.model != "unknown" {
-                ob.models.insert(t.model.to_string());
-            }
-        }
-    }
-    if let Some(last_ob) = cur {
-        blocks.push(finalize(last_ob, now_utc));
-    }
-
-    let active = blocks.last().filter(|b| b.is_active).cloned();
-    (active, blocks)
 }
 
 pub fn fmt_countdown(secs: i64) -> String {
@@ -693,7 +519,6 @@ impl StatuslineReader {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BudgetConfig {
-    pub block_5h_usd: f64,       // 0 = disabled
     pub daily_usd: f64,          // 0 = disabled
     pub weekly_usd: f64,         // 0 = disabled
     pub warn_pct: f64,           // default 70.0
@@ -705,7 +530,6 @@ pub struct BudgetConfig {
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
-            block_5h_usd: 0.0,
             daily_usd: 0.0,
             weekly_usd: 0.0,
             warn_pct: 70.0,
@@ -718,7 +542,7 @@ impl Default for BudgetConfig {
 
 impl BudgetConfig {
     pub fn has_any_usd_budget(&self) -> bool {
-        self.block_5h_usd > 0.0 || self.daily_usd > 0.0 || self.weekly_usd > 0.0
+        self.daily_usd > 0.0 || self.weekly_usd > 0.0
     }
 
     pub fn classify_usage_pct(&self, pct: f64) -> AlertSeverity {
@@ -759,7 +583,6 @@ pub struct AlertEvent {
 
 pub fn evaluate_alerts(
     cfg: &BudgetConfig,
-    active_block: Option<&BillingBlock>,
     today_key: &str,
     today_usd: f64,
     week_key: &str,
@@ -768,32 +591,6 @@ pub fn evaluate_alerts(
     now_utc: DateTime<Utc>,
 ) -> Vec<AlertEvent> {
     let mut events = Vec::new();
-
-    if let Some(blk) = active_block {
-        if cfg.block_5h_usd > 0.0 {
-            let cur = blk.counts.cost.total_usd();
-            let pct = (cur / cfg.block_5h_usd) * 100.0;
-            let sev = cfg.classify_usage_pct(pct);
-            if sev != AlertSeverity::Normal {
-                events.push(AlertEvent {
-                    dedup_key: format!("5h:{}:{:?}", blk.block_key(), sev),
-                    severity: sev,
-                    title: if sev == AlertSeverity::Critical {
-                        "AGY 5h 窗口费用临界".into()
-                    } else {
-                        "AGY 5h 窗口费用预警".into()
-                    },
-                    message: format!(
-                        "本 5h 窗口已估算 ${:.2} / ${:.2} ({:.0}%) · 剩余 {}",
-                        cur,
-                        cfg.block_5h_usd,
-                        pct,
-                        fmt_countdown(blk.remaining_secs),
-                    ),
-                });
-            }
-        }
-    }
 
     if cfg.daily_usd > 0.0 {
         let pct = (today_usd / cfg.daily_usd) * 100.0;
@@ -939,7 +736,6 @@ impl BudgetStore {
             .clone()
             .ok_or_else(|| "未配置 budget.json 路径".to_string())?;
         let val = json!({
-            "block_5h_usd": (cfg.block_5h_usd.max(0.0) * 100.0).round() / 100.0,
             "daily_usd": (cfg.daily_usd.max(0.0) * 100.0).round() / 100.0,
             "weekly_usd": (cfg.weekly_usd.max(0.0) * 100.0).round() / 100.0,
             "warn_pct": cfg.warn_pct.clamp(1.0, 99.0),
@@ -964,9 +760,6 @@ pub fn parse_budget_json(text: &str) -> Option<BudgetConfig> {
             .and_then(Value::as_f64)
             .filter(|v| v.is_finite() && *v >= 0.0)
     };
-    if let Some(v) = get_nonneg("block_5h_usd") {
-        cfg.block_5h_usd = v;
-    }
     if let Some(v) = get_nonneg("daily_usd") {
         cfg.daily_usd = v;
     }
@@ -991,65 +784,26 @@ pub fn parse_budget_json(text: &str) -> Option<BudgetConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pricing::CostBreakdown;
-    use crate::stats::{SourceKind, TurnRecord};
 
     #[test]
-    fn test_5h_rolling_blocks_and_burn_rate() {
-        let t0 = DateTime::parse_from_rfc3339("2026-11-23T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let t1 = t0 + Duration::minutes(30);
-        let t2 = t0 + Duration::hours(6); // Starts a second 5h block!
-        let now = t2 + Duration::hours(1);
-
-        let mk_turn = |ts: DateTime<Utc>, usd: f64| TurnRecord {
-            step_index: 1,
-            timestamp_utc: Some(ts),
-            model: "gemini-4-neon-xhigh".into(),
-            is_checkpoint: false,
-            input_tokens: 100_000,
-            cache_read_tokens: 200_000,
-            cache_write_tokens: 0,
-            output_tokens: 10_000,
-            tool_names: Vec::new(),
-            thinking_chars: 0,
-            gen_secs: None,
-            cost: CostBreakdown {
-                input_usd: usd,
-                ..Default::default()
-            },
-        };
-
-        let s = SessionInfo {
-            conversation_id: "s1".into(),
-            title: "t".into(),
-            workspace: String::new(),
-            source: SourceKind::Cli,
-            is_archived: false,
-            is_subagent: false,
-            parent_id: None,
-            parent_title: String::new(),
-            turns: vec![mk_turn(t0, 1.0), mk_turn(t1, 1.5), mk_turn(t2, 2.0)],
-            counts: TokenCounts::default(),
-            models: BTreeSet::new(),
-            first_time: None,
-            last_time: None,
-        };
-
-        let (active, blocks) = compute_billing_blocks(&[s], now);
-        assert_eq!(blocks.len(), 2);
-        assert!(!blocks[0].is_active);
-        assert_eq!(blocks[0].counts.calls, 2);
-        assert!((blocks[0].counts.cost.total_usd() - 2.5).abs() < 1e-6);
-
-        let act = active.expect("second block should be active");
-        assert!(act.is_active);
-        assert_eq!(act.counts.calls, 1);
-        assert_eq!(act.elapsed_secs, 3600);
-        assert_eq!(act.remaining_secs, 4 * 3600);
-        assert!((act.usd_per_hour - 2.0).abs() < 1e-6);
-        assert!((act.projected_usd - 10.0).abs() < 1e-6);
+    fn test_budget_json_ignores_legacy_block_5h_usd() {
+        let legacy = r#"{
+            "block_5h_usd": 15.0,
+            "daily_usd": 30.0,
+            "weekly_usd": 120.0,
+            "warn_pct": 75.0,
+            "critical_pct": 95.0,
+            "quota_warn_rem_pct": 25.0,
+            "quota_crit_rem_pct": 12.0
+        }"#;
+        let cfg = parse_budget_json(legacy).expect("legacy budget.json should still parse");
+        assert!((cfg.daily_usd - 30.0).abs() < 1e-9);
+        assert!((cfg.weekly_usd - 120.0).abs() < 1e-9);
+        assert!((cfg.warn_pct - 75.0).abs() < 1e-9);
+        assert!((cfg.critical_pct - 95.0).abs() < 1e-9);
+        assert!((cfg.quota_warn_rem_pct - 25.0).abs() < 1e-9);
+        assert!((cfg.quota_crit_rem_pct - 12.0).abs() < 1e-9);
+        assert!(cfg.has_any_usd_budget());
     }
 
     #[test]
@@ -1092,7 +846,7 @@ mod tests {
             daily_usd: 10.0,
             ..Default::default()
         };
-        let alerts = evaluate_alerts(&cfg, None, "2026-11-23", 7.5, "2026-W48", 7.5, Some(&snap), now);
+        let alerts = evaluate_alerts(&cfg, "2026-11-23", 7.5, "2026-W48", 7.5, Some(&snap), now);
         assert_eq!(alerts.len(), 2);
         assert!(alerts.iter().any(|a| a.dedup_key == "day:2026-11-23:Warn"));
         assert!(alerts.iter().any(|a| a.dedup_key.starts_with("quota:claude-5h:") && a.severity == AlertSeverity::Critical));
