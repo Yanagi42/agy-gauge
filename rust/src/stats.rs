@@ -1,4 +1,4 @@
-//! Strictly read-only multi-agent incremental scanner & aggregator for `agy-gauge`.
+//! Strictly read-only multi-agent incremental scanner & aggregator for `Gauge`.
 //!
 //! Supported Tier-1 pure-text agents (via `crate::sources` adapters):
 //!   - Antigravity (`agy` CLI / 2.0 App / IDE)

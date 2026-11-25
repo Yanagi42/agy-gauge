@@ -2232,7 +2232,7 @@ impl DashboardView {
                         DateScope::Custom => "自定义范围",
                     }
                 };
-                let brand_hdr = if self.is_multi_agent() { "AGY Gauge 多端" } else { "AGY CLI " };
+                let brand_hdr = "Gauge ";
                 let text = if self.active_tab == Tab::Models {
                     let (primary, secondary) = self.ordered_models(self.model_sort);
                     let mut lines = vec![
@@ -2712,12 +2712,12 @@ impl DashboardView {
 
         // 14 DIP Concept C Braun Paper Dial brand micro-icon
         draw_brand_dial_icon(factories, rt, 20.0, h * 0.5, theme.is_dark, alert_level);
-        draw_text(rt, "AGY", &fonts.ui_brand, rect_f(31.0, 0.0, 34.0, h), theme.text);
+        draw_text(rt, "GAUGE", &fonts.ui_brand, rect_f(31.0, 0.0, 56.0, h), theme.text);
         draw_text(
             rt,
             if self.cost_mode { "/ $" } else { "/ 额" },
             &fonts.ui_small,
-            rect_f(65.0, 1.0, 27.0, h),
+            rect_f(87.0, 1.0, 27.0, h),
             theme.muted,
         );
 
@@ -2730,7 +2730,7 @@ impl DashboardView {
             (Tab::Sessions, "会话", 36.0),
             (Tab::Calls, "调用", 36.0),
         ];
-        let mut tx = 94.0;
+        let mut tx = 118.0;
         for (tab, lbl, tw) in tabs {
             let r = rect_f(tx, 0.0, tw, h);
             let act = self.active_tab == tab;
@@ -7818,7 +7818,7 @@ mod tests {
             "<已脱敏目录>"
         );
         assert_eq!(
-            redact_pricing_path(Some(Path::new(r"C:\Users\alice\agy-token-stats\pricing.json"))),
+            redact_pricing_path(Some(Path::new(r"C:\Users\alice\gauge\pricing.json"))),
             "./pricing.json"
         );
         assert_eq!(redact_pricing_path(None), "./pricing.json");

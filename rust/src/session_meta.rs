@@ -1,5 +1,5 @@
 //! Local user-curated session metadata (`session_meta.json`) stored ONLY in the application's
-//! own directory (beside `agy-token-monitor.exe`).
+//! own directory (beside `gauge.exe`).
 //!
 //! Safety & Invariants:
 //!   - NEVER reads or writes inside `~/.gemini`.

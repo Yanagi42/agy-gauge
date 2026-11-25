@@ -1,15 +1,15 @@
 [package]
-name = "agy-token-monitor"
+name = "gauge"
 version = "1.2.0"
 edition = "2021"
-description = "Ultra-lightweight strictly read-only Direct2D quota, token & system monitor for Antigravity (agy)"
+description = "Ultra-lightweight strictly read-only Direct2D token, cost & system monitor for AI coding agents"
 
 [lib]
-name = "agy_gauge"
+name = "gauge"
 path = "src/lib.rs"
 
 [[bin]]
-name = "agy-token-monitor"
+name = "gauge"
 path = "src/main.rs"
 
 [[bin]]

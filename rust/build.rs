@@ -19,7 +19,7 @@ fn main() {
     assert!(status.success(), "windres failed");
 
     println!(
-        "cargo:rustc-link-arg-bin=agy-token-monitor={}",
+        "cargo:rustc-link-arg-bin=gauge={}",
         res_obj.display()
     );
 }

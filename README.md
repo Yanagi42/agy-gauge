@@ -1,10 +1,10 @@
-# agy-gauge
+# Gauge
 
 一个**严格只读、极轻量、零联网**的多 Agent 本地 Token 用量、API 费用估算（USD）、官方 `/statusline` 配额桥接与系统负载仪表盘（Windows），原生聚合 **Antigravity（`agy` CLI / App / IDE）+ Claude Code + OpenAI Codex CLI + Gemini CLI**：
 
-- **Rust + Direct2D 桌面悬浮版**（`agy-token-monitor.exe`）：右下角逐像素抗锯齿毛玻璃胶囊 + Windows 系统托盘常驻 + 即时详情面板（进程内复用增量扫描缓存与 90 秒系统负载历史），默认自动发现本机已安装的全部 Tier-1 纯文本 Agent。
+- **Rust + Direct2D 桌面悬浮版**（`gauge.exe`）：右下角逐像素抗锯齿毛玻璃胶囊 + Windows 系统托盘常驻 + 即时详情面板（进程内复用增量扫描缓存与 90 秒系统负载历史），默认自动发现本机已安装的全部 Tier-1 纯文本 Agent。
 - **Rust 原生 `/statusline` 桥接器**（`agy-statusline.exe` / `agy-statusline.cmd`）：遵循 Antigravity 官方 `statusLine` 命令协议（仅扫描 Antigravity 目录以保持启动与渲染耗时 < 10ms），在终端底部显示紧凑状态栏的同时，把脱敏后的 Antigravity 官方剩余配额与重置倒计时同步给桌面版与 CLI。
-- **Python 零依赖命令行版**（`agy_token_stats.py`）：100% 严格只读（单元测试通过 AST 静态约束验证，零文件写操作、零 `sqlite3`、零网络模块），支持多 Agent 聚合与过滤、表格 / 单行摘要 / JSON / CSV 统计、来源分布与预算退出码检查。
+- **Python 零依赖命令行版**（`gauge_stats.py` / `gauge-cli.cmd`）：100% 严格只读（单元测试通过 AST 静态约束验证，零文件写操作、零 `sqlite3`、零网络模块），支持多 Agent 聚合与过滤、表格 / 单行摘要 / JSON / CSV 统计、来源分布与预算退出码检查。
 
 ## 桌面版特性
 
@@ -28,7 +28,7 @@
 - **系统托盘、托盘悬停模式、全屏自动隐藏与开机自启**：
   - 常驻 Windows 系统托盘（左键切换详情面板，右键打开统一菜单与最近 CLI 会话快捷恢复，Explorer 重启自动恢复图标），悬停显示今日全源用量与官方配额摘要。
   - **托盘悬停模式（右键菜单勾选或 `--tray-hover`）**：胶囊不再常占屏幕空间；开启时自动将托盘图标固定展示在任务栏右下角（写入当前用户 `HKCU\Control Panel\NotifyIconSettings` 的 `IsPromoted=1`），切换回常驻悬浮胶囊时自动收回到 `^` 折叠区（`IsPromoted=0`）；鼠标悬停即在任务栏上方浮出实时毛玻璃胶囊。
-  - 支持「隐藏悬浮胶囊」仅保留托盘后台监控、「全屏应用自动隐藏胶囊」（`SHQueryUserNotificationState`）以及免提权开机自启（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgyGauge`）。
+  - 支持「隐藏悬浮胶囊」仅保留托盘后台监控、「全屏应用自动隐藏胶囊」（`SHQueryUserNotificationState`）以及免提权开机自启（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Gauge`；用户偏好存放在 `HKCU\Software\Gauge` 并自动迁移旧版 `Software\AgyTokenMonitor`）。
 - **全局 `Tok | $` 费用视图切换（快捷键 `D`）**：
   - 内置覆盖 Antigravity / Claude（支持 1h 缓存写 `2.0×` 计费）/ OpenAI Codex（`gpt-5.*`、`gpt-5-codex`、`codex-mini`、`gpt-4.1*`）/ Gemini 2.0+ 模型单价，支持在「模型 → 单价表」在线编辑并热写程序目录 `pricing.json`（精确模型名优先于前缀匹配）。
   - 费用模式下，趋势柱图、按天/按周/按月与逐轮剖析全部按美元拆解堆叠（缓存读 / 新输入 / 输出），实时计算**缓存命中已省美元金额**与周环比变化。
@@ -68,7 +68,7 @@
 
 ## 自定义单价、预算与会话元数据（仅位于程序同目录）
 
-以下 JSON 文件均仅读写于 `agy-token-monitor.exe` 同目录，**绝不写入 `~/.gemini`、`~/.claude` 或 `~/.codex`**：
+以下 JSON 文件均仅读写于 `gauge.exe` 同目录，**绝不写入 `~/.gemini`、`~/.claude` 或 `~/.codex`**：
 
 - `pricing.json`：自定义模型单价热覆盖（可在「模型 → 单价表」在线编辑，单位 USD / 1M tokens）：
   ```json
@@ -110,7 +110,7 @@
 cd rust
 cargo test --all-targets
 cargo build --release
-copy target\release\agy-token-monitor.exe ..\agy-token-monitor.exe
+copy target\release\gauge.exe ..\gauge.exe
 copy target\release\agy-statusline.exe ..\agy-statusline.exe
 ```
 
@@ -118,31 +118,31 @@ copy target\release\agy-statusline.exe ..\agy-statusline.exe
 
 ```powershell
 # 启动桌面悬浮胶囊与系统托盘（默认自动发现 Antigravity + Claude Code + Codex CLI + Gemini CLI）
-.\agy-widget.cmd
+.\gauge.exe
 
 # 过滤来源：仅监控 Antigravity / 仅监控指定 Agent 组合 / 兼容指定单个数据目录
-.\agy-widget.cmd --agy-only
-.\agy-widget.cmd --agents claude,codex
-.\agy-widget.cmd --data-dir "$env:USERPROFILE\.gemini\antigravity-cli"
+.\gauge.exe --agy-only
+.\gauge.exe --agents claude,codex
+.\gauge.exe --data-dir "$env:USERPROFILE\.gemini\antigravity-cli"
 
 # 常用显示参数：托盘悬停模式 / 极简角标 / 浅色纸感 / 费用视图 / 脱敏模式 / 禁用本地归档 / 指定副屏 / 指定单价表
-.\agy-widget.cmd --tray-hover
-.\agy-widget.cmd --mini --light --cost --redact
-.\agy-widget.cmd --no-archive --monitor 1 --pricing .\pricing.json
+.\gauge.exe --tray-hover
+.\gauge.exe --mini --light --cost --redact
+.\gauge.exe --no-archive --monitor 1 --pricing .\pricing.json
 
 # 生成 Antigravity CLI 官方 /statusline 配置片段
 .\agy-statusline.cmd --print-config
 
-# Python 零依赖命令行版（严格只读，默认自动发现全部 Tier-1 Agent）
-python agy_token_stats.py --today --human
-python agy_token_stats.py --view sources --human
-python agy_token_stats.py --agy-only --today --human
-python agy_token_stats.py --agent claude,codex --days 7 --human
-python agy_token_stats.py --compact
-python agy_token_stats.py --view tools --days 7
-python agy_token_stats.py --view weekly --sort cost --human
-python agy_token_stats.py --view all --redact
-python agy_token_stats.py --format json --redact
+# Python 零依赖命令行版（严格只读，默认自动发现全部 Tier-1 Agent；也可直接用 .\gauge-cli.cmd）
+python gauge_stats.py --today --human
+python gauge_stats.py --view sources --human
+python gauge_stats.py --agy-only --today --human
+python gauge_stats.py --agent claude,codex --days 7 --human
+python gauge_stats.py --compact
+python gauge_stats.py --view tools --days 7
+python gauge_stats.py --view weekly --sort cost --human
+python gauge_stats.py --view all --redact
+python gauge_stats.py --format json --redact
 # 脚本化全源预算检查（退出码：0 正常 / 10 预警 / 20 临界）
-python agy_token_stats.py --budget-daily 30 --budget-weekly 150 --check-budget
+python gauge_stats.py --budget-daily 30 --budget-weekly 150 --check-budget
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly read-only multi-agent token usage analyzer for agy-gauge.
+"""Strictly read-only multi-agent token usage analyzer for Gauge.
 
 Reads only whitelisted plain-text local transcript and metadata files:
   - Antigravity (~/.gemini/antigravity{,-cli,-ide}):
@@ -3694,7 +3694,7 @@ def render_text(
     out: list[str] = []
 
     hdr_tag = "Read-Only, Redacted" if redact else "Read-Only"
-    header = _style(f"Antigravity (agy-gauge) Quota & Token Usage [{hdr_tag}]", "1;36", color)
+    header = _style(f"Gauge Quota & Token Usage [{hdr_tag}]", "1;36", color)
     out.append(header)
     dirs_list = report.data_dirs or [report.data_dir]
     data_dir_disp = ", ".join(_redact_data_dir(d) if redact else str(d) for d in dirs_list)
@@ -4359,17 +4359,17 @@ def render_pricing_table(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="agy_token_stats.py",
-        description="Strictly read-only multi-agent token usage analyzer (Antigravity, Claude Code, Codex CLI, Gemini CLI).",
+        prog="gauge_stats.py",
+        description="Gauge — strictly read-only multi-agent token usage analyzer (Antigravity, Claude Code, Codex CLI, Gemini CLI).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python agy_token_stats.py                        # Auto-discover all installed Tier-1 agents\n"
-            "  python agy_token_stats.py --today --human        # Only today's usage in K/M format\n"
-            "  python agy_token_stats.py --agy-only             # Antigravity (CLI/App/IDE) sources only\n"
-            "  python agy_token_stats.py --agents claude,codex  # Specific agent families only\n"
-            "  python agy_token_stats.py --view sources         # Breakdown by agent source\n"
-            "  python agy_token_stats.py --format json          # Export structured JSON to stdout\n"
+            "  python gauge_stats.py                        # Auto-discover all installed Tier-1 agents\n"
+            "  python gauge_stats.py --today --human        # Only today's usage in K/M format\n"
+            "  python gauge_stats.py --agy-only             # Antigravity (CLI/App/IDE) sources only\n"
+            "  python gauge_stats.py --agents claude,codex  # Specific agent families only\n"
+            "  python gauge_stats.py --view sources         # Breakdown by agent source\n"
+            "  python gauge_stats.py --format json          # Export structured JSON to stdout\n"
         ),
     )
     parser.add_argument(

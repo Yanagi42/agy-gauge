@@ -4,7 +4,7 @@
 //!   - Receives official session/quota JSON directly from `agy` over `stdin`
 //!     (per https://antigravity.google/docs/cli/statusline).
 //!   - Atomically saves a PII-stripped snapshot (`statusline_state.json`) ONLY inside
-//!     this executable's own directory so `agy-token-monitor.exe` and `agy_token_stats.py`
+//!     this executable's own directory so `gauge.exe` and `gauge_stats.py`
 //!     can display official remaining quotas & reset countdowns.
 //!   - Strictly read-only on `~/.gemini`; zero network requests; zero SQLite access.
 
@@ -13,12 +13,12 @@ use std::path::PathBuf;
 
 use chrono::{Local, Utc};
 
-use agy_gauge::pricing::{fmt_cost_compact, PricingCatalog};
-use agy_gauge::quota::{
+use gauge::pricing::{fmt_cost_compact, PricingCatalog};
+use gauge::quota::{
     fmt_countdown, parse_statusline_payload, save_statusline_state, BudgetStore,
     StatuslineSnapshot,
 };
-use agy_gauge::stats::{fmt_compact, IncrementalScanner};
+use gauge::stats::{fmt_compact, IncrementalScanner};
 
 fn print_config_snippet() {
     let exe_str = std::env::current_exe()
@@ -143,7 +143,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "agy-statusline — Official Antigravity CLI /statusline bridge for agy-gauge\n\
+                    "agy-statusline — Official Antigravity CLI /statusline bridge for Gauge\n\
                      \n\
                      Usage:\n\
                        agy-statusline.exe [--compact] [--no-color] [--state <path>] [--no-scan]\n\
@@ -177,9 +177,9 @@ fn main() {
         None
     };
 
-    let target_state = state_path.or_else(agy_gauge::quota::StatuslineReader::default_path);
+    let target_state = state_path.or_else(gauge::quota::StatuslineReader::default_path);
     if let (Some(path), Some(snap)) = (target_state.as_deref(), parsed_snap.as_ref()) {
-        // Persist sanitized official quota state for agy-token-monitor.exe & agy_token_stats.py.
+        // Persist sanitized official quota state for gauge.exe & gauge_stats.py.
         let _ = save_statusline_state(path, snap);
     }
 

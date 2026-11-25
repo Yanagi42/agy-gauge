@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for agy_token_stats.py using isolated temporary fixtures."""
+"""Unit tests for gauge_stats.py using isolated temporary fixtures."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-import agy_token_stats as mod
+import gauge_stats as mod
 
 
-class AgyTokenStatsTests(unittest.TestCase):
+class GaugeStatsTests(unittest.TestCase):
     def _create_fixture(self, root: pathlib.Path) -> None:
         # Session 1: normal multi-turn session with duplicate step_index and a partial trailing line
         s1_logs = root / "brain" / "11111111-aaaa-bbbb-cccc-000000000001" / ".system_generated" / "logs"
@@ -1881,7 +1881,7 @@ class AgyTokenStatsTests(unittest.TestCase):
             "replace_file",
         }
 
-        for filename in ("agy_token_stats.py",):
+        for filename in ("gauge_stats.py",):
             src = (base_dir / filename).read_text(encoding="utf-8")
             tree = ast.parse(src, filename=filename)
             for node in ast.walk(tree):

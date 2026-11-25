@@ -15,7 +15,7 @@ mod dashboard;
 mod pill;
 mod telemetry;
 
-pub use agy_gauge::{archive, launcher, pricing, quota, session_meta, stats};
+pub use gauge::{archive, launcher, pricing, quota, session_meta, stats};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -908,7 +908,7 @@ impl Drop for AppIcons {
 
 fn broadcast_meta_sync(exclude: HWND) {
     unsafe {
-        for cls in [w!("AgyTokenPillClass"), w!("AgyTokenDashboardClass")] {
+        for cls in [w!("GaugePillClass"), w!("GaugeDashboardClass")] {
             if let Ok(target) = FindWindowW(cls, None) {
                 if !target.0.is_null() && target != exclude {
                     let _ = PostMessageW(target, WM_APP_SYNC_META, WPARAM(0), LPARAM(0));
@@ -1072,7 +1072,7 @@ fn toggle_dashboard_safe() {
         return;
     }
     unsafe {
-        if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
+        if let Ok(existing) = FindWindowW(w!("GaugeDashboardClass"), None) {
             if !existing.0.is_null() && IsWindowVisible(existing).as_bool() && !IsIconic(existing).as_bool() {
                 let _ = PostMessageW(existing, WM_CLOSE, WPARAM(0), LPARAM(0));
                 return;
@@ -1124,7 +1124,7 @@ fn open_or_focus_dashboard_safe() {
     }
 
     unsafe {
-        if let Ok(existing) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
+        if let Ok(existing) = FindWindowW(w!("GaugeDashboardClass"), None) {
             if !existing.0.is_null() {
                 let _ = ShowWindow(existing, SW_RESTORE);
                 let _ = SetForegroundWindow(existing);
@@ -1166,7 +1166,7 @@ fn create_dashboard_window_local() {
         let owner_hwnd = with_app(|app| app.dash_owner_hwnd).flatten().or_else(|| {
             let h = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
-                w!("AgyTokenOwnerClass"),
+                w!("GaugeOwnerClass"),
                 w!(""),
                 WS_POPUP,
                 0,
@@ -1187,8 +1187,8 @@ fn create_dashboard_window_local() {
 
         if let Ok(hwnd) = CreateWindowExW(
             Default::default(),
-            w!("AgyTokenDashboardClass"),
-            w!("AGY 用量统计"),
+            w!("GaugeDashboardClass"),
+            w!("Gauge"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             wx,
             wy,
@@ -1290,7 +1290,7 @@ fn destroy_dashboard_safe() {
         }
     } else if !dash_only {
         unsafe {
-            if let Ok(ext) = FindWindowW(w!("AgyTokenDashboardClass"), None) {
+            if let Ok(ext) = FindWindowW(w!("GaugeDashboardClass"), None) {
                 if !ext.0.is_null() {
                     let _ = PostMessageW(ext, WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
@@ -1661,7 +1661,7 @@ impl AppState {
             .copied()
             .unwrap_or_default();
         let mut tip = format!(
-            "AGY Gauge · 今日 {} ({})",
+            "Gauge · 今日 {} ({})",
             stats::fmt_compact(tc.total_tokens()),
             pricing::fmt_cost_compact(&tc.cost, tc.calls),
         );
@@ -1905,7 +1905,7 @@ impl AppState {
                 self.notify_banner("脱敏模式已拦截，按 P 关闭后重试", true);
             } else if self.notifications_enabled {
                 if let Some(tray) = &self.tray {
-                    tray.show_balloon("AGY Gauge", "脱敏模式已拦截，请先关闭脱敏模式", false, true);
+                    tray.show_balloon("Gauge", "脱敏模式已拦截，请先关闭脱敏模式", false, true);
                 }
             }
             return false;
@@ -1935,14 +1935,14 @@ impl AppState {
                         self.notify_banner(msg, false);
                     } else if self.notifications_enabled {
                         if let Some(tray) = &self.tray {
-                            tray.show_balloon("AGY Gauge", &msg, false, false);
+                            tray.show_balloon("Gauge", &msg, false, false);
                         }
                     }
                     // Auto-hide dashboard on launch; also emit quiet balloon if enabled so user sees fallback notice.
                     if from_dashboard && self.notifications_enabled {
                         if let Some(tray) = &self.tray {
                             tray.show_balloon(
-                                "AGY Gauge",
+                                "Gauge",
                                 "原工作区目录不存在，已在用户主目录恢复会话",
                                 false,
                                 false,
@@ -1971,7 +1971,7 @@ impl AppState {
                                 self.notify_banner(msg, true);
                             } else if self.notifications_enabled {
                                 if let Some(tray) = &self.tray {
-                                    tray.show_balloon("AGY Gauge", &msg, false, true);
+                                    tray.show_balloon("Gauge", &msg, false, true);
                                 }
                             }
                             return false;
@@ -1982,7 +1982,7 @@ impl AppState {
                     self.notify_banner(err, true);
                 } else if self.notifications_enabled {
                     if let Some(tray) = &self.tray {
-                        tray.show_balloon("AGY Gauge", &err, false, true);
+                        tray.show_balloon("Gauge", &err, false, true);
                     }
                 }
                 false
@@ -2483,25 +2483,25 @@ fn show_export_menu_safe(hwnd: HWND) {
     let today_str = Local::now().date_naive().format("%Y%m%d").to_string();
     let (default_name, filter_lbl, filter_pat, ext) = match cmd {
         CMD_EXPORT_JSON => (
-            format!("agy-usage-{today_str}.json"),
+            format!("gauge-usage-{today_str}.json"),
             "JSON 文件 (*.json)",
             "*.json",
             "json",
         ),
         CMD_EXPORT_SESSIONS_CSV => (
-            format!("agy-sessions-{today_str}.csv"),
+            format!("gauge-sessions-{today_str}.csv"),
             "CSV 文件 (*.csv)",
             "*.csv",
             "csv",
         ),
         CMD_EXPORT_DAILY_CSV => (
-            format!("agy-daily-{today_str}.csv"),
+            format!("gauge-daily-{today_str}.csv"),
             "CSV 文件 (*.csv)",
             "*.csv",
             "csv",
         ),
         CMD_EXPORT_CALLS_CSV => (
-            format!("agy-calls-{today_str}.csv"),
+            format!("gauge-calls-{today_str}.csv"),
             "CSV 文件 (*.csv)",
             "*.csv",
             "csv",
@@ -2813,7 +2813,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
         let autostart = is_autostart_enabled();
         let dash_open = local_vis
             || unsafe {
-                FindWindowW(w!("AgyTokenDashboardClass"), None)
+                FindWindowW(w!("GaugeDashboardClass"), None)
                     .map(|h| !h.0.is_null() && IsWindowVisible(h).as_bool())
                     .unwrap_or(false)
             };
@@ -4154,7 +4154,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             hIcon: icon_big,
             hIconSm: icon_sm,
             hCursor: arrow,
-            lpszClassName: w!("AgyTokenPillClass"),
+            lpszClassName: w!("GaugePillClass"),
             ..Default::default()
         };
         RegisterClassExW(&pill_cls);
@@ -4171,7 +4171,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(owner_wndproc),
             hInstance: hinst.into(),
-            lpszClassName: w!("AgyTokenOwnerClass"),
+            lpszClassName: w!("GaugeOwnerClass"),
             ..Default::default()
         };
         RegisterClassExW(&owner_cls);
@@ -4184,7 +4184,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             hIcon: icon_big,
             hIconSm: icon_sm,
             hCursor: arrow,
-            lpszClassName: w!("AgyTokenDashboardClass"),
+            lpszClassName: w!("GaugeDashboardClass"),
             ..Default::default()
         };
         RegisterClassExW(&dash_cls);
@@ -4199,8 +4199,8 @@ fn run_app(opts: CliOpts) -> Result<()> {
         } else {
             CreateWindowExW(
                 pill_ex,
-                w!("AgyTokenPillClass"),
-                w!("AGY Token Pill"),
+                w!("GaugePillClass"),
+                w!("Gauge Pill"),
                 WS_POPUP,
                 0,
                 0,
@@ -4215,7 +4215,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
 
         let taskbar_created_msg = register_taskbar_created_msg();
         let tray = if !opts.dashboard_only && !opts.self_test && !pill_hwnd.0.is_null() {
-            let init_tip = if prefs.tray_hover_mode { "" } else { "AGY Gauge · 初始化中" };
+            let init_tip = if prefs.tray_hover_mode { "" } else { "Gauge · 初始化中" };
             Some(TrayIcon::new(pill_hwnd, icons.tray_normal, init_tip))
         } else {
             None

@@ -600,9 +600,9 @@ pub fn evaluate_alerts(
                 dedup_key: format!("day:{}:{:?}", today_key, sev),
                 severity: sev,
                 title: if sev == AlertSeverity::Critical {
-                    "AGY 今日预算临界".into()
+                    "Gauge 今日预算临界".into()
                 } else {
-                    "AGY 今日预算预警".into()
+                    "Gauge 今日预算预警".into()
                 },
                 message: format!(
                     "今日估算费用已达 ${:.2} / ${:.2} ({:.0}%)",
@@ -620,9 +620,9 @@ pub fn evaluate_alerts(
                 dedup_key: format!("week:{}:{:?}", week_key, sev),
                 severity: sev,
                 title: if sev == AlertSeverity::Critical {
-                    "AGY 本周预算临界".into()
+                    "Gauge 本周预算临界".into()
                 } else {
-                    "AGY 本周预算预警".into()
+                    "Gauge 本周预算预警".into()
                 },
                 message: format!(
                     "{} 估算费用已达 ${:.2} / ${:.2} ({:.0}%)",

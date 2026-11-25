@@ -129,15 +129,28 @@ impl Default for UserPrefs {
     }
 }
 
-const REG_SUBKEY: PCWSTR = w!("Software\\AgyTokenMonitor");
+const REG_SUBKEY: PCWSTR = w!("Software\\Gauge");
+const LEGACY_REG_SUBKEY: PCWSTR = w!("Software\\AgyTokenMonitor");
 
-fn reg_read_u32(name: PCWSTR) -> Option<u32> {
+fn reg_subkey_exists(subkey: PCWSTR) -> bool {
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey).is_ok() {
+            let _ = RegCloseKey(hkey);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn reg_read_u32_from(subkey: PCWSTR, name: PCWSTR) -> Option<u32> {
     unsafe {
         let mut val: u32 = 0;
         let mut sz: u32 = size_of::<u32>() as u32;
         let status = RegGetValueW(
             HKEY_CURRENT_USER,
-            REG_SUBKEY,
+            subkey,
             name,
             RRF_RT_REG_DWORD,
             None,
@@ -152,66 +165,81 @@ fn reg_read_u32(name: PCWSTR) -> Option<u32> {
     }
 }
 
-pub fn load_user_prefs() -> UserPrefs {
+fn load_user_prefs_from(subkey: PCWSTR) -> UserPrefs {
     let mut p = UserPrefs::default();
-    if let Some(v) = reg_read_u32(w!("light_theme")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("light_theme")) {
         p.light_theme = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("mini")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("mini")) {
         p.mini = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("topmost")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("topmost")) {
         p.topmost = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("human")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("human")) {
         p.human = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("cost_mode")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("cost_mode")) {
         p.cost_mode = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("group_subagents")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("group_subagents")) {
         p.group_subagents = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("privacy_mode")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("privacy_mode")) {
         p.privacy_mode = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("pill_visible")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("pill_visible")) {
         p.pill_visible = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("tray_hover_mode")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("tray_hover_mode")) {
         p.tray_hover_mode = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("notifications_enabled")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("notifications_enabled")) {
         p.notifications_enabled = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("hide_on_fullscreen")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("hide_on_fullscreen")) {
         p.hide_on_fullscreen = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("monitor_index")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("monitor_index")) {
         p.monitor_index = v as usize;
     }
-    if let Some(v) = reg_read_u32(w!("fresh_only")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("fresh_only")) {
         p.fresh_only = v != 0;
     }
-    if let Some(v) = reg_read_u32(w!("date_scope")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("date_scope")) {
         p.date_scope = v.min(4) as u8;
     }
-    if let Some(v) = reg_read_u32(w!("pill_metric")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("pill_metric")) {
         p.pill_metric = v.min(2) as u8;
     }
-    if let Some(v) = reg_read_u32(w!("pill_items")) {
+    if let Some(v) = reg_read_u32_from(subkey, w!("pill_items")) {
         let masked = v & PILL_ITEMS_ALL_MASK;
         p.pill_items = if masked != 0 { masked } else { PILL_ITEMS_DEFAULT };
     } else {
         p.pill_items = migrate_legacy_pill_items(p.mini, p.pill_metric);
     }
     p.mini = (p.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
-    if reg_read_u32(w!("has_custom_pos")).unwrap_or(0) != 0 {
-        if let (Some(x), Some(y)) = (reg_read_u32(w!("pos_x")), reg_read_u32(w!("pos_y"))) {
+    if reg_read_u32_from(subkey, w!("has_custom_pos")).unwrap_or(0) != 0 {
+        if let (Some(x), Some(y)) = (
+            reg_read_u32_from(subkey, w!("pos_x")),
+            reg_read_u32_from(subkey, w!("pos_y")),
+        ) {
             p.custom_pos = Some((x as i32, y as i32));
         }
     }
     p
+}
+
+pub fn load_user_prefs() -> UserPrefs {
+    if reg_subkey_exists(REG_SUBKEY) {
+        return load_user_prefs_from(REG_SUBKEY);
+    }
+    if reg_subkey_exists(LEGACY_REG_SUBKEY) {
+        let p = load_user_prefs_from(LEGACY_REG_SUBKEY);
+        save_user_prefs(&p);
+        return p;
+    }
+    UserPrefs::default()
 }
 
 pub fn save_user_prefs(p: &UserPrefs) {
@@ -555,7 +583,7 @@ pub fn is_cursor_in_tray_hover_zone(
 /// Notify peer windows (pill <-> independent dashboard) to reload saved preferences immediately.
 pub fn broadcast_prefs_sync(exclude: HWND) {
     unsafe {
-        for cls in [w!("AgyTokenPillClass"), w!("AgyTokenDashboardClass")] {
+        for cls in [w!("GaugePillClass"), w!("GaugeDashboardClass")] {
             if let Ok(target) = FindWindowW(cls, None) {
                 if !target.0.is_null() && target != exclude {
                     let _ = PostMessageW(
@@ -599,7 +627,7 @@ pub struct SingleInstanceGuard {
 impl SingleInstanceGuard {
     pub fn acquire() -> Option<Self> {
         unsafe {
-            let handle = CreateMutexW(None, false, w!("Local\\AgyTokenMonitorRustV1")).ok()?;
+            let handle = CreateMutexW(None, false, w!("Local\\GaugeRustV1")).ok()?;
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(handle);
                 return None;
@@ -975,7 +1003,8 @@ pub fn wide_pcwstr(buf: &[u16]) -> PCWSTR {
 // ---------- Windows System Tray, Balloon Alerts, Autostart, Fullscreen & File Dialog ----------
 
 const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const AUTOSTART_NAME: PCWSTR = w!("AgyGauge");
+const AUTOSTART_NAME: PCWSTR = w!("Gauge");
+const LEGACY_AUTOSTART_NAME: PCWSTR = w!("AgyGauge");
 
 pub fn is_autostart_enabled() -> bool {
     unsafe {
@@ -1005,12 +1034,18 @@ pub fn set_autostart_enabled(enable: bool) -> bool {
                 let cmd = format!("\"{}\"", exe.display());
                 let wide = to_wide_null(&cmd);
                 let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
-                RegSetValueExW(hkey, AUTOSTART_NAME, 0, REG_SZ, Some(bytes)).is_ok()
+                let written = RegSetValueExW(hkey, AUTOSTART_NAME, 0, REG_SZ, Some(bytes)).is_ok();
+                if written {
+                    let _ = RegDeleteValueW(hkey, LEGACY_AUTOSTART_NAME);
+                }
+                written
             } else {
                 false
             }
         } else {
-            RegDeleteValueW(hkey, AUTOSTART_NAME).is_ok()
+            let removed_new = RegDeleteValueW(hkey, AUTOSTART_NAME).is_ok();
+            let removed_old = RegDeleteValueW(hkey, LEGACY_AUTOSTART_NAME).is_ok();
+            removed_new || removed_old
         };
         let _ = RegCloseKey(hkey);
         ok
@@ -1871,8 +1906,8 @@ mod tests {
         assert!(!is_cursor_in_tray_hover_zone((2296, 1200), icon_mid, pos, 240, 50, 10)); // far above pill
 
         assert_eq!(
-            normalize_exe_path_for_compare(r#"\\?\C:/Users/Qingz/agy-token-monitor.exe"#),
-            r"c:\users\qingz\agy-token-monitor.exe"
+            normalize_exe_path_for_compare(r#"\\?\C:/Users/Qingz/gauge.exe"#),
+            r"c:\users\qingz\gauge.exe"
         );
         assert_eq!(desired_tray_promoted_write(None, true), Some(1));
         assert_eq!(desired_tray_promoted_write(Some(0), true), Some(1));
