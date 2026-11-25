@@ -30,6 +30,7 @@ struct CachedTranscript {
     first_user_preview: String,
     subagent_parent_id: Option<String>,
     subagent_preview: String,
+    is_swarm_subagent: bool,
     last_step_running: bool,
     skipped_lines: usize,
 }
@@ -231,7 +232,7 @@ impl SourceAdapter for AntigravityAdapter {
             let is_subagent = match meta {
                 Some(m) if m.is_internal => true,
                 Some(_) => false,
-                None => cached.subagent_parent_id.is_some(),
+                None => cached.subagent_parent_id.is_some() || cached.is_swarm_subagent,
             };
             let parent_id = if is_subagent {
                 cached.subagent_parent_id.clone().filter(|p| p != &cid)
@@ -290,6 +291,8 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
     let mut first_user_preview = String::new();
     let mut subagent_parent_id: Option<String> = None;
     let mut subagent_preview = String::new();
+    let mut is_swarm_subagent = false;
+    let mut subagent_meta_is_swarm_ping = false;
     let mut last_step_running = false;
     let mut skipped_lines = 0usize;
     let mut generic_ts: HashMap<i64, DateTime<Utc>> = HashMap::new();
@@ -312,10 +315,11 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
             last_step_running = running;
         }
         let need_preview = !seen_user_input && trimmed.contains("USER_INPUT");
-        let need_subagent_meta = !seen_user_input
-            && subagent_parent_id.is_none()
-            && subagent_preview.is_empty()
-            && trimmed.contains("SYSTEM_MESSAGE");
+        let want_subagent_meta = !seen_user_input
+            && by_step.is_empty()
+            && ((subagent_parent_id.is_none() && subagent_preview.is_empty())
+                || subagent_meta_is_swarm_ping);
+        let need_subagent_meta = want_subagent_meta && trimmed.contains("SYSTEM_MESSAGE");
         if trimmed.starts_with('{')
             && trimmed.ends_with('}')
             && !need_preview
@@ -337,15 +341,31 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
                     first_user_preview = extract_user_preview(content);
                 }
             }
-        } else if !seen_user_input
-            && subagent_parent_id.is_none()
-            && subagent_preview.is_empty()
-            && step_type == "SYSTEM_MESSAGE"
-        {
+        } else if want_subagent_meta && step_type == "SYSTEM_MESSAGE" {
             if let Some(content) = map.get("content").and_then(Value::as_str) {
-                let (pid, prev) = extract_subagent_meta(content);
-                subagent_parent_id = pid;
-                subagent_preview = prev;
+                let meta = extract_subagent_meta(content);
+                if meta.is_swarm {
+                    is_swarm_subagent = true;
+                }
+                if subagent_meta_is_swarm_ping {
+                    if meta.is_swarm_ping {
+                        if subagent_parent_id.is_none() && meta.parent_id.is_some() {
+                            subagent_parent_id = meta.parent_id;
+                        }
+                    } else {
+                        if meta.parent_id.is_some() {
+                            subagent_parent_id = meta.parent_id;
+                        }
+                        if !meta.preview.is_empty() {
+                            subagent_preview = meta.preview;
+                        }
+                        subagent_meta_is_swarm_ping = false;
+                    }
+                } else {
+                    subagent_parent_id = meta.parent_id;
+                    subagent_preview = meta.preview;
+                    subagent_meta_is_swarm_ping = meta.is_swarm_ping;
+                }
             }
         }
 
@@ -455,6 +475,7 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
     if seen_user_input {
         subagent_parent_id = None;
         subagent_preview.clear();
+        is_swarm_subagent = false;
     }
 
     Some(CachedTranscript {
@@ -463,6 +484,7 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
         first_user_preview,
         subagent_parent_id,
         subagent_preview,
+        is_swarm_subagent,
         last_step_running,
         skipped_lines,
     })
@@ -535,7 +557,24 @@ fn estimate_gen_secs(t: &TurnRecord, generic_ts: &HashMap<i64, DateTime<Utc>>) -
     (0..=3600).contains(&secs).then_some(secs as u32)
 }
 
-fn extract_subagent_meta(content: &str) -> (Option<String>, String) {
+struct SubagentMeta {
+    parent_id: Option<String>,
+    preview: String,
+    is_swarm: bool,
+    is_swarm_ping: bool,
+}
+
+fn extract_swarm_role(header_line: &str) -> Option<&str> {
+    let pos = header_line.find(" for @")?;
+    let rest = &header_line[pos + " for ".len()..];
+    let end = rest
+        .find(|c: char| matches!(c, ')' | ':' | ',') || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let role = &rest[..end];
+    (role.len() > 1).then_some(role)
+}
+
+fn extract_subagent_meta(content: &str) -> SubagentMeta {
     let mut parent_id = None;
     if let Some(pos) = content.find("sender=") {
         let rest = &content[pos + "sender=".len()..];
@@ -545,21 +584,71 @@ fn extract_subagent_meta(content: &str) -> (Option<String>, String) {
         }
     }
     let mut preview = String::new();
+    let mut is_swarm = false;
+    let mut is_swarm_ping = false;
     if let Some(pos) = content.find("content=") {
         let body = &content[pos + "content=".len()..];
-        for line in body.lines() {
-            let trimmed = line.trim().trim_start_matches('#').trim();
+        let mut lines: Vec<&str> = Vec::new();
+        for raw_line in body.lines() {
+            let mut trimmed = raw_line.trim();
             if trimmed.is_empty() || trimmed.starts_with("</SYSTEM_MESSAGE>") {
                 continue;
             }
-            let cleaned_md = trimmed.replace("**", "").replace('`', "");
-            preview = clean_single_line(&cleaned_md, 72);
-            if !preview.is_empty() {
-                break;
+            if let Some(stripped) = trimmed.strip_suffix("</SYSTEM_MESSAGE>") {
+                trimmed = stripped.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+            }
+            lines.push(trimmed);
+        }
+        if let Some(&first_raw) = lines.first() {
+            if first_raw.starts_with("[swarm] new board message") {
+                is_swarm = true;
+                is_swarm_ping = true;
+                preview = clean_single_line(first_raw, 72);
+            } else if first_raw.starts_with("You have just started. Your assignment") {
+                is_swarm = true;
+                let role = extract_swarm_role(first_raw);
+                let mut brief = String::new();
+                for candidate in lines.iter().skip(1) {
+                    let cleaned = candidate
+                        .trim_start_matches('#')
+                        .trim()
+                        .replace("**", "")
+                        .replace('`', "");
+                    if !cleaned.is_empty() {
+                        brief = cleaned;
+                        break;
+                    }
+                }
+                preview = match (role, brief.is_empty()) {
+                    (Some(r), false) => clean_single_line(&format!("{r} · {brief}"), 72),
+                    (Some(r), true) => clean_single_line(r, 72),
+                    (None, false) => clean_single_line(&brief, 72),
+                    (None, true) => clean_single_line(first_raw, 72),
+                };
+            } else {
+                for candidate in lines {
+                    let cleaned_md = candidate
+                        .trim_start_matches('#')
+                        .trim()
+                        .replace("**", "")
+                        .replace('`', "");
+                    preview = clean_single_line(&cleaned_md, 72);
+                    if !preview.is_empty() {
+                        break;
+                    }
+                }
             }
         }
     }
-    (parent_id, preview)
+    SubagentMeta {
+        parent_id,
+        preview,
+        is_swarm,
+        is_swarm_ping,
+    }
 }
 
 fn extract_user_preview(content: &str) -> String {

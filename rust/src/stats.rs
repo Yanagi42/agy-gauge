@@ -1759,6 +1759,139 @@ mod tests {
     }
 
     #[test]
+    fn test_swarm_worker_board_ping_upgrades_to_step1_assignment_without_meta() {
+        let base = std::env::temp_dir().join(format!(
+            "agy_gauge_swarm_worker_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let parent_id = "ab159572-c4b8-4bd9-86e4-6b4bb34a5129";
+        let worker_sys_id = "a6330233-a6c5-4e24-82dc-24e1795519fe";
+        let worker_peer_id = "00b0f7b6-2eb8-40c6-ab17-8382ceef722e";
+        let other_worker_id = "def33a67-8eec-4265-be5b-85ee403d56d4";
+        let worker_early_id = "11e43752-b1f0-4710-9427-1c78a6b3b92b";
+
+        for cid in [parent_id, worker_sys_id, worker_peer_id, worker_early_id] {
+            fs::create_dir_all(
+                base.join("brain")
+                    .join(cid)
+                    .join(".system_generated")
+                    .join("logs"),
+            )
+            .unwrap();
+        }
+        let cache = base.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        // Deliberately omit all swarm workers from conversation_metadata.json to simulate
+        // live runs before agy flushes metadata cache.
+        fs::write(
+            cache.join("conversation_metadata.json"),
+            format!(
+                r#"{{"conversations":{{"{parent_id}":{{"summary":{{"Title":"Swarm Coordinator","WorkspaceURIs":["file:///C:/Users/qingz/agent-home"]}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            base.join("brain")
+                .join(parent_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+            concat!(
+                r#"{"step_index":0,"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","content":"<USER_REQUEST>\n/swarm audit repos\n</USER_REQUEST>"}"#,
+                "\n",
+                r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-25T16:38:00Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":0,"output_tokens":120}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        // Worker 1: step=0 sender=system board ping, step=1 real assignment with coordinator UUID & @verifier
+        let w1 = [
+            r#"{"step_index":0,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"The following is a <SYSTEM_MESSAGE>\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T16:38:11Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #5\n</SYSTEM_MESSAGE>"}"#.to_string(),
+            format!(
+                r#"{{"step_index":1,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"The following is a <SYSTEM_MESSAGE>\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T16:38:11Z sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=You have just started. Your assignment (recorded on the board as #5 for @verifier):\n\nYou are the **independent** `verifier` for all repos.\n</SYSTEM_MESSAGE>"}}"#
+            ),
+            r#"{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-25T16:38:16Z","model":"gemini-4-neon-xhigh","input_tokens":1500,"cache_read_tokens":2000,"output_tokens":200}"#.to_string(),
+        ]
+        .join("\n");
+        fs::write(
+            base.join("brain")
+                .join(worker_sys_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+            format!("{w1}\n"),
+        )
+        .unwrap();
+
+        // Worker 2: step=0 sender=<other-worker-uuid> board ping, step=1 upgrades to root coordinator UUID
+        let w2 = [
+            format!(
+                r#"{{"step_index":0,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T18:40:58Z sender={other_worker_id} priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #2\n</SYSTEM_MESSAGE>"}}"#
+            ),
+            format!(
+                r#"{{"step_index":1,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T18:40:58Z sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=You have just started. Your assignment (recorded on the board as #2 for @stack-bench):\n\n# Benchmark Engineer\n</SYSTEM_MESSAGE>"}}"#
+            ),
+            r#"{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-23T18:41:05Z","model":"gemini-4-neon-xhigh","input_tokens":800,"cache_read_tokens":1200,"output_tokens":100}"#.to_string(),
+        ]
+        .join("\n");
+        fs::write(
+            base.join("brain")
+                .join(worker_peer_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+            format!("{w2}\n"),
+        )
+        .unwrap();
+
+        // Worker 3: only step=0 board ping before first turn (no meta, no step=1) -> still subagent, never "(未命名会话)"
+        let w3 = [
+            r#"{"step_index":0,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T16:38:12Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #6\n</SYSTEM_MESSAGE>"}"#,
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-25T16:38:19Z","model":"gemini-4-neon-xhigh","input_tokens":500,"cache_read_tokens":0,"output_tokens":60}"#,
+            // Later runtime SYSTEM_MESSAGE after first turn must NOT hijack title or parent
+            r#"{"step_index":2,"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T16:41:00Z sender=00000000-0000-0000-0000-000000000000 priority=MESSAGE_PRIORITY_HIGH content=[monitor] tick\n</SYSTEM_MESSAGE>"}"#,
+        ]
+        .join("\n");
+        fs::write(
+            base.join("brain")
+                .join(worker_early_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+            format!("{w3}\n"),
+        )
+        .unwrap();
+
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None);
+        let snap = scanner.scan();
+        assert_eq!(snap.sessions.len(), 4);
+
+        let s1 = snap.sessions.iter().find(|s| s.conversation_id == worker_sys_id).unwrap();
+        assert!(s1.is_subagent);
+        assert_eq!(s1.parent_id.as_deref(), Some(parent_id));
+        assert_eq!(s1.parent_title, "Swarm Coordinator");
+        assert_eq!(s1.workspace, "C:/Users/qingz/agent-home");
+        assert_eq!(s1.title, "@verifier · You are the independent verifier for all repos.");
+
+        let s2 = snap.sessions.iter().find(|s| s.conversation_id == worker_peer_id).unwrap();
+        assert!(s2.is_subagent);
+        assert_eq!(s2.parent_id.as_deref(), Some(parent_id));
+        assert_eq!(s2.workspace, "C:/Users/qingz/agent-home");
+        assert_eq!(s2.title, "@stack-bench · Benchmark Engineer");
+
+        let s3 = snap.sessions.iter().find(|s| s.conversation_id == worker_early_id).unwrap();
+        assert!(s3.is_subagent);
+        assert!(s3.parent_id.is_none());
+        assert_eq!(s3.title, "[swarm] new board message #6");
+        assert_ne!(s3.title, "(未命名会话)");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn test_multi_source_tools_thinking_and_custom_range() {
         let base = std::env::temp_dir().join(format!("agy_gauge_multi_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);

@@ -525,6 +525,207 @@ class GaugeStatsTests(unittest.TestCase):
             self.assertEqual(js_child["parent_id"], parent_id)
             self.assertEqual(js_child["parent_title"], "SubVault Review")
 
+    def test_swarm_worker_board_ping_upgrades_to_assignment_without_meta(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            parent_id = "ab159572-c4b8-4bd9-86e4-6b4bb34a5129"
+            worker_sys_id = "a6330233-a6c5-4e24-82dc-24e1795519fe"
+            worker_peer_id = "00b0f7b6-2eb8-40c6-ab17-8382ceef722e"
+            other_worker_id = "def33a67-8eec-4265-be5b-85ee403d56d4"
+            worker_early_id = "11e43752-b1f0-4710-9427-1c78a6b3b92b"
+
+            for cid in (parent_id, worker_sys_id, worker_peer_id, worker_early_id):
+                (root / "brain" / cid / ".system_generated" / "logs").mkdir(parents=True)
+            cache_dir = root / "cache"
+            cache_dir.mkdir(parents=True)
+            # Workers intentionally omitted from conversation_metadata.json (live race window).
+            (cache_dir / "conversation_metadata.json").write_text(
+                json.dumps({
+                    "conversations": {
+                        parent_id: {
+                            "summary": {
+                                "Title": "Swarm Coordinator",
+                                "WorkspaceURIs": ["file:///C:/Users/test/agent-home"],
+                            }
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+
+            (root / "brain" / parent_id / ".system_generated" / "logs" / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "status": "DONE",
+                        "content": "<USER_REQUEST>\n/swarm audit repos\n</USER_REQUEST>",
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-25T16:38:00Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 120,
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # Worker 1: step=0 sender=system ping, step=1 coordinator assignment with @verifier
+            (root / "brain" / worker_sys_id / ".system_generated" / "logs" / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            "[Message] timestamp=2026-11-25T16:38:11Z sender=system "
+                            "priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #5\n"
+                            "</SYSTEM_MESSAGE>"
+                        ),
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            f"[Message] timestamp=2026-11-25T16:38:11Z sender={parent_id} "
+                            "priority=MESSAGE_PRIORITY_HIGH content=You have just started. "
+                            "Your assignment (recorded on the board as #5 for @verifier):\n\n"
+                            "You are the **independent** `verifier` for all repos.\n"
+                            "</SYSTEM_MESSAGE>"
+                        ),
+                    }),
+                    json.dumps({
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-25T16:38:16Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 1500,
+                        "cache_read_tokens": 2000,
+                        "output_tokens": 200,
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # Worker 2: step=0 sender=<other-worker> ping, step=1 upgrades parent_id to root coordinator
+            (root / "brain" / worker_peer_id / ".system_generated" / "logs" / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            f"[Message] timestamp=2026-11-23T18:40:58Z sender={other_worker_id} "
+                            "priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #2\n"
+                            "</SYSTEM_MESSAGE>"
+                        ),
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            f"[Message] timestamp=2026-11-23T18:40:58Z sender={parent_id} "
+                            "priority=MESSAGE_PRIORITY_HIGH content=You have just started. "
+                            "Your assignment (recorded on the board as #2 for @stack-bench):\n\n"
+                            "# Benchmark Engineer\n"
+                            "</SYSTEM_MESSAGE>"
+                        ),
+                    }),
+                    json.dumps({
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-23T18:41:05Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 800,
+                        "cache_read_tokens": 1200,
+                        "output_tokens": 100,
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # Worker 3: only step=0 board ping before turn -> subagent, never "(untitled)"
+            (root / "brain" / worker_early_id / ".system_generated" / "logs" / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            "[Message] timestamp=2026-11-25T16:38:12Z sender=system "
+                            "priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #6\n"
+                            "</SYSTEM_MESSAGE>"
+                        ),
+                    }),
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-25T16:38:19Z",
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 500,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 60,
+                    }),
+                    json.dumps({
+                        "step_index": 2,
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM",
+                        "status": "DONE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            "[Message] timestamp=2026-11-25T16:41:00Z sender=00000000-0000-0000-0000-000000000000 "
+                            "priority=MESSAGE_PRIORITY_HIGH content=[monitor] tick\n"
+                            "</SYSTEM_MESSAGE>"
+                        ),
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            rep = mod.scan_usage(root, tz=tz_utc, pricing_path=None)
+            self.assertEqual(len(rep.sessions), 4)
+
+            s1 = next(s for s in rep.sessions if s.conversation_id == worker_sys_id)
+            self.assertTrue(s1.is_subagent)
+            self.assertEqual(s1.parent_id, parent_id)
+            self.assertEqual(s1.parent_title, "Swarm Coordinator")
+            self.assertEqual(s1.workspace, "C:/Users/test/agent-home")
+            self.assertEqual(s1.title, "@verifier · You are the independent verifier for all repos.")
+
+            s2 = next(s for s in rep.sessions if s.conversation_id == worker_peer_id)
+            self.assertTrue(s2.is_subagent)
+            self.assertEqual(s2.parent_id, parent_id)
+            self.assertEqual(s2.workspace, "C:/Users/test/agent-home")
+            self.assertEqual(s2.title, "@stack-bench · Benchmark Engineer")
+
+            s3 = next(s for s in rep.sessions if s.conversation_id == worker_early_id)
+            self.assertTrue(s3.is_subagent)
+            self.assertIsNone(s3.parent_id)
+            self.assertEqual(s3.title, "[swarm] new board message #6")
+            self.assertNotEqual(s3.title, "(untitled)")
+
     def test_redaction_across_text_json_csv_and_pricing(self) -> None:
         tz_utc = dt.timezone.utc
         with tempfile.TemporaryDirectory() as tmp:

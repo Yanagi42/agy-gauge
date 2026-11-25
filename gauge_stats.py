@@ -945,10 +945,24 @@ def _extract_user_preview(content: str) -> str:
     return _clean_single_line(snippet, max_len=80)
 
 
-def _extract_subagent_meta(content: str) -> tuple[str | None, str]:
-    """Parse subagent launcher SYSTEM_MESSAGE for sender=<parent-uuid> and task preview."""
+def _extract_swarm_role(header_line: str) -> str:
+    """Extract '@role' from 'You have just started. Your assignment (... for @role):'."""
+    marker = " for @"
+    pos = header_line.find(marker)
+    if pos < 0:
+        return ""
+    rest = header_line[pos + len(" for ") :]
+    end = 0
+    while end < len(rest) and rest[end] not in (")", ":", ",", " ", "\t", "\r", "\n"):
+        end += 1
+    role = rest[:end]
+    return role if len(role) > 1 else ""
+
+
+def _extract_subagent_meta(content: str) -> tuple[str | None, str, bool, bool]:
+    """Parse subagent launcher SYSTEM_MESSAGE for (parent_id, preview, is_swarm, is_swarm_ping)."""
     if not content:
-        return None, ""
+        return None, "", False, False
     parent_id: str | None = None
     pos = content.find("sender=")
     if pos >= 0:
@@ -957,18 +971,51 @@ def _extract_subagent_meta(content: str) -> tuple[str | None, str]:
         if _UUID_RE.match(tok):
             parent_id = tok
     preview = ""
+    is_swarm = False
+    is_swarm_ping = False
     cpos = content.find("content=")
     if cpos >= 0:
         body = content[cpos + len("content=") :]
+        lines: list[str] = []
         for raw_line in body.splitlines():
-            trimmed = raw_line.strip().lstrip("#").strip()
+            trimmed = raw_line.strip()
             if not trimmed or trimmed.startswith("</SYSTEM_MESSAGE>"):
                 continue
-            cleaned_md = trimmed.replace("**", "").replace("`", "")
-            preview = _clean_single_line(cleaned_md, max_len=72)
-            if preview:
-                break
-    return parent_id, preview
+            if trimmed.endswith("</SYSTEM_MESSAGE>"):
+                trimmed = trimmed[: -len("</SYSTEM_MESSAGE>")].strip()
+                if not trimmed:
+                    continue
+            lines.append(trimmed)
+        if lines:
+            first_raw = lines[0]
+            if first_raw.startswith("[swarm] new board message"):
+                is_swarm = True
+                is_swarm_ping = True
+                preview = _clean_single_line(first_raw, max_len=72)
+            elif first_raw.startswith("You have just started. Your assignment"):
+                is_swarm = True
+                role = _extract_swarm_role(first_raw)
+                brief = ""
+                for candidate in lines[1:]:
+                    cleaned = candidate.lstrip("#").strip().replace("**", "").replace("`", "")
+                    if cleaned:
+                        brief = cleaned
+                        break
+                if role and brief:
+                    preview = _clean_single_line(f"{role} · {brief}", max_len=72)
+                elif role:
+                    preview = _clean_single_line(role, max_len=72)
+                elif brief:
+                    preview = _clean_single_line(brief, max_len=72)
+                else:
+                    preview = _clean_single_line(first_raw, max_len=72)
+            else:
+                for candidate in lines:
+                    cleaned = candidate.lstrip("#").strip().replace("**", "").replace("`", "")
+                    preview = _clean_single_line(cleaned, max_len=72)
+                    if preview:
+                        break
+    return parent_id, preview, is_swarm, is_swarm_ping
 
 
 def _parse_iso_timestamp(value: Any, tz: dt.tzinfo) -> dt.datetime | None:
@@ -1059,7 +1106,7 @@ def _has_token_metrics(record: dict[str, Any]) -> bool:
 def _parse_transcript_file(
     transcript_path: pathlib.Path,
     cid: str,
-) -> tuple[list[TurnRecord], str, str | None, str, int]:
+) -> tuple[list[TurnRecord], str, str | None, str, bool, int]:
     """Parse a single transcript JSONL file in UTC (tz conversion happens later)."""
     turns_by_step: dict[int, TurnRecord] = {}
     fallback_order = -1
@@ -1067,6 +1114,8 @@ def _parse_transcript_file(
     first_user_preview = ""
     subagent_parent_id: str | None = None
     subagent_preview = ""
+    is_swarm_subagent = False
+    subagent_meta_is_swarm_ping = False
     skipped_lines = 0
 
     with transcript_path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -1075,12 +1124,15 @@ def _parse_transcript_file(
             if not stripped:
                 continue
             need_preview = (not seen_user_input) and ("USER_INPUT" in stripped)
-            need_subagent_meta = (
+            want_subagent_meta = (
                 (not seen_user_input)
-                and subagent_parent_id is None
-                and (not subagent_preview)
-                and ("SYSTEM_MESSAGE" in stripped)
+                and (not turns_by_step)
+                and (
+                    (subagent_parent_id is None and not subagent_preview)
+                    or subagent_meta_is_swarm_ping
+                )
             )
+            need_subagent_meta = want_subagent_meta and ("SYSTEM_MESSAGE" in stripped)
             if (
                 stripped.startswith("{")
                 and stripped.endswith("}")
@@ -1103,13 +1155,27 @@ def _parse_transcript_file(
                 if not first_user_preview and isinstance(obj.get("content"), str):
                     first_user_preview = _extract_user_preview(obj["content"])
             elif (
-                not seen_user_input
-                and subagent_parent_id is None
-                and not subagent_preview
+                want_subagent_meta
                 and step_type_peek == "SYSTEM_MESSAGE"
                 and isinstance(obj.get("content"), str)
             ):
-                subagent_parent_id, subagent_preview = _extract_subagent_meta(obj["content"])
+                pid, prev, is_swarm, is_ping = _extract_subagent_meta(obj["content"])
+                if is_swarm:
+                    is_swarm_subagent = True
+                if subagent_meta_is_swarm_ping:
+                    if is_ping:
+                        if subagent_parent_id is None and pid is not None:
+                            subagent_parent_id = pid
+                    else:
+                        if pid is not None:
+                            subagent_parent_id = pid
+                        if prev:
+                            subagent_preview = prev
+                        subagent_meta_is_swarm_ping = False
+                else:
+                    subagent_parent_id = pid
+                    subagent_preview = prev
+                    subagent_meta_is_swarm_ping = is_ping
 
             if not _has_token_metrics(obj):
                 continue
@@ -1178,7 +1244,15 @@ def _parse_transcript_file(
     if seen_user_input:
         subagent_parent_id = None
         subagent_preview = ""
-    return ordered, first_user_preview, subagent_parent_id, subagent_preview, skipped_lines
+        is_swarm_subagent = False
+    return (
+        ordered,
+        first_user_preview,
+        subagent_parent_id,
+        subagent_preview,
+        is_swarm_subagent,
+        skipped_lines,
+    )
 
 
 def _extract_text_from_content(content: Any) -> str:
@@ -2189,7 +2263,9 @@ class IncrementalScanner:
             ]
         self.pricing = PricingCatalog(pricing_path)
         self.archive_path = archive_path
-        self._transcript_cache: dict[str, tuple[int, int, list[TurnRecord], str, str | None, str, int]] = {}
+        self._transcript_cache: dict[
+            str, tuple[int, int, list[TurnRecord], str, str | None, str, bool, int]
+        ] = {}
         self._agent_file_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
         self._ann_cache: dict[str, tuple[int, int, str]] = {}
         self._meta_sigs: dict[str, tuple[int, int]] = {}
@@ -2461,19 +2537,32 @@ class IncrementalScanner:
 
             cached = self._transcript_cache.get(cache_key)
             if cached is not None and cached[0] == mtime_ns and cached[1] == size:
-                raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
+                (
+                    raw_turns,
+                    first_user_preview,
+                    subagent_parent_id,
+                    subagent_preview,
+                    is_swarm_subagent,
+                    file_skipped,
+                ) = (
                     cached[2],
                     cached[3],
                     cached[4],
                     cached[5],
                     cached[6],
+                    cached[7],
                 )
                 files_cached += 1
             else:
                 try:
-                    raw_turns, first_user_preview, subagent_parent_id, subagent_preview, file_skipped = (
-                        _parse_transcript_file(transcript_path, cid)
-                    )
+                    (
+                        raw_turns,
+                        first_user_preview,
+                        subagent_parent_id,
+                        subagent_preview,
+                        is_swarm_subagent,
+                        file_skipped,
+                    ) = _parse_transcript_file(transcript_path, cid)
                 except OSError as exc:
                     warnings.append(f"Could not read {transcript_path}: {exc}")
                     continue
@@ -2484,6 +2573,7 @@ class IncrementalScanner:
                     first_user_preview,
                     subagent_parent_id,
                     subagent_preview,
+                    is_swarm_subagent,
                     file_skipped,
                 )
                 files_reparsed += 1
@@ -2499,7 +2589,7 @@ class IncrementalScanner:
             if meta is not None:
                 is_subagent = bool(meta.get("is_internal"))
             else:
-                is_subagent = subagent_parent_id is not None
+                is_subagent = (subagent_parent_id is not None) or is_swarm_subagent
             parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
             meta_dict = meta or {}
             title = (

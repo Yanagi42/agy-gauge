@@ -117,6 +117,8 @@ impl UsageArchive {
                     prev.turns.len() != s.turns.len()
                         || prev.title != s.title
                         || prev.workspace != s.workspace
+                        || prev.is_subagent != s.is_subagent
+                        || prev.parent_id != s.parent_id
                         || prev.parent_title != s.parent_title
                         || prev.source != s.source
                         || prev.turns.last().map(|t| (
