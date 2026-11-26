@@ -103,6 +103,21 @@ impl UsageArchive {
         pricing: &PricingCatalog,
         allow_persist: bool,
     ) -> Vec<SessionInfo> {
+        self.sync_and_backfill_filtered(
+            live_sessions,
+            pricing,
+            allow_persist,
+            &crate::stats::SourceDiscoveryFilter::All,
+        )
+    }
+
+    pub fn sync_and_backfill_filtered(
+        &mut self,
+        live_sessions: &[SessionInfo],
+        pricing: &PricingCatalog,
+        allow_persist: bool,
+        filter: &crate::stats::SourceDiscoveryFilter,
+    ) -> Vec<SessionInfo> {
         if !self.enabled {
             return Vec::new();
         }
@@ -128,6 +143,9 @@ impl UsageArchive {
                             t.cache_write_tokens,
                             t.cache_write_1h_tokens,
                             t.reasoning_tokens,
+                            t.gen_secs,
+                            t.thinking_chars,
+                            t.tool_names.len(),
                         )) != s.turns.last().map(|t| (
                             t.output_tokens,
                             t.input_tokens,
@@ -135,6 +153,9 @@ impl UsageArchive {
                             t.cache_write_tokens,
                             t.cache_write_1h_tokens,
                             t.reasoning_tokens,
+                            t.gen_secs,
+                            t.thinking_chars,
+                            t.tool_names.len(),
                         ))
                 }
             };
@@ -164,7 +185,10 @@ impl UsageArchive {
 
         let mut backfilled = Vec::new();
         for ((family, cid), arch) in &self.entries {
-            if live_keys.contains(&(*family, cid.as_str())) || arch.turns.is_empty() {
+            if !filter.allows(*family)
+                || live_keys.contains(&(*family, cid.as_str()))
+                || arch.turns.is_empty()
+            {
                 continue;
             }
             backfilled.push(materialize_archived_session(arch, pricing));
@@ -593,6 +617,17 @@ mod tests {
         let cc_turn = &parsed["sessions"]["claude-code:shared-id"]["turns"][0];
         assert_eq!(cc_turn["rt"], 800);
         assert_eq!(cc_turn["cw1h"], 1_000_000);
+
+        // Filtered backfill: AgyOnly must NOT leak archived Claude sessions.
+        let mut a_filt = UsageArchive::new(Some(arch_path.clone()), true);
+        let agy_only = a_filt.sync_and_backfill_filtered(
+            &[],
+            &pricing,
+            false,
+            &crate::stats::SourceDiscoveryFilter::AgyOnly,
+        );
+        assert_eq!(agy_only.len(), 1);
+        assert_eq!(agy_only[0].source, SourceKind::Cli);
 
         // Reload fresh archive with no live sessions -> both sessions backfill with distinct sources
         // and Claude's 1h cache write is priced at 2.0x input ($6.00/M for Sonnet 4.6, vs $3.75/M 5m).

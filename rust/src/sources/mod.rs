@@ -48,7 +48,11 @@ pub struct SafeFs {
 
 impl SafeFs {
     pub fn new(root: PathBuf) -> Self {
-        let canon_root = fs::canonicalize(&root).ok();
+        let canon_root = if non_symlink_dir(&root) {
+            fs::canonicalize(&root).ok()
+        } else {
+            None
+        };
         Self {
             root,
             canon_root,
@@ -62,7 +66,7 @@ impl SafeFs {
 
     /// Re-resolves canonical root if it did not exist at construction time.
     pub fn refresh_root(&mut self) {
-        if self.canon_root.is_none() {
+        if self.canon_root.is_none() && non_symlink_dir(&self.root) {
             self.canon_root = fs::canonicalize(&self.root).ok();
         }
     }
@@ -91,7 +95,7 @@ impl SafeFs {
             return None;
         }
         if !self.verified_paths.contains(path) {
-            if self.canon_root.is_none() {
+            if self.canon_root.is_none() && non_symlink_dir(&self.root) {
                 self.canon_root = fs::canonicalize(&self.root).ok();
             }
             let root = self.canon_root.as_ref()?;
@@ -264,7 +268,7 @@ pub fn discover_default_sources(filter: &SourceDiscoveryFilter) -> Vec<(SourceKi
             (SourceKind::Ide, gemini_base.join("antigravity-ide")),
         ];
         for (kind, dir) in agy_candidates {
-            if non_symlink_dir(&dir.join("brain")) {
+            if non_symlink_dir(&dir) && non_symlink_dir(&dir.join("brain")) {
                 push_unique_source(&mut out, kind, dir);
             }
         }
@@ -288,7 +292,7 @@ pub fn discover_default_sources(filter: &SourceDiscoveryFilter) -> Vec<(SourceKi
             }
         }
         for dir in candidates {
-            if non_symlink_dir(&dir.join("projects")) {
+            if non_symlink_dir(&dir) && non_symlink_dir(&dir.join("projects")) {
                 push_unique_source(&mut out, SourceKind::ClaudeCode, dir);
             }
         }
@@ -301,8 +305,9 @@ pub fn discover_default_sources(filter: &SourceDiscoveryFilter) -> Vec<(SourceKi
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".codex")));
         if let Some(dir) = codex_root {
-            if non_symlink_dir(&dir.join("sessions"))
-                || non_symlink_dir(&dir.join("archived_sessions"))
+            if non_symlink_dir(&dir)
+                && (non_symlink_dir(&dir.join("sessions"))
+                    || non_symlink_dir(&dir.join("archived_sessions")))
             {
                 push_unique_source(&mut out, SourceKind::Codex, dir);
             }
@@ -314,14 +319,17 @@ pub fn discover_default_sources(filter: &SourceDiscoveryFilter) -> Vec<(SourceKi
         let mut candidates = Vec::new();
         if let Some(raw) = std::env::var_os("GEMINI_CLI_HOME").filter(|s| !s.is_empty()) {
             let root = PathBuf::from(raw);
-            if non_symlink_dir(&root.join("tmp")) {
+            if non_symlink_dir(&root) && non_symlink_dir(&root.join("tmp")) {
                 candidates.push(root);
-            } else if non_symlink_dir(&root.join(".gemini").join("tmp")) {
+            } else if non_symlink_dir(&root)
+                && non_symlink_dir(&root.join(".gemini"))
+                && non_symlink_dir(&root.join(".gemini").join("tmp"))
+            {
                 candidates.push(root.join(".gemini"));
             }
         } else if let Some(h) = &home {
             let root = h.join(".gemini");
-            if non_symlink_dir(&root.join("tmp")) {
+            if non_symlink_dir(&root) && non_symlink_dir(&root.join("tmp")) {
                 candidates.push(root);
             }
         }

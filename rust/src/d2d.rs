@@ -338,7 +338,7 @@ pub struct LayeredSurface {
     dc: HDC,
     bmp: HBITMAP,
     old_obj: HGDIOBJ,
-    rt: ID2D1DCRenderTarget,
+    rt: Option<ID2D1DCRenderTarget>,
     width_px: i32,
     height_px: i32,
     dpi: f32,
@@ -350,6 +350,9 @@ impl LayeredSurface {
         let h = height_px.max(1);
         unsafe {
             let dc = CreateCompatibleDC(HDC::default());
+            if dc.is_invalid() {
+                return Err(windows::core::Error::from_win32());
+            }
             let mut bi: BITMAPINFO = zeroed();
             bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
             bi.bmiHeader.biWidth = w;
@@ -359,7 +362,13 @@ impl LayeredSurface {
             bi.bmiHeader.biCompression = BI_RGB.0;
 
             let mut bits: *mut std::ffi::c_void = ptr::null_mut();
-            let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
+            let bmp = match CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = DeleteDC(dc);
+                    return Err(e);
+                }
+            };
             let old_obj = SelectObject(dc, bmp);
 
             let props = D2D1_RENDER_TARGET_PROPERTIES {
@@ -372,7 +381,15 @@ impl LayeredSurface {
                 dpiY: dpi,
                 ..Default::default()
             };
-            let rt = factories.d2d.CreateDCRenderTarget(&props)?;
+            let rt = match factories.d2d.CreateDCRenderTarget(&props) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = SelectObject(dc, old_obj);
+                    let _ = DeleteObject(bmp);
+                    let _ = DeleteDC(dc);
+                    return Err(e);
+                }
+            };
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
@@ -380,7 +397,7 @@ impl LayeredSurface {
                 dc,
                 bmp,
                 old_obj,
-                rt,
+                rt: Some(rt),
                 width_px: w,
                 height_px: h,
                 dpi,
@@ -401,18 +418,21 @@ impl LayeredSurface {
         F: FnOnce(&ID2D1RenderTarget),
     {
         unsafe {
+            let Some(rt) = &self.rt else {
+                return Ok(());
+            };
             let sub = RECT {
                 left: 0,
                 top: 0,
                 right: self.width_px,
                 bottom: self.height_px,
             };
-            self.rt.BindDC(self.dc, &sub)?;
-            self.rt.BeginDraw();
-            self.rt.Clear(Some(&rgba(0, 0, 0, 0.0)));
-            let base: ID2D1RenderTarget = windows::core::Interface::cast(&self.rt)?;
+            rt.BindDC(self.dc, &sub)?;
+            rt.BeginDraw();
+            rt.Clear(Some(&rgba(0, 0, 0, 0.0)));
+            let base: ID2D1RenderTarget = windows::core::Interface::cast(rt)?;
             draw_fn(&base);
-            self.rt.EndDraw(None, None)?;
+            rt.EndDraw(None, None)?;
 
             let dst_pt = POINT { x, y };
             let sz = SIZE {
@@ -444,6 +464,8 @@ impl LayeredSurface {
 
 impl Drop for LayeredSurface {
     fn drop(&mut self) {
+        // Release Direct2D DC render target before tearing down the backing GDI DC/bitmap.
+        self.rt.take();
         unsafe {
             let _ = SelectObject(self.dc, self.old_obj);
             let _ = DeleteObject(self.bmp);
@@ -457,7 +479,7 @@ pub struct WindowSurface {
     dc: HDC,
     bmp: HBITMAP,
     old_obj: HGDIOBJ,
-    rt: ID2D1DCRenderTarget,
+    rt: Option<ID2D1DCRenderTarget>,
     width_px: i32,
     height_px: i32,
     dpi: f32,
@@ -469,6 +491,9 @@ impl WindowSurface {
         let h = height_px.max(1);
         unsafe {
             let dc = CreateCompatibleDC(HDC::default());
+            if dc.is_invalid() {
+                return Err(windows::core::Error::from_win32());
+            }
             let mut bi: BITMAPINFO = zeroed();
             bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
             bi.bmiHeader.biWidth = w;
@@ -478,7 +503,13 @@ impl WindowSurface {
             bi.bmiHeader.biCompression = BI_RGB.0;
 
             let mut bits: *mut std::ffi::c_void = ptr::null_mut();
-            let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
+            let bmp = match CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = DeleteDC(dc);
+                    return Err(e);
+                }
+            };
             let old_obj = SelectObject(dc, bmp);
 
             let props = D2D1_RENDER_TARGET_PROPERTIES {
@@ -491,7 +522,15 @@ impl WindowSurface {
                 dpiY: dpi,
                 ..Default::default()
             };
-            let rt = factories.d2d.CreateDCRenderTarget(&props)?;
+            let rt = match factories.d2d.CreateDCRenderTarget(&props) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = SelectObject(dc, old_obj);
+                    let _ = DeleteObject(bmp);
+                    let _ = DeleteDC(dc);
+                    return Err(e);
+                }
+            };
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
@@ -499,7 +538,7 @@ impl WindowSurface {
                 dc,
                 bmp,
                 old_obj,
-                rt,
+                rt: Some(rt),
                 width_px: w,
                 height_px: h,
                 dpi,
@@ -516,17 +555,20 @@ impl WindowSurface {
         F: FnOnce(&ID2D1RenderTarget),
     {
         unsafe {
+            let Some(rt) = &self.rt else {
+                return Ok(());
+            };
             let sub = RECT {
                 left: 0,
                 top: 0,
                 right: self.width_px,
                 bottom: self.height_px,
             };
-            self.rt.BindDC(self.dc, &sub)?;
-            self.rt.BeginDraw();
-            let base: ID2D1RenderTarget = windows::core::Interface::cast(&self.rt)?;
+            rt.BindDC(self.dc, &sub)?;
+            rt.BeginDraw();
+            let base: ID2D1RenderTarget = windows::core::Interface::cast(rt)?;
             draw_fn(&base);
-            self.rt.EndDraw(None, None)?;
+            rt.EndDraw(None, None)?;
 
             if let Some(hdc) = target_hdc {
                 let _ = BitBlt(hdc, 0, 0, self.width_px, self.height_px, self.dc, 0, 0, SRCCOPY);
@@ -538,6 +580,8 @@ impl WindowSurface {
 
 impl Drop for WindowSurface {
     fn drop(&mut self) {
+        // Release Direct2D DC render target before tearing down the backing GDI DC/bitmap.
+        self.rt.take();
         unsafe {
             let _ = SelectObject(self.dc, self.old_obj);
             let _ = DeleteObject(self.bmp);

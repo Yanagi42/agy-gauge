@@ -735,17 +735,29 @@ impl BudgetStore {
             .path
             .clone()
             .ok_or_else(|| "未配置 budget.json 路径".to_string())?;
+        let warn_pct = cfg.warn_pct.clamp(1.0, 500.0);
+        let critical_pct = cfg.critical_pct.clamp(warn_pct, 500.0);
+        let quota_warn_rem_pct = cfg.quota_warn_rem_pct.clamp(1.0, 95.0);
+        let quota_crit_rem_pct = cfg.quota_crit_rem_pct.clamp(0.0, quota_warn_rem_pct);
+        let saved_cfg = BudgetConfig {
+            daily_usd: (cfg.daily_usd.max(0.0) * 100.0).round() / 100.0,
+            weekly_usd: (cfg.weekly_usd.max(0.0) * 100.0).round() / 100.0,
+            warn_pct,
+            critical_pct,
+            quota_warn_rem_pct,
+            quota_crit_rem_pct,
+        };
         let val = json!({
-            "daily_usd": (cfg.daily_usd.max(0.0) * 100.0).round() / 100.0,
-            "weekly_usd": (cfg.weekly_usd.max(0.0) * 100.0).round() / 100.0,
-            "warn_pct": cfg.warn_pct.clamp(1.0, 99.0),
-            "critical_pct": cfg.critical_pct.clamp(1.0, 100.0),
-            "quota_warn_rem_pct": cfg.quota_warn_rem_pct.clamp(1.0, 95.0),
-            "quota_crit_rem_pct": cfg.quota_crit_rem_pct.clamp(0.0, 90.0),
+            "daily_usd": saved_cfg.daily_usd,
+            "weekly_usd": saved_cfg.weekly_usd,
+            "warn_pct": saved_cfg.warn_pct,
+            "critical_pct": saved_cfg.critical_pct,
+            "quota_warn_rem_pct": saved_cfg.quota_warn_rem_pct,
+            "quota_crit_rem_pct": saved_cfg.quota_crit_rem_pct,
         });
         let text = serde_json::to_string_pretty(&val).map_err(|e| format!("序列化失败: {e}"))?;
         atomic_write_json(&path, &format!("{text}\n"))?;
-        self.config = cfg;
+        self.config = saved_cfg;
         self.sig = regular_file_sig(&path);
         Ok(())
     }
@@ -767,10 +779,10 @@ pub fn parse_budget_json(text: &str) -> Option<BudgetConfig> {
         cfg.weekly_usd = v;
     }
     if let Some(v) = get_nonneg("warn_pct") {
-        cfg.warn_pct = v.clamp(1.0, 99.0);
+        cfg.warn_pct = v.clamp(1.0, 500.0);
     }
     if let Some(v) = get_nonneg("critical_pct") {
-        cfg.critical_pct = v.clamp(cfg.warn_pct, 100.0);
+        cfg.critical_pct = v.clamp(cfg.warn_pct, 500.0);
     }
     if let Some(v) = get_nonneg("quota_warn_rem_pct") {
         cfg.quota_warn_rem_pct = v.clamp(1.0, 95.0);

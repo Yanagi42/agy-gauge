@@ -686,10 +686,10 @@ fn parse_claude_jsonl(fh: File, sig: FileSig) -> CachedClaudeTranscript {
             continue;
         }
 
-        // Fast-path skip for well-formed lines that cannot carry turns, titles, cwd, or first user text.
+        // Fast-path skip for well-formed lines that cannot carry turns, titles, cwd, or user-turn transitions.
         if trimmed.starts_with('{') && trimmed.ends_with('}') {
             let need_cwd = cwd.is_empty() && trimmed.contains("\"cwd\"");
-            let need_user = first_user_preview.is_empty() && trimmed.contains("\"user\"");
+            let need_user = trimmed.contains("\"user\"");
             let interesting = trimmed.contains("\"assistant\"")
                 || trimmed.contains("\"custom-title\"")
                 || trimmed.contains("\"summary\"")
@@ -882,11 +882,19 @@ fn parse_claude_jsonl(fh: File, sig: FileSig) -> CachedClaudeTranscript {
                 .saturating_add(acc.cache_read_tokens)
                 .saturating_add(acc.cache_write_tokens);
 
-            if !acc.has_usage || output_tokens >= acc.output_tokens || new_total_in > old_total_in {
+            if !acc.has_usage
+                || new_total_in > old_total_in
+                || (new_total_in == old_total_in
+                    && new_total_in > 0
+                    && output_tokens >= acc.output_tokens)
+            {
                 acc.input_tokens = input_tokens;
                 acc.cache_read_tokens = cache_read_tokens;
                 acc.cache_write_tokens = cache_write_tokens;
-                acc.cache_write_1h_tokens = cache_write_1h_tokens.min(cache_write_tokens);
+                acc.cache_write_1h_tokens = acc
+                    .cache_write_1h_tokens
+                    .max(cache_write_1h_tokens)
+                    .min(cache_write_tokens);
             }
             acc.output_tokens = acc.output_tokens.max(output_tokens);
             acc.has_usage = true;

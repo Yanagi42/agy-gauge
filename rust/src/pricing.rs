@@ -736,7 +736,7 @@ impl PricingCatalog {
             .override_path
             .clone()
             .ok_or_else(|| "未配置 pricing.json 路径".to_string())?;
-        if !path.is_file() {
+        if regular_file_sig(&path).is_none() {
             return Ok(false);
         }
         let (mut root, mut models_map) = load_pricing_json_object(&path);
@@ -1103,6 +1103,9 @@ fn parse_custom_rules_json(text: &str) -> Vec<CustomRateRule> {
 }
 
 fn load_pricing_json_object(path: &Path) -> (Map<String, Value>, Map<String, Value>) {
+    if regular_file_sig(path).is_none() {
+        return (Map::new(), Map::new());
+    }
     if let Ok(text) = fs::read_to_string(path) {
         if let Ok(Value::Object(mut root)) = serde_json::from_str::<Value>(&text) {
             if let Some(Value::Object(models)) = root.remove("models") {
@@ -1125,14 +1128,14 @@ fn load_pricing_json_object(path: &Path) -> (Map<String, Value>, Map<String, Val
 }
 
 fn write_pricing_json_object(path: &Path, root: &Map<String, Value>) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {e}"))?;
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err("拒绝写入符号链接 pricing.json".to_string());
         }
     }
     let payload = serde_json::to_string_pretty(&Value::Object(root.clone()))
         .map_err(|e| format!("序列化失败: {e}"))?;
-    fs::write(path, format!("{payload}\n")).map_err(|e| format!("写入 pricing.json 失败: {e}"))
+    crate::quota::atomic_write_json(path, &format!("{payload}\n"))
 }
 
 fn parse_rate_obj(obj: &serde_json::Map<String, Value>) -> Option<ModelRate> {

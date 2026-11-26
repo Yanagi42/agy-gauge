@@ -2946,6 +2946,12 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                         app.privacy_mode = !app.privacy_mode;
                         if let Some(view) = &mut app.dash_view {
                             view.privacy_mode = app.privacy_mode;
+                            if app.privacy_mode {
+                                view.search_query.clear();
+                            }
+                        }
+                        if app.privacy_mode {
+                            app.pricing_edits.set_search_text("");
                         }
                         app.persist_and_sync(hwnd);
                         app.invalidate_dashboard();
@@ -3421,6 +3427,18 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             } else {
                 (window_dpi_scale(hwnd) * 96.0).round() as u32
             };
+            if lparam.0 != 0 {
+                let suggested = *(lparam.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    (suggested.right - suggested.left).max(320),
+                    (suggested.bottom - suggested.top).max(240),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             with_app(|app| {
                 app.icons.apply_dashboard_icons_for_dpi(hwnd, new_dpi);
                 if let Some(view) = &mut app.dash_view {
@@ -3594,6 +3612,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         }
                         _ => {}
                     }
+                    let prev_privacy = app.privacy_mode;
                     let mut need_refresh = false;
                     let mut prefs_changed = false;
                     if let Some(view) = &mut app.dash_view {
@@ -3603,8 +3622,14 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         app.cost_mode = view.cost_mode;
                         app.group_subagents = view.group_subagents;
                         app.privacy_mode = view.privacy_mode;
+                        if !prev_privacy && app.privacy_mode {
+                            view.search_query.clear();
+                        }
                         app.fresh_only = view.fresh_only;
                         app.date_scope = view.scope;
+                    }
+                    if !prev_privacy && app.privacy_mode {
+                        app.pricing_edits.set_search_text("");
                     }
                     let (p_act, b_act, s_act, d_act) = app
                         .dash_view
@@ -3808,6 +3833,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             };
             if let Some(act) = action {
                 with_app(|app| {
+                    let prev_privacy = app.privacy_mode;
                     let mut need_refresh = false;
                     let mut prefs_changed = false;
                     if let Some(view) = &mut app.dash_view {
@@ -3817,8 +3843,14 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         app.cost_mode = view.cost_mode;
                         app.group_subagents = view.group_subagents;
                         app.privacy_mode = view.privacy_mode;
+                        if !prev_privacy && app.privacy_mode {
+                            view.search_query.clear();
+                        }
                         app.fresh_only = view.fresh_only;
                         app.date_scope = view.scope;
+                    }
+                    if !prev_privacy && app.privacy_mode {
+                        app.pricing_edits.set_search_text("");
                     }
                     let (p_act, b_act, s_act, d_act) = app
                         .dash_view
@@ -3956,6 +3988,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
 
 struct CliOpts {
     data_dirs: Vec<(stats::SourceKind, PathBuf)>,
+    explicit_data_dir: bool,
     discovery_filter: stats::SourceDiscoveryFilter,
     pricing_path: Option<PathBuf>,
     no_archive: bool,
@@ -3979,6 +4012,7 @@ where
 {
     let mut opts = CliOpts {
         data_dirs: Vec::new(),
+        explicit_data_dir: false,
         discovery_filter: stats::SourceDiscoveryFilter::All,
         pricing_path: None,
         no_archive: false,
@@ -4037,6 +4071,7 @@ where
                     let p = PathBuf::from(v);
                     let kind = stats::SourceKind::infer_from_path(&p);
                     opts.data_dirs.push((kind, p));
+                    opts.explicit_data_dir = true;
                 }
             }
             "--pricing" => {
@@ -4124,8 +4159,9 @@ fn run_app(opts: CliOpts) -> Result<()> {
         quota::StatuslineReader::default_path(),
         quota::BudgetStore::default_path(),
         archive::UsageArchive::default_path(),
-        !opts.no_archive && !opts.self_test,
+        !opts.no_archive && !opts.self_test && !opts.explicit_data_dir,
     )
+    .with_archive_filter(opts.discovery_filter.clone())
     .with_session_meta(if opts.self_test {
         None
     } else {

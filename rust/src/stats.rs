@@ -654,6 +654,7 @@ pub struct IncrementalScanner {
     statusline: StatuslineReader,
     budget: BudgetStore,
     archive: UsageArchive,
+    archive_filter: SourceDiscoveryFilter,
     session_meta: SessionMetaStore,
 }
 
@@ -699,6 +700,7 @@ impl IncrementalScanner {
             statusline: StatuslineReader::new(statusline_path),
             budget: BudgetStore::new(budget_path),
             archive: UsageArchive::new(archive_path, archive_enabled),
+            archive_filter: SourceDiscoveryFilter::All,
             session_meta: SessionMetaStore::new(None),
         }
     }
@@ -741,6 +743,11 @@ impl IncrementalScanner {
 
     pub fn with_session_meta(mut self, session_meta_path: Option<PathBuf>) -> Self {
         self.session_meta = SessionMetaStore::new(session_meta_path);
+        self
+    }
+
+    pub fn with_archive_filter(mut self, filter: SourceDiscoveryFilter) -> Self {
+        self.archive_filter = filter;
         self
     }
 
@@ -927,7 +934,12 @@ impl IncrementalScanner {
         }
 
         // Sync live sessions into local app-directory archive & backfill any pruned historical sessions.
-        let archived_backfill = self.archive.sync_and_backfill(&sessions, &self.pricing, true);
+        let archived_backfill = self.archive.sync_and_backfill_filtered(
+            &sessions,
+            &self.pricing,
+            true,
+            &self.archive_filter,
+        );
         let archived_sessions_count = archived_backfill.len();
         sessions.extend(archived_backfill);
 

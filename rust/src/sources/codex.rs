@@ -416,16 +416,17 @@ fn session_id_from_filename(path: &Path) -> String {
 fn parse_session_index(fh: File) -> HashMap<String, IndexEntry> {
     let mut out: HashMap<String, IndexEntry> = HashMap::new();
     let mut reader = BufReader::with_capacity(32 * 1024, fh);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
     loop {
-        line.clear();
-        let Ok(n) = reader.read_line(&mut line) else {
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else {
             break;
         };
         if n == 0 {
             break;
         }
-        let trimmed = line.trim();
+        let line_cow = String::from_utf8_lossy(&buf);
+        let trimmed = line_cow.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -493,6 +494,7 @@ fn maybe_relevant_rollout_line(trimmed: &str) -> bool {
         "\"web_search_call\"",
         "\"mcp_tool_call\"",
         "\"reasoning\"",
+        "\"message\"",
     ];
     WATCHED.iter().any(|kw| trimmed.contains(kw))
 }
@@ -547,7 +549,7 @@ fn extract_user_message_text(payload: &Map<String, Value>) -> Option<String> {
 
 fn parse_rollout_file(fh: File, path: &Path, sig: FileSig) -> CachedRollout {
     let mut reader = BufReader::with_capacity(64 * 1024, fh);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
 
     let mut session_id = String::new();
     let mut session_cwd = String::new();
@@ -569,14 +571,15 @@ fn parse_rollout_file(fh: File, path: &Path, sig: FileSig) -> CachedRollout {
     let mut skipped_lines = 0usize;
 
     loop {
-        line.clear();
-        let Ok(n) = reader.read_line(&mut line) else {
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else {
             break;
         };
         if n == 0 {
             break;
         }
-        let trimmed = line.trim();
+        let line_cow = String::from_utf8_lossy(&buf);
+        let trimmed = line_cow.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -737,6 +740,15 @@ fn parse_rollout_file(fh: File, path: &Path, sig: FileSig) -> CachedRollout {
                     "reasoning" => {
                         pending_reasoning = true;
                     }
+                    "message" => {
+                        if first_user_message.is_empty()
+                            && payload.get("role").and_then(Value::as_str) == Some("user")
+                        {
+                            if let Some(msg) = extract_user_message_text(payload) {
+                                first_user_message = msg;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -858,6 +870,15 @@ fn parse_rollout_file(fh: File, path: &Path, sig: FileSig) -> CachedRollout {
             }
 
             _ => {}
+        }
+    }
+
+    if let Some(last) = turns.last_mut() {
+        if !pending_tools.is_empty() {
+            last.tool_names.extend(pending_tools);
+        }
+        if pending_reasoning && last.reasoning_tokens == 0 && last.thinking_chars == 0 {
+            last.thinking_chars = 1;
         }
     }
 

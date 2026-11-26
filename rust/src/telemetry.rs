@@ -6,7 +6,7 @@ use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{PCWSTR, PWSTR, w};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, GlobalFree, HANDLE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED,
     DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -980,14 +980,17 @@ pub fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> bool {
         };
         let dst = GlobalLock(hmem) as *mut u16;
         if dst.is_null() {
+            let _ = GlobalFree(hmem);
             let _ = CloseClipboard();
             return false;
         }
         ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
         let _ = GlobalUnlock(hmem);
         let ok = SetClipboardData(CF_UNICODETEXT, HANDLE(hmem.0)).is_ok();
+        if !ok {
+            let _ = GlobalFree(hmem);
+        }
         let _ = CloseClipboard();
-        let _ = HGLOBAL(hmem.0);
         ok
     }
 }

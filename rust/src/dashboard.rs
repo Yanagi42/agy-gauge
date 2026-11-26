@@ -493,14 +493,15 @@ fn slice_session(s: &SessionInfo, f: &SessionFilter) -> Option<SessionInfo> {
 
 #[derive(Debug, Clone)]
 struct DisplaySessionRow {
-    session: SessionInfo,
+    sess_idx: usize,
+    out_of_scope: bool,
+    sliced: Option<Box<SessionInfo>>,
     counts: TokenCounts,
     primary_model: String,
     last_time: Option<chrono::DateTime<Local>>,
     subagent_count: usize,
     is_child_row: bool,
     is_pinned: bool,
-    out_of_scope: bool,
 }
 
 /// One model call (= one transcript step carrying token counters) in the call log.
@@ -866,7 +867,7 @@ impl DashboardView {
         if self.privacy_mode {
             self.redactor.session_id(cid)
         } else {
-            cid[..cid.len().min(8)].to_string()
+            cid.chars().take(8).collect()
         }
     }
 
@@ -931,7 +932,7 @@ impl DashboardView {
             _ => s.source.family_label().to_string(),
         };
         format!(
-            "会话明细 · {}\n- ID: {} | 来源: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
+            "会话明细 · {}\n- ID: {} | 来源: {} | 时间: {} | 模型: {}{}\n- 轮数: {}{} | 缓存命中: {:.1}%\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} | 缓存写入: {} | 输出: {}\n- 总 Token: {} (非缓存增量: {}) | 峰值Ctx: {}",
             title,
             sid,
             source_disp,
@@ -948,6 +949,7 @@ impl DashboardView {
             fmt_usd_precise(s.counts.cost.cache_saved_usd),
             fmt_commas(s.counts.input_tokens),
             fmt_commas(s.counts.cache_read_tokens),
+            fmt_commas(s.counts.cache_write_tokens),
             fmt_commas(s.counts.output_tokens),
             fmt_commas(s.counts.total_tokens()),
             fmt_commas(s.counts.non_cached_tokens()),
@@ -1021,13 +1023,13 @@ impl DashboardView {
         let cur_idx = self
             .selected_session
             .as_deref()
-            .and_then(|id| sorted.iter().position(|r| r.session.conversation_id == id))
+            .and_then(|id| sorted.iter().position(|r| self.row_session(r).conversation_id == id))
             .unwrap_or(0);
         let next_idx = (cur_idx as isize + delta).clamp(0, (sorted.len() - 1) as isize) as usize;
         if next_idx == cur_idx && self.selected_session.is_some() {
             return false;
         }
-        self.selected_session = Some(sorted[next_idx].session.conversation_id.clone());
+        self.selected_session = Some(self.row_session(&sorted[next_idx]).conversation_id.clone());
         let vis = self.sessions_vis_rows.max(1);
         if next_idx < self.scroll_rows {
             self.scroll_rows = next_idx;
@@ -1089,6 +1091,16 @@ impl DashboardView {
         Self::session_split_counts_of(&self.cached_sessions)
     }
 
+    fn row_session<'a>(&'a self, r: &'a DisplaySessionRow) -> &'a SessionInfo {
+        if let Some(ref s) = r.sliced {
+            s.as_ref()
+        } else if r.out_of_scope {
+            &self.pinned_out_of_scope[r.sess_idx]
+        } else {
+            &self.cached_sessions[r.sess_idx]
+        }
+    }
+
     fn sort_display_rows(&self, rows: &mut [DisplaySessionRow], keep_parent_first: Option<&str>) {
         let ord_row = |a: &DisplaySessionRow, b: &DisplaySessionRow| -> std::cmp::Ordering {
             match self.sort {
@@ -1121,8 +1133,8 @@ impl DashboardView {
         };
         if let Some(pid) = keep_parent_first {
             rows.sort_by(|a, b| {
-                let a_root = a.session.conversation_id == pid;
-                let b_root = b.session.conversation_id == pid;
+                let a_root = self.row_session(a).conversation_id == pid;
+                let b_root = self.row_session(b).conversation_id == pid;
                 b_root
                     .cmp(&a_root)
                     .then_with(|| b.is_pinned.cmp(&a.is_pinned))
@@ -1185,34 +1197,39 @@ impl DashboardView {
             let mut rows: Vec<DisplaySessionRow> = self
                 .cached_sessions
                 .iter()
-                .filter(|s| s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
-                .filter(|s| !apply_search || self.session_matches_search(s))
-                .map(|s| DisplaySessionRow {
+                .enumerate()
+                .filter(|(_, s)| s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
+                .filter(|(_, s)| !apply_search || self.session_matches_search(s))
+                .map(|(idx, s)| DisplaySessionRow {
+                    sess_idx: idx,
+                    out_of_scope: false,
+                    sliced: None,
                     counts: s.counts,
                     primary_model: s.primary_model(),
                     last_time: s.last_time,
                     subagent_count: 0,
                     is_child_row: s.parent_id.as_deref() == Some(pid.as_str()),
                     is_pinned: self.pinned_ids.contains(&s.conversation_id),
-                    out_of_scope: false,
-                    session: s.clone(),
                 })
                 .collect();
             if include_out_of_scope_pins {
-                for s in &self.pinned_out_of_scope {
+                for (idx, s) in self.pinned_out_of_scope.iter().enumerate() {
                     if (s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
                         && (!apply_search || self.session_matches_search(s))
-                        && !rows.iter().any(|r| r.session.conversation_id == s.conversation_id)
+                        && !rows
+                            .iter()
+                            .any(|r| self.row_session(r).conversation_id == s.conversation_id)
                     {
                         rows.push(DisplaySessionRow {
+                            sess_idx: idx,
+                            out_of_scope: true,
+                            sliced: None,
                             counts: s.counts,
                             primary_model: s.primary_model(),
                             last_time: s.last_time,
                             subagent_count: 0,
                             is_child_row: s.parent_id.as_deref() == Some(pid.as_str()),
                             is_pinned: true,
-                            out_of_scope: true,
-                            session: s.clone(),
                         });
                     }
                 }
@@ -1229,42 +1246,65 @@ impl DashboardView {
         let use_grouping = self.group_subagents && !force_flat;
 
         // Model / day / week filters: rows count only the matching turns of each session.
-        let sliced_storage: Vec<SessionInfo>;
-        let base: &[SessionInfo] = match filter.filter(|f| f.slices_turns()) {
+        let slicer = filter.filter(|f| f.slices_turns());
+        let sliced_storage: Vec<(usize, SessionInfo)>;
+        let filtered: Vec<(usize, &SessionInfo, bool)> = match slicer {
             Some(f) => {
-                sliced_storage = self.cached_sessions.iter().filter_map(|s| slice_session(s, f)).collect();
-                &sliced_storage
+                sliced_storage = self
+                    .cached_sessions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, s)| slice_session(s, f).map(|sl| (idx, sl)))
+                    .collect();
+                sliced_storage
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, s))| filter.map(|flt| flt.matches(s)).unwrap_or(true))
+                    .filter(|(_, (_, s))| !apply_search || self.session_matches_search(s))
+                    .map(|(sl_idx, (_, s))| (sl_idx, s, true))
+                    .collect()
             }
-            None => &self.cached_sessions,
+            None => {
+                sliced_storage = Vec::new();
+                self.cached_sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| filter.map(|f| f.matches(s)).unwrap_or(true))
+                    .filter(|(_, s)| !apply_search || self.session_matches_search(s))
+                    .map(|(idx, s)| (idx, s, false))
+                    .collect()
+            }
         };
-
-        let filtered: Vec<&SessionInfo> = base
-            .iter()
-            .filter(|s| filter.map(|f| f.matches(s)).unwrap_or(true))
-            .filter(|s| !apply_search || self.session_matches_search(s))
-            .collect();
 
         let mut rows = if !use_grouping {
             filtered
                 .into_iter()
-                .map(|s| DisplaySessionRow {
-                    counts: s.counts,
-                    primary_model: s.primary_model(),
-                    last_time: s.last_time,
-                    subagent_count: 0,
-                    is_child_row: s.is_subagent,
-                    is_pinned: self.pinned_ids.contains(&s.conversation_id),
-                    out_of_scope: false,
-                    session: s.clone(),
+                .map(|(idx, s, is_sliced)| {
+                    let (sess_idx, sliced) = if is_sliced {
+                        (sliced_storage[idx].0, Some(Box::new(s.clone())))
+                    } else {
+                        (idx, None)
+                    };
+                    DisplaySessionRow {
+                        sess_idx,
+                        out_of_scope: false,
+                        sliced,
+                        counts: s.counts,
+                        primary_model: s.primary_model(),
+                        last_time: s.last_time,
+                        subagent_count: 0,
+                        is_child_row: s.is_subagent,
+                        is_pinned: self.pinned_ids.contains(&s.conversation_id),
+                    }
                 })
                 .collect()
         } else {
             let present_ids: std::collections::HashSet<&str> = filtered
                 .iter()
-                .map(|s| s.conversation_id.as_str())
+                .map(|(_, s, _)| s.conversation_id.as_str())
                 .collect();
             let mut children_by_parent: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
-            for s in &filtered {
+            for (_, s, _) in &filtered {
                 if let Some(pid) = s.parent_id.as_deref() {
                     if present_ids.contains(pid) {
                         children_by_parent.entry(pid).or_default().push(*s);
@@ -1273,7 +1313,7 @@ impl DashboardView {
             }
 
             let mut out = Vec::with_capacity(filtered.len());
-            for s in &filtered {
+            for &(idx, s, is_sliced) in &filtered {
                 // Skip subagents whose parent is already shown in this view (they roll up into parent).
                 if let Some(pid) = s.parent_id.as_deref() {
                     if present_ids.contains(pid) {
@@ -1294,15 +1334,21 @@ impl DashboardView {
                         }
                     }
                 }
+                let (sess_idx, sliced) = if is_sliced {
+                    (sliced_storage[idx].0, Some(Box::new(s.clone())))
+                } else {
+                    (idx, None)
+                };
                 out.push(DisplaySessionRow {
+                    sess_idx,
+                    out_of_scope: false,
+                    sliced,
                     counts,
                     primary_model: s.primary_model(),
                     last_time,
                     subagent_count: sub_cnt,
                     is_child_row: s.is_subagent,
                     is_pinned: self.pinned_ids.contains(&s.conversation_id),
-                    out_of_scope: false,
-                    session: (*s).clone(),
                 });
             }
             out
@@ -1316,9 +1362,9 @@ impl DashboardView {
         if allow_oos {
             let existing: HashSet<String> = rows
                 .iter()
-                .map(|r| r.session.conversation_id.clone())
+                .map(|r| self.row_session(r).conversation_id.clone())
                 .collect();
-            for s in &self.pinned_out_of_scope {
+            for (idx, s) in self.pinned_out_of_scope.iter().enumerate() {
                 if existing.contains(&s.conversation_id) {
                     continue;
                 }
@@ -1330,19 +1376,18 @@ impl DashboardView {
                 if apply_search && !self.session_matches_search(s) {
                     continue;
                 }
-                let eff = match filter.filter(|f| f.slices_turns()) {
-                    Some(f) => slice_session(s, f).unwrap_or_else(|| s.clone()),
-                    None => s.clone(),
-                };
+                let sliced = slicer.and_then(|f| slice_session(s, f)).map(Box::new);
+                let eff = sliced.as_deref().unwrap_or(s);
                 rows.push(DisplaySessionRow {
+                    sess_idx: idx,
+                    out_of_scope: true,
                     counts: eff.counts,
                     primary_model: eff.primary_model(),
                     last_time: eff.last_time,
                     subagent_count: 0,
                     is_child_row: eff.is_subagent,
                     is_pinned: true,
-                    out_of_scope: true,
-                    session: eff,
+                    sliced,
                 });
             }
         }
@@ -1588,7 +1633,7 @@ impl DashboardView {
     /// Per-call CSV (UTF-8 BOM). Only token metadata and tool *names* are exported — never
     /// prompts, tool arguments, or outputs; session labels follow privacy mode.
     pub fn export_calls_csv(&self) -> String {
-        let mut out = String::from("\u{FEFF}time,session_id,source,step,model,kind,tools,tool_count,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,context_tokens,cache_hit_pct,thinking_chars,gen_secs,output_tps,gap_secs,cost_usd,workspace,session_title\n");
+        let mut out = String::from("\u{FEFF}time,session_id,source,step,model,kind,tools,tool_count,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens,context_tokens,cache_hit_pct,thinking_chars,gen_secs,output_tps,gap_secs,cost_usd,workspace,session_title\n");
         for r in self.call_rows() {
             let s = self.call_session(&r);
             let t = &s.turns[r.turn_idx];
@@ -1609,7 +1654,7 @@ impl DashboardView {
                 format!("{:.6}", t.cost.total_usd())
             };
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{},{}\n",
                 time,
                 csv_escape(&self.format_session_id(&s.conversation_id)),
                 s.source.as_str(),
@@ -1622,6 +1667,7 @@ impl DashboardView {
                 t.cache_read_tokens,
                 t.cache_write_tokens,
                 t.output_tokens,
+                t.reasoning_tokens,
                 t.total_tokens(),
                 t.total_input(),
                 t.cache_hit_rate(),
@@ -1789,7 +1835,7 @@ impl DashboardView {
     }
 
     pub fn export_sessions_csv(&self) -> String {
-        let mut out = String::from("\u{FEFF}id,source,archived,last_active,calls,active_secs,thinking_turns,model,cache_hit_pct,input_tokens,cache_read_tokens,output_tokens,total_tokens,cost_usd,peak_context,workspace,title\n");
+        let mut out = String::from("\u{FEFF}id,source,archived,last_active,calls,active_secs,thinking_turns,model,cache_hit_pct,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,total_tokens,cost_usd,peak_context,workspace,title\n");
         let csv_esc = |s: &str| {
             if s.contains([',', '"', '\n', '\r']) {
                 format!("\"{}\"", s.replace('"', "\"\""))
@@ -1798,7 +1844,7 @@ impl DashboardView {
             }
         };
         for row in self.display_sessions(true) {
-            let s = &row.session;
+            let s = self.row_session(&row);
             let sid = self.format_session_id(&s.conversation_id);
             let title = self.format_session_title(s);
             let ws = self.format_workspace_label(&s.workspace);
@@ -1808,7 +1854,7 @@ impl DashboardView {
                 .unwrap_or_default();
             let c = row.counts;
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{:.6},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{:.6},{},{},{}\n",
                 csv_esc(&sid),
                 s.source.as_str(),
                 s.is_archived,
@@ -1820,6 +1866,7 @@ impl DashboardView {
                 c.cache_hit_rate(),
                 c.input_tokens,
                 c.cache_read_tokens,
+                c.cache_write_tokens,
                 c.output_tokens,
                 c.total_tokens(),
                 c.cost.total_usd(),
@@ -1900,7 +1947,7 @@ impl DashboardView {
                     } else {
                         let short_ws = workspace_short_name(&s.workspace);
                         (
-                            s.conversation_id[..s.conversation_id.len().min(8)].to_string(),
+                            s.conversation_id.chars().take(8).collect(),
                             s.title.clone(),
                             if short_ws.is_empty() {
                                 "(未知工作区)".to_string()
@@ -1927,7 +1974,7 @@ impl DashboardView {
             self.display_sessions(true)
                 .into_iter()
                 .map(|r| {
-                    let s = &r.session;
+                    let s = self.row_session(&r);
                     json!({
                         "id": self.format_session_id(&s.conversation_id),
                         "title": self.format_session_title(s),
@@ -2237,8 +2284,8 @@ impl DashboardView {
                     let (primary, secondary) = self.ordered_models(self.model_sort);
                     let mut lines = vec![
                         format!("{brand_hdr}按模型用量与估算费用 ({})", scope_lbl),
-                        "| 模型 | 调用 | 命中率 | 稳定命中(第2轮起) | 未命中 | 输出速度(tok/s) | 新增输入 | 缓存读取 | 输出 | 总 Token | 估算费用(USD) | 峰值Ctx |".to_string(),
-                        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+                        "| 模型 | 调用 | 命中率 | 稳定命中(第2轮起) | 未命中 | 输出速度(tok/s) | 新增输入 | 缓存读取 | 缓存写入 | 输出 | 总 Token | 估算费用(USD) | 峰值Ctx |".to_string(),
+                        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
                     ];
                     let fmt_row = |name: &str, c: &TokenCounts, mcs: Option<&ModelCacheStats>, tag: &str| {
                         let mt = mcs
@@ -2254,7 +2301,7 @@ impl DashboardView {
                             .map(|v| format!("{v:.0}"))
                             .unwrap_or_else(|| "-".into());
                         format!(
-                            "| {}{} | {} | {:.1}% | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                            "| {}{} | {} | {:.1}% | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                             name,
                             tag,
                             c.calls,
@@ -2264,6 +2311,7 @@ impl DashboardView {
                             speed,
                             fmt_compact(c.input_tokens),
                             fmt_compact(c.cache_read_tokens),
+                            fmt_compact(c.cache_write_tokens),
                             fmt_compact(c.output_tokens),
                             fmt_compact(c.total_tokens()),
                             fmt_cost(&c.cost, c.calls, false),
@@ -2288,7 +2336,7 @@ impl DashboardView {
                     lines.join("\n")
                 } else {
                     format!(
-                        "{brand_hdr}Token & API 费用统计 ({})\n- 会话: {} | 调用: {}\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%)\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
+                        "{brand_hdr}Token & API 费用统计 ({})\n- 会话: {} | 调用: {}\n- 估算 API 费用: {} (新输入 {} / 缓存读 {} / 输出 {} · 缓存已省 {})\n- 新增输入: {} | 缓存读取: {} (命中 {:.1}%) | 缓存写入: {}\n- 输出: {} | 总 Token: {} (非缓存增量: {})\n- 峰值Ctx: {}",
                         scope_lbl,
                         sess_cnt,
                         t.calls,
@@ -2300,6 +2348,7 @@ impl DashboardView {
                         fmt_commas(t.input_tokens),
                         fmt_commas(t.cache_read_tokens),
                         t.cache_hit_rate(),
+                        fmt_commas(t.cache_write_tokens),
                         fmt_commas(t.output_tokens),
                         fmt_commas(t.total_tokens()),
                         fmt_commas(t.non_cached_tokens()),
@@ -2372,10 +2421,10 @@ impl DashboardView {
                     let keep = self
                         .selected_session
                         .as_deref()
-                        .map(|id| matches.iter().any(|r| r.session.conversation_id == id))
+                        .map(|id| matches.iter().any(|r| self.row_session(r).conversation_id == id))
                         .unwrap_or(false);
                     if !keep {
-                        self.selected_session = matches.first().map(|r| r.session.conversation_id.clone());
+                        self.selected_session = matches.first().map(|r| self.row_session(r).conversation_id.clone());
                     }
                 }
                 (false, false)
@@ -2495,10 +2544,10 @@ impl DashboardView {
         let keep = self
             .selected_session
             .as_ref()
-            .map(|id| visible.iter().any(|r| &r.session.conversation_id == id))
+            .map(|id| visible.iter().any(|r| &self.row_session(r).conversation_id == id))
             .unwrap_or(false);
         if !keep {
-            self.selected_session = visible.first().map(|r| r.session.conversation_id.clone());
+            self.selected_session = visible.first().map(|r| self.row_session(r).conversation_id.clone());
         }
     }
 
@@ -3232,8 +3281,32 @@ impl DashboardView {
             let title = if self.cost_mode { "今日分时费用 ($)" } else { "今日分时趋势" };
             (title, items, Vec::new(), "今日暂无用量 · 右上角可切换 7天 / 全部")
         } else {
-            let n_days: u64 = match self.scope {
-                DateScope::Days7 => 7,
+            let (end_day, n_days): (NaiveDate, u64) = match self.scope {
+                DateScope::Days7 => (today, 7),
+                DateScope::Custom => {
+                    let end = self
+                        .custom_until
+                        .or_else(|| {
+                            self.cached_agg
+                                .by_day
+                                .keys()
+                                .next_back()
+                                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                        })
+                        .unwrap_or(today);
+                    let start = self
+                        .custom_since
+                        .or_else(|| {
+                            self.cached_agg
+                                .by_day
+                                .keys()
+                                .next()
+                                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                        })
+                        .unwrap_or(end);
+                    let span = ((end - start).num_days() + 1).clamp(1, 14) as u64;
+                    (end, span)
+                }
                 _ => {
                     let earliest = self
                         .cached_agg
@@ -3241,16 +3314,17 @@ impl DashboardView {
                         .keys()
                         .next()
                         .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-                    match earliest {
+                    let span = match earliest {
                         Some(d) => ((today - d).num_days() + 1).clamp(7, 14) as u64,
                         None => 7,
-                    }
+                    };
+                    (today, span)
                 }
             };
             let mut days_keys: Vec<Option<String>> = Vec::new();
             let items: Vec<BarItem> = (0..n_days)
                 .rev()
-                .filter_map(|off| today.checked_sub_days(chrono::Days::new(off)))
+                .filter_map(|off| end_day.checked_sub_days(chrono::Days::new(off)))
                 .map(|d| {
                     let k = d.format("%Y-%m-%d").to_string();
                     let c = self.cached_agg.by_day.get(&k).copied().unwrap_or_default();
@@ -3792,7 +3866,7 @@ impl DashboardView {
             let now_local = Local::now();
             let row_h = (avail_h / max_vis as f32).clamp(26.0, 32.0);
             for (i, row) in recent_rows.iter().take(show_n).enumerate() {
-                let s = &row.session;
+                let s = self.row_session(row);
                 let ry = list_y + i as f32 * row_h;
                 let cell_h = row_h - 2.0;
                 let rr = rect_f(rr_l, ry, rr_w, cell_h);
@@ -3880,10 +3954,11 @@ impl DashboardView {
                     human,
                 );
 
-                self.session_row_rects.push((rr, s.conversation_id.clone()));
+                let cid = s.conversation_id.clone();
+                self.session_row_rects.push((rr, cid.clone()));
                 self.hit_boxes.push(HitBox {
                     rect: rr,
-                    action: ClickAction::InspectSession(s.conversation_id.clone()),
+                    action: ClickAction::InspectSession(cid),
                 });
             }
         }
@@ -5930,7 +6005,7 @@ impl DashboardView {
         } else {
             let mut prev_was_pinned = false;
             for (vi, row) in sorted.iter().skip(self.scroll_rows).take(vis).enumerate() {
-                let s = &row.session;
+                let s = self.row_session(row);
                 let ry = list_y + vi as f32 * row_h;
                 let cell_h = row_h - 2.0;
                 let rr = rect_f(rr_l, ry, rr_w, cell_h);
@@ -6078,15 +6153,16 @@ impl DashboardView {
                     human,
                 );
 
-                self.session_row_rects.push((rr, s.conversation_id.clone()));
+                let cid = s.conversation_id.clone();
+                self.session_row_rects.push((rr, cid.clone()));
                 self.hit_boxes.push(HitBox {
                     rect: rr,
-                    action: ClickAction::SelectSession(s.conversation_id.clone()),
+                    action: ClickAction::SelectSession(cid.clone()),
                 });
                 // Push pin star hitbox AFTER row hitbox so reverse-order hit_test_click hits star first.
                 self.hit_boxes.push(HitBox {
                     rect: star_r,
-                    action: ClickAction::TogglePinSession(s.conversation_id.clone()),
+                    action: ClickAction::TogglePinSession(cid),
                 });
             }
 
@@ -7368,7 +7444,7 @@ mod tests {
         // Grouped mode rolls child into parent (1 row, 5 calls total, subagent_count=1)
         let grouped = view.display_sessions(true);
         assert_eq!(grouped.len(), 1);
-        assert_eq!(grouped[0].session.conversation_id, "p1");
+        assert_eq!(view.row_session(&grouped[0]).conversation_id, "p1");
         assert_eq!(grouped[0].subagent_count, 1);
         assert_eq!(grouped[0].counts.calls, 5);
 
@@ -7376,16 +7452,16 @@ mod tests {
         view.session_filter = Some(SessionFilter::Model("gemini-4-hydrogen-tiered-xhigh".into()));
         let by_model = view.display_sessions(true);
         assert_eq!(by_model.len(), 1);
-        assert_eq!(by_model[0].session.conversation_id, "c1");
+        assert_eq!(view.row_session(&by_model[0]).conversation_id, "c1");
         assert!(by_model[0].is_child_row);
 
         // Parent drill-down expands parent first, then its subagent
         view.session_filter = Some(SessionFilter::Parent("p1".into(), "p1".into()));
         let expanded = view.display_sessions(true);
         assert_eq!(expanded.len(), 2);
-        assert_eq!(expanded[0].session.conversation_id, "p1");
+        assert_eq!(view.row_session(&expanded[0]).conversation_id, "p1");
         assert!(!expanded[0].is_child_row);
-        assert_eq!(expanded[1].session.conversation_id, "c1");
+        assert_eq!(view.row_session(&expanded[1]).conversation_id, "c1");
         assert!(expanded[1].is_child_row);
     }
 
@@ -7904,10 +7980,10 @@ mod tests {
         // 2) Sessions tab list shows pinned session FIRST, followed by in-scope session; unpinned old stays excluded
         let tab_rows = view.display_sessions_for_tab();
         assert_eq!(tab_rows.len(), 2);
-        assert_eq!(tab_rows[0].session.conversation_id, "old-pinned-0002");
+        assert_eq!(view.row_session(&tab_rows[0]).conversation_id, "old-pinned-0002");
         assert!(tab_rows[0].is_pinned);
         assert!(tab_rows[0].out_of_scope);
-        assert_eq!(tab_rows[1].session.conversation_id, "today-sess-0001");
+        assert_eq!(view.row_session(&tab_rows[1]).conversation_id, "today-sess-0001");
         assert!(!tab_rows[1].is_pinned);
         assert!(!tab_rows[1].out_of_scope);
 
@@ -8197,7 +8273,7 @@ mod tests {
         view.ensure_filtered(&snap);
         let rows = view.display_sessions_for_tab();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session.conversation_id, "secret-hist-0002");
+        assert_eq!(view.row_session(&rows[0]).conversation_id, "secret-hist-0002");
         assert_eq!(view.selected_session.as_deref(), Some("secret-hist-0002"));
 
         // Drilling into an older ISO week from Today also expands to All and returns full week sessions
@@ -8216,7 +8292,7 @@ mod tests {
         view.ensure_filtered(&snap);
         let wk_rows = view.display_sessions_for_tab();
         assert_eq!(wk_rows.len(), 1);
-        assert_eq!(wk_rows[0].session.conversation_id, "secret-hist-0002");
+        assert_eq!(view.row_session(&wk_rows[0]).conversation_id, "secret-hist-0002");
     }
 
     #[test]
@@ -8262,7 +8338,7 @@ mod tests {
         view.session_filter = Some(SessionFilter::Agent(AgentFamily::Codex));
         let codex_rows = view.display_sessions(true);
         assert_eq!(codex_rows.len(), 1);
-        assert_eq!(codex_rows[0].session.conversation_id, "codex-uuid-0003");
+        assert_eq!(view.row_session(&codex_rows[0]).conversation_id, "codex-uuid-0003");
         view.session_filter = None;
 
         // 2) Under privacy_mode, agent aliases & SourceKind::label_short() still match in Sessions & Calls
@@ -8276,7 +8352,7 @@ mod tests {
             view.search_query = q.into();
             let s_hits = view.display_sessions(true);
             assert_eq!(s_hits.len(), 1, "sessions query={q}");
-            assert_eq!(s_hits[0].session.conversation_id, expected_cid);
+            assert_eq!(view.row_session(&s_hits[0]).conversation_id, expected_cid);
             let c_hits = view.call_rows();
             assert_eq!(c_hits.len(), expected_calls, "calls query={q}");
             assert!(c_hits.iter().all(|r| view.call_session(r).conversation_id == expected_cid));

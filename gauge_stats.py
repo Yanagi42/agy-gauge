@@ -1954,7 +1954,7 @@ def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dic
                 continue
 
             rec_type = str(obj.get("type") or "")
-            if rec_type == "session_metadata" or (
+            if rec_type in ("session_metadata", "session", "header", "metadata") or (
                 "sessionId" in obj and not rec_type and "tokens" not in obj
             ):
                 if isinstance(obj.get("sessionId"), str) and obj["sessionId"].strip():
@@ -4675,14 +4675,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.data_dir is not None:
         primary_dir = args.data_dir.expanduser()
         sources = [SourceSpec("antigravity", primary_dir, _infer_source_name(primary_dir))]
+        agent_filter = {"antigravity"}
     elif args.single_source:
         primary_dir = DEFAULT_DATA_DIR
         sources = [SourceSpec("antigravity", primary_dir, "cli")]
+        agent_filter = {"antigravity"}
     else:
         sources = discover_default_sources(agent_filter)
         primary_dir = sources[0].root if sources else DEFAULT_DATA_DIR
 
-    archive_path = None if args.no_archive else DEFAULT_ARCHIVE_PATH
+    archive_path = None if (args.no_archive or args.data_dir is not None) else DEFAULT_ARCHIVE_PATH
     report = scan_usage(
         data_dir=primary_dir,
         tz=tz,

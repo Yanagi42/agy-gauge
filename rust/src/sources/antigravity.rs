@@ -296,15 +296,16 @@ fn parse_transcript_file(path: &Path, sig: FileSig) -> Option<CachedTranscript> 
     let mut last_step_running = false;
     let mut skipped_lines = 0usize;
     let mut generic_ts: HashMap<i64, DateTime<Utc>> = HashMap::new();
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
 
     loop {
-        line.clear();
-        let Ok(n) = reader.read_line(&mut line) else { break };
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else { break };
         if n == 0 {
             break;
         }
-        let trimmed = line.trim();
+        let line_cow = String::from_utf8_lossy(&buf);
+        let trimmed = line_cow.trim();
         if trimmed.is_empty() {
             continue;
         }

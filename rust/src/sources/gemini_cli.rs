@@ -479,18 +479,19 @@ fn parse_session_jsonl(path: &Path, fh: File, sig: FileSig) -> CachedSessionFile
     let mut meta = SessionMetaState::default();
     let mut messages: Vec<Map<String, Value>> = Vec::new();
     let mut skipped_lines = 0usize;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut first_line = true;
 
     loop {
-        line.clear();
-        let Ok(n) = reader.read_line(&mut line) else {
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else {
             break;
         };
         if n == 0 {
             break;
         }
-        let mut trimmed = line.trim();
+        let line_cow = String::from_utf8_lossy(&buf);
+        let mut trimmed = line_cow.trim();
         if first_line {
             trimmed = trimmed.trim_start_matches('\u{feff}').trim();
             first_line = false;
@@ -545,7 +546,13 @@ fn parse_session_jsonl(path: &Path, fh: File, sig: FileSig) -> CachedSessionFile
         // 3. Header/metadata record vs appended message record.
         let msg_type = map.get("type").and_then(Value::as_str).map(str::trim);
         let is_explicit_header = map.contains_key("sessionId")
-            && matches!(msg_type, None | Some("session") | Some("header") | Some("metadata"));
+            && matches!(
+                msg_type,
+                None | Some("session")
+                    | Some("header")
+                    | Some("metadata")
+                    | Some("session_metadata")
+            );
 
         if is_explicit_header
             || (msg_type.is_none()
