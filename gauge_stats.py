@@ -26,22 +26,16 @@ Safety guarantees:
 
 from __future__ import annotations
 
-import argparse
-import csv
 import datetime as dt
-import hashlib
 import io
 import json
 import os
 import pathlib
 import re
+import stat
 import sys
 import time
-import unicodedata
-import urllib.parse
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Any, Sequence
 
 
 DEFAULT_DATA_DIR = pathlib.Path.home() / ".gemini" / "antigravity-cli"
@@ -75,11 +69,27 @@ _AGENT_ALIASES: dict[str, str] = {
 }
 
 
-@dataclass(frozen=True)
 class SourceSpec:
-    kind: str  # "antigravity" | "claude" | "codex" | "gemini"
-    root: pathlib.Path
-    source_name: str  # "cli" | "app" | "ide" | "custom" | "claude" | "codex" | "gemini"
+    __slots__ = ("kind", "root", "source_name")
+
+    def __init__(self, kind: str, root: pathlib.Path, source_name: str) -> None:
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "source_name", source_name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(f"SourceSpec is immutable (cannot set {name!r})")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SourceSpec):
+            return NotImplemented
+        return (self.kind, self.root, self.source_name) == (other.kind, other.root, other.source_name)
+
+    def __hash__(self) -> int:
+        return hash((self.kind, self.root, self.source_name))
+
+    def __repr__(self) -> str:
+        return f"SourceSpec(kind={self.kind!r}, root={self.root!r}, source_name={self.source_name!r})"
 
 
 def _infer_source_name(path: pathlib.Path) -> str:
@@ -121,39 +131,46 @@ def source_to_agent_family(source: str) -> str:
     return "antigravity"
 
 
+_SOURCE_BADGES: dict[str, str] = {
+    "cli": "AGY",
+    "app": "App",
+    "ide": "IDE",
+    "custom": "Custom",
+    "claude": "Claude",
+    "codex": "Codex",
+    "gemini": "Gemini",
+}
+
+_SOURCE_DISPLAY_LABELS: dict[str, str] = {
+    "cli": "Antigravity CLI",
+    "app": "Antigravity App",
+    "ide": "Antigravity IDE",
+    "custom": "Antigravity Custom",
+    "claude": "Claude Code",
+    "codex": "Codex CLI",
+    "gemini": "Gemini CLI",
+}
+
+_AGENT_DISPLAY_LABELS: dict[str, str] = {
+    "antigravity": "Antigravity",
+    "claude": "Claude Code",
+    "codex": "Codex CLI",
+    "gemini": "Gemini CLI",
+}
+
+
 def source_badge(source: str) -> str:
     low = source.strip().lower()
-    return {
-        "cli": "AGY",
-        "app": "App",
-        "ide": "IDE",
-        "custom": "Custom",
-        "claude": "Claude",
-        "codex": "Codex",
-        "gemini": "Gemini",
-    }.get(low, source or "AGY")
+    return _SOURCE_BADGES.get(low, source or "AGY")
 
 
 def source_display_label(source: str) -> str:
     low = source.strip().lower()
-    return {
-        "cli": "Antigravity CLI",
-        "app": "Antigravity App",
-        "ide": "Antigravity IDE",
-        "custom": "Antigravity Custom",
-        "claude": "Claude Code",
-        "codex": "Codex CLI",
-        "gemini": "Gemini CLI",
-    }.get(low, source or "Antigravity")
+    return _SOURCE_DISPLAY_LABELS.get(low, source or "Antigravity")
 
 
 def agent_display_label(family: str) -> str:
-    return {
-        "antigravity": "Antigravity",
-        "claude": "Claude Code",
-        "codex": "Codex CLI",
-        "gemini": "Gemini CLI",
-    }.get(family, family)
+    return _AGENT_DISPLAY_LABELS.get(family, family)
 
 
 def parse_agent_filter(raw_values: Sequence[str] | None) -> set[str] | None:
@@ -267,20 +284,56 @@ _USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DO
 _PBTXT_TITLE_RE = re.compile(r'(?m)^\s*title\s*:\s*"((?:\\.|[^"\\])*)"')
 _PBTXT_ESCAPE_RE = re.compile(r"\\([0-7]{1,3}|x[0-9a-fA-F]{2}|[abfnrtv\\\"'?])")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+_WIN_DRIVE_URI_RE = re.compile(r"^/[A-Za-z]:/")
+_FRAC_SEC_RE = re.compile(r"(\.\d{6})\d+")
+_JSON_WS_RE = re.compile(r"[ \t\n\r]*")
+_AGY_FAST_RE = re.compile(
+    r'^\{"step_index":(\d+),"source":"[^"\\]*","type":"([^"\\]+)","status":"([^"\\]+)","created_at":"([^"\\]+)"'
+    r'(?:,"model":"([^"\\]*)")?'
+    r',"input_tokens":(\d+),"cache_read_tokens":(\d+)'
+    r'(?:,"cache_write_tokens":(\d+))?'
+    r',"output_tokens":(\d+)'
+)
+_PY311_PLUS = sys.version_info >= (3, 11)
+_UTC = dt.timezone.utc
+_FROMISOFORMAT = dt.datetime.fromisoformat
+_JSON_DECODE = json.JSONDecoder().decode
 
 _EFFORT_SUFFIXES = ("-xhigh", "-high", "-medium", "-med", "-low", "-minimal", "-max", "-none")
 _CARBON_STD_DATE = dt.date(2026, 12, 1)
 _FLASH38_STD_DATE = dt.date(2027, 1, 1)
 
 
-@dataclass(frozen=True)
 class ModelRate:
     """USD per 1,000,000 tokens."""
 
-    input: float
-    cache_read: float
-    cache_write: float
-    output: float
+    __slots__ = ("input", "cache_read", "cache_write", "output")
+
+    def __init__(self, input: float, cache_read: float, cache_write: float, output: float) -> None:
+        object.__setattr__(self, "input", input)
+        object.__setattr__(self, "cache_read", cache_read)
+        object.__setattr__(self, "cache_write", cache_write)
+        object.__setattr__(self, "output", output)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(f"ModelRate is immutable (cannot set {name!r})")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ModelRate):
+            return NotImplemented
+        return (self.input, self.cache_read, self.cache_write, self.output) == (
+            other.input, other.cache_read, other.cache_write, other.output
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.input, self.cache_read, self.cache_write, self.output))
+
+    def __repr__(self) -> str:
+        return (
+            f"ModelRate(input={self.input!r}, cache_read={self.cache_read!r}, "
+            f"cache_write={self.cache_write!r}, output={self.output!r})"
+        )
 
     def calculate(
         self,
@@ -290,16 +343,22 @@ class ModelRate:
         output_tokens: int,
         cache_write_1h_tokens: int = 0,
     ) -> "CostBreakdown":
-        per_m = 1_000_000.0
-        in_usd = (input_tokens / per_m) * self.input
-        cr_usd = (cache_read_tokens / per_m) * self.cache_read
-        cw_1h = min(max(0, cache_write_1h_tokens), max(0, cache_write_tokens))
-        cw_5m = max(0, cache_write_tokens - cw_1h)
-        cw_usd = (cw_5m / per_m) * self.cache_write + (cw_1h / per_m) * (self.input * 2.0)
-        out_usd = (output_tokens / per_m) * self.output
+        inv_m = 1e-6
+        in_usd = input_tokens * inv_m * self.input
+        cr_usd = cache_read_tokens * inv_m * self.cache_read
+        if cache_write_tokens > 0:
+            if cache_write_1h_tokens > 0:
+                cw_1h = cache_write_1h_tokens if cache_write_1h_tokens < cache_write_tokens else cache_write_tokens
+                cw_5m = cache_write_tokens - cw_1h
+                cw_usd = cw_5m * inv_m * self.cache_write + cw_1h * inv_m * (self.input * 2.0)
+            else:
+                cw_usd = cache_write_tokens * inv_m * self.cache_write
+        else:
+            cw_usd = 0.0
+        out_usd = output_tokens * inv_m * self.output
         saved_usd = (
-            (cache_read_tokens / per_m) * (self.input - self.cache_read)
-            if self.input > self.cache_read
+            cache_read_tokens * inv_m * (self.input - self.cache_read)
+            if cache_read_tokens > 0 and self.input > self.cache_read
             else 0.0
         )
         return CostBreakdown(
@@ -312,14 +371,57 @@ class ModelRate:
         )
 
 
-@dataclass
 class CostBreakdown:
-    input_usd: float = 0.0
-    cache_read_usd: float = 0.0
-    cache_write_usd: float = 0.0
-    output_usd: float = 0.0
-    cache_saved_usd: float = 0.0
-    unpriced_calls: int = 0
+    __slots__ = (
+        "input_usd",
+        "cache_read_usd",
+        "cache_write_usd",
+        "output_usd",
+        "cache_saved_usd",
+        "unpriced_calls",
+    )
+
+    def __init__(
+        self,
+        input_usd: float = 0.0,
+        cache_read_usd: float = 0.0,
+        cache_write_usd: float = 0.0,
+        output_usd: float = 0.0,
+        cache_saved_usd: float = 0.0,
+        unpriced_calls: int = 0,
+    ) -> None:
+        self.input_usd = input_usd
+        self.cache_read_usd = cache_read_usd
+        self.cache_write_usd = cache_write_usd
+        self.output_usd = output_usd
+        self.cache_saved_usd = cache_saved_usd
+        self.unpriced_calls = unpriced_calls
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CostBreakdown):
+            return NotImplemented
+        return (
+            self.input_usd,
+            self.cache_read_usd,
+            self.cache_write_usd,
+            self.output_usd,
+            self.cache_saved_usd,
+            self.unpriced_calls,
+        ) == (
+            other.input_usd,
+            other.cache_read_usd,
+            other.cache_write_usd,
+            other.output_usd,
+            other.cache_saved_usd,
+            other.unpriced_calls,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"CostBreakdown(input_usd={self.input_usd!r}, cache_read_usd={self.cache_read_usd!r}, "
+            f"cache_write_usd={self.cache_write_usd!r}, output_usd={self.output_usd!r}, "
+            f"cache_saved_usd={self.cache_saved_usd!r}, unpriced_calls={self.unpriced_calls!r})"
+        )
 
     @property
     def total_usd(self) -> float:
@@ -345,6 +447,9 @@ class CostBreakdown:
         return calls > 0 and self.unpriced_calls >= calls
 
 
+_ZERO_COST = CostBreakdown()
+
+
 _PROVIDER_PREFIXES = (
     "us.anthropic.",
     "eu.anthropic.",
@@ -364,13 +469,15 @@ def canonical_exact_key(raw: str) -> str:
     return s.replace("@", "-").replace(".", "-").replace("_", "-")
 
 
-def normalize_model_key(raw: str) -> str:
-    s = canonical_exact_key(raw)
+def _strip_effort_suffix(exact: str) -> str:
     for suffix in _EFFORT_SUFFIXES:
-        if s.endswith(suffix) and len(s) > len(suffix):
-            s = s[: -len(suffix)]
-            break
-    return s
+        if exact.endswith(suffix) and len(exact) > len(suffix):
+            return exact[: -len(suffix)]
+    return exact
+
+
+def normalize_model_key(raw: str) -> str:
+    return _strip_effort_suffix(canonical_exact_key(raw))
 
 
 def _matches_model_prefix(norm: str, prefix: str) -> bool:
@@ -458,6 +565,12 @@ class PricingCatalog:
         self._override_sig: tuple[int, int] | None = None
         # (raw_key, exact_key, prefix, has_effort, base, long_th, long_rate)
         self._custom_rules: list[tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None]] = []
+        # Memoized matched rule spec per raw model string:
+        # (source, rule_name, base, long_th, long_rate, intro_before, intro_rate) | None
+        self._rule_cache: dict[
+            str,
+            tuple[str, str, ModelRate, int | None, ModelRate | None, dt.date | None, ModelRate | None] | None,
+        ] = {}
         self.refresh()
 
     def refresh(self) -> bool:
@@ -466,6 +579,8 @@ class PricingCatalog:
             changed = self._override_sig is not None or bool(self._custom_rules)
             self._override_sig = None
             self._custom_rules = []
+            if changed:
+                self._rule_cache.clear()
             return changed
         try:
             st = path.stat()
@@ -476,6 +591,7 @@ class PricingCatalog:
             return False
         self._override_sig = sig
         self._custom_rules = self._load_rules(path)
+        self._rule_cache.clear()
         return True
 
     @staticmethod
@@ -497,7 +613,7 @@ class PricingCatalog:
                 continue
             raw_key = str(k).strip()
             exact_key = canonical_exact_key(raw_key)
-            prefix = normalize_model_key(raw_key)
+            prefix = _strip_effort_suffix(exact_key)
             if not prefix:
                 continue
             has_effort = exact_key != prefix
@@ -508,36 +624,65 @@ class PricingCatalog:
             rules.append((raw_key, exact_key, prefix, has_effort, base, th, lr))
         return rules
 
+    def _lookup_rule_spec(
+        self, model: str
+    ) -> tuple[str, str, ModelRate, int | None, ModelRate | None, dt.date | None, ModelRate | None] | None:
+        if model in self._rule_cache:
+            return self._rule_cache[model]
+        exact = canonical_exact_key(model)
+        norm = _strip_effort_suffix(exact)
+        spec: tuple[str, str, ModelRate, int | None, ModelRate | None, dt.date | None, ModelRate | None] | None = None
+        if norm and norm not in ("unknown", "compaction") and model != "(上下文压缩)":
+            for raw_key, exact_key, _, _, base, th, lr in self._custom_rules:
+                if exact_key == exact:
+                    spec = ("custom(exact)", raw_key, base, th, lr, None, None)
+                    break
+            if spec is None and self._custom_rules:
+                best: tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None] | None = None
+                for rule in self._custom_rules:
+                    if rule[3]:  # effort-specific custom rule does not match other effort levels
+                        continue
+                    if _matches_model_prefix(norm, rule[2]):
+                        if best is None or len(rule[2]) > len(best[2]):
+                            best = rule
+                if best is not None:
+                    raw_key, _, _, _, base, th, lr = best
+                    spec = ("custom(prefix)", raw_key, base, th, lr, None, None)
+            if spec is None:
+                for display, prefixes, base, th, lr, intro_before, intro_rate, _ in _BUILTIN_SPECS:
+                    if any(_matches_model_prefix(norm, p) for p in prefixes):
+                        spec = ("builtin", display, base, th, lr, intro_before, intro_rate)
+                        break
+        self._rule_cache[model] = spec
+        return spec
+
     def resolve_detail(
         self, model: str, total_input_tokens: int, date_obj: dt.date | None
     ) -> tuple[ModelRate, str, str] | None:
-        exact = canonical_exact_key(model)
-        norm = normalize_model_key(model)
-        if not norm or norm in ("unknown", "compaction") or model == "(上下文压缩)":
+        spec = self._rule_cache.get(model)
+        if spec is None and model not in self._rule_cache:
+            spec = self._lookup_rule_spec(model)
+        if spec is None:
             return None
-        for raw_key, exact_key, _, _, base, th, lr in self._custom_rules:
-            if exact_key == exact:
-                r = lr if (th is not None and lr is not None and total_input_tokens > th) else base
-                return r, "custom(exact)", raw_key
-        best: tuple[str, str, str, bool, ModelRate, int | None, ModelRate | None] | None = None
-        for rule in self._custom_rules:
-            if rule[3]:  # effort-specific custom rule does not match other effort levels
-                continue
-            if _matches_model_prefix(norm, rule[2]):
-                if best is None or len(rule[2]) > len(best[2]):
-                    best = rule
-        if best is not None:
-            raw_key, _, _, _, base, th, lr = best
-            r = lr if (th is not None and lr is not None and total_input_tokens > th) else base
-            return r, "custom(prefix)", raw_key
-        bi = _builtin_detail(norm, total_input_tokens, date_obj)
-        if bi is not None:
-            return bi[0], "builtin", bi[1]
-        return None
+        src, rule_name, base, th, lr, intro_before, intro_rate = spec
+        if intro_before is not None and intro_rate is not None and date_obj is not None and date_obj < intro_before:
+            return intro_rate, src, rule_name
+        if th is not None and lr is not None and total_input_tokens > th:
+            return lr, src, rule_name
+        return base, src, rule_name
 
     def resolve_rate(self, model: str, total_input_tokens: int, date_obj: dt.date | None) -> ModelRate | None:
-        det = self.resolve_detail(model, total_input_tokens, date_obj)
-        return det[0] if det is not None else None
+        spec = self._rule_cache.get(model)
+        if spec is None and model not in self._rule_cache:
+            spec = self._lookup_rule_spec(model)
+        if spec is None:
+            return None
+        _, _, base, th, lr, intro_before, intro_rate = spec
+        if intro_before is not None and intro_rate is not None and date_obj is not None and date_obj < intro_before:
+            return intro_rate
+        if th is not None and lr is not None and total_input_tokens > th:
+            return lr
+        return base
 
     def build_table(self, observed_models: Sequence[str], date_obj: dt.date) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -618,15 +763,62 @@ class PricingCatalog:
         )
 
 
-@dataclass
 class TokenCounts:
-    calls: int = 0
-    input_tokens: int = 0  # Uncached new input tokens
-    cache_read_tokens: int = 0  # Prompt cache hit input tokens
-    cache_write_tokens: int = 0  # Prompt cache creation tokens (if reported)
-    output_tokens: int = 0  # Output tokens (thinking + response + tool calls)
-    peak_context: int = 0  # Max single-call total input tokens
-    cost: CostBreakdown = field(default_factory=CostBreakdown)
+    __slots__ = (
+        "calls",
+        "input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "peak_context",
+        "cost",
+    )
+
+    def __init__(
+        self,
+        calls: int = 0,
+        input_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        output_tokens: int = 0,
+        peak_context: int = 0,
+        cost: CostBreakdown | None = None,
+    ) -> None:
+        self.calls = calls
+        self.input_tokens = input_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self.cache_write_tokens = cache_write_tokens
+        self.output_tokens = output_tokens
+        self.peak_context = peak_context
+        self.cost = CostBreakdown() if cost is None else cost
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TokenCounts):
+            return NotImplemented
+        return (
+            self.calls,
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.output_tokens,
+            self.peak_context,
+            self.cost,
+        ) == (
+            other.calls,
+            other.input_tokens,
+            other.cache_read_tokens,
+            other.cache_write_tokens,
+            other.output_tokens,
+            other.peak_context,
+            other.cost,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"TokenCounts(calls={self.calls!r}, input_tokens={self.input_tokens!r}, "
+            f"cache_read_tokens={self.cache_read_tokens!r}, cache_write_tokens={self.cache_write_tokens!r}, "
+            f"output_tokens={self.output_tokens!r}, peak_context={self.peak_context!r}, cost={self.cost!r})"
+        )
 
     @property
     def total_input_tokens(self) -> int:
@@ -634,7 +826,7 @@ class TokenCounts:
 
     @property
     def total_tokens(self) -> int:
-        return self.total_input_tokens + self.output_tokens
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
 
     @property
     def non_cached_tokens(self) -> int:
@@ -642,7 +834,7 @@ class TokenCounts:
 
     @property
     def cache_hit_rate(self) -> float:
-        denom = self.total_input_tokens
+        denom = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
         if denom <= 0:
             return 0.0
         return (self.cache_read_tokens / denom) * 100.0
@@ -665,8 +857,43 @@ class TokenCounts:
         self.cache_write_tokens += cache_write_tokens
         self.output_tokens += output_tokens
         if cost is not None:
-            self.cost.merge(cost)
+            sc = self.cost
+            sc.input_usd += cost.input_usd
+            sc.cache_read_usd += cost.cache_read_usd
+            sc.cache_write_usd += cost.cache_write_usd
+            sc.output_usd += cost.output_usd
+            sc.cache_saved_usd += cost.cache_saved_usd
+            sc.unpriced_calls += cost.unpriced_calls
         ctx = input_tokens + cache_read_tokens + cache_write_tokens
+        if ctx > self.peak_context:
+            self.peak_context = ctx
+
+    def add_call_inline(
+        self,
+        input_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        output_tokens: int,
+        ctx: int,
+        in_usd: float,
+        cr_usd: float,
+        cw_usd: float,
+        out_usd: float,
+        saved_usd: float,
+        unpriced: int,
+    ) -> None:
+        self.calls += 1
+        self.input_tokens += input_tokens
+        self.cache_read_tokens += cache_read_tokens
+        self.cache_write_tokens += cache_write_tokens
+        self.output_tokens += output_tokens
+        sc = self.cost
+        sc.input_usd += in_usd
+        sc.cache_read_usd += cr_usd
+        sc.cache_write_usd += cw_usd
+        sc.output_usd += out_usd
+        sc.cache_saved_usd += saved_usd
+        sc.unpriced_calls += unpriced
         if ctx > self.peak_context:
             self.peak_context = ctx
 
@@ -676,7 +903,14 @@ class TokenCounts:
         self.cache_read_tokens += other.cache_read_tokens
         self.cache_write_tokens += other.cache_write_tokens
         self.output_tokens += other.output_tokens
-        self.cost.merge(other.cost)
+        sc = self.cost
+        oc = other.cost
+        sc.input_usd += oc.input_usd
+        sc.cache_read_usd += oc.cache_read_usd
+        sc.cache_write_usd += oc.cache_write_usd
+        sc.output_usd += oc.output_usd
+        sc.cache_saved_usd += oc.cache_saved_usd
+        sc.unpriced_calls += oc.unpriced_calls
         if other.peak_context > self.peak_context:
             self.peak_context = other.peak_context
 
@@ -702,23 +936,101 @@ class TokenCounts:
         }
 
 
-@dataclass
 class TurnRecord:
-    conversation_id: str
-    step_index: int
-    timestamp: dt.datetime | None
-    model: str
-    step_type: str
-    status: str
-    input_tokens: int
-    cache_read_tokens: int
-    cache_write_tokens: int
-    output_tokens: int
-    tool_names: tuple[str, ...] = ()
-    thinking_chars: int = 0
-    reasoning_tokens: int = 0
-    cache_write_1h_tokens: int = 0
-    cost: CostBreakdown = field(default_factory=CostBreakdown)
+    __slots__ = (
+        "conversation_id",
+        "step_index",
+        "timestamp",
+        "model",
+        "step_type",
+        "status",
+        "input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "tool_names",
+        "thinking_chars",
+        "reasoning_tokens",
+        "cache_write_1h_tokens",
+        "cost",
+    )
+
+    def __init__(
+        self,
+        conversation_id: str,
+        step_index: int,
+        timestamp: dt.datetime | None,
+        model: str,
+        step_type: str,
+        status: str,
+        input_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        output_tokens: int,
+        tool_names: tuple[str, ...] = (),
+        thinking_chars: int = 0,
+        reasoning_tokens: int = 0,
+        cache_write_1h_tokens: int = 0,
+        cost: CostBreakdown | None = None,
+    ) -> None:
+        self.conversation_id = conversation_id
+        self.step_index = step_index
+        self.timestamp = timestamp
+        self.model = model
+        self.step_type = step_type
+        self.status = status
+        self.input_tokens = input_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self.cache_write_tokens = cache_write_tokens
+        self.output_tokens = output_tokens
+        self.tool_names = tool_names
+        self.thinking_chars = thinking_chars
+        self.reasoning_tokens = reasoning_tokens
+        self.cache_write_1h_tokens = cache_write_1h_tokens
+        self.cost = CostBreakdown() if cost is None else cost
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TurnRecord):
+            return NotImplemented
+        return (
+            self.conversation_id,
+            self.step_index,
+            self.timestamp,
+            self.model,
+            self.step_type,
+            self.status,
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.output_tokens,
+            self.tool_names,
+            self.thinking_chars,
+            self.reasoning_tokens,
+            self.cache_write_1h_tokens,
+            self.cost,
+        ) == (
+            other.conversation_id,
+            other.step_index,
+            other.timestamp,
+            other.model,
+            other.step_type,
+            other.status,
+            other.input_tokens,
+            other.cache_read_tokens,
+            other.cache_write_tokens,
+            other.output_tokens,
+            other.tool_names,
+            other.thinking_chars,
+            other.reasoning_tokens,
+            other.cache_write_1h_tokens,
+            other.cost,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"TurnRecord(conversation_id={self.conversation_id!r}, step_index={self.step_index!r}, "
+            f"model={self.model!r}, input_tokens={self.input_tokens!r}, output_tokens={self.output_tokens!r})"
+        )
 
     @property
     def total_input_tokens(self) -> int:
@@ -726,11 +1038,11 @@ class TurnRecord:
 
     @property
     def total_tokens(self) -> int:
-        return self.total_input_tokens + self.output_tokens
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
 
     @property
     def cache_hit_rate(self) -> float:
-        denom = self.total_input_tokens
+        denom = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
         return (self.cache_read_tokens / denom) * 100.0 if denom > 0 else 0.0
 
     @property
@@ -738,22 +1050,115 @@ class TurnRecord:
         return self.thinking_chars > 0 or self.reasoning_tokens > 0
 
 
-@dataclass
+class _SessionDigest:
+    """Compact pre-aggregated per-session summary used when retain_turns=False."""
+
+    __slots__ = (
+        "by_model",
+        "by_day",
+        "by_hour",
+        "day_to_wm",
+        "tool_counts",
+        "model_tokens",
+        "active_duration_secs",
+        "thinking_turns",
+    )
+
+    def __init__(
+        self,
+        by_model: dict[str, TokenCounts],
+        by_day: dict[str, TokenCounts],
+        by_hour: dict[int, TokenCounts],
+        day_to_wm: dict[str, tuple[str, str]],
+        tool_counts: dict[str, int],
+        model_tokens: dict[str, tuple[bool, int]],
+        active_duration_secs: int,
+        thinking_turns: int,
+    ) -> None:
+        self.by_model = by_model
+        self.by_day = by_day
+        self.by_hour = by_hour
+        self.day_to_wm = day_to_wm
+        self.tool_counts = tool_counts
+        self.model_tokens = model_tokens
+        self.active_duration_secs = active_duration_secs
+        self.thinking_turns = thinking_turns
+
+
+def _active_duration_from_times(times: list[dt.datetime]) -> int:
+    if not times:
+        return 0
+    if len(times) == 1:
+        return 15
+    times.sort()
+    secs = 0
+    prev = times[0]
+    for cur in times[1:]:
+        d = int((cur - prev).total_seconds())
+        if d > 0:
+            secs += d if d < 600 else 600
+        prev = cur
+    return secs if secs > 15 else 15
+
+
 class SessionInfo:
-    conversation_id: str
-    title: str = ""
-    workspace: str = ""
-    transcript_path: str = ""
-    source: str = "cli"
-    is_archived: bool = False
-    is_subagent: bool = False
-    parent_id: str | None = None
-    parent_title: str = ""
-    turns: list[TurnRecord] = field(default_factory=list)
-    counts: TokenCounts = field(default_factory=TokenCounts)
-    models: set[str] = field(default_factory=set)
-    first_time: dt.datetime | None = None
-    last_time: dt.datetime | None = None
+    __slots__ = (
+        "conversation_id",
+        "title",
+        "workspace",
+        "transcript_path",
+        "source",
+        "is_archived",
+        "is_subagent",
+        "parent_id",
+        "parent_title",
+        "turns",
+        "counts",
+        "models",
+        "first_time",
+        "last_time",
+        "_digest",
+    )
+
+    def __init__(
+        self,
+        conversation_id: str,
+        title: str = "",
+        workspace: str = "",
+        transcript_path: str = "",
+        source: str = "cli",
+        is_archived: bool = False,
+        is_subagent: bool = False,
+        parent_id: str | None = None,
+        parent_title: str = "",
+        turns: list[TurnRecord] | None = None,
+        counts: TokenCounts | None = None,
+        models: set[str] | None = None,
+        first_time: dt.datetime | None = None,
+        last_time: dt.datetime | None = None,
+        _digest: _SessionDigest | None = None,
+    ) -> None:
+        self.conversation_id = conversation_id
+        self.title = title
+        self.workspace = workspace
+        self.transcript_path = transcript_path
+        self.source = source
+        self.is_archived = is_archived
+        self.is_subagent = is_subagent
+        self.parent_id = parent_id
+        self.parent_title = parent_title
+        self.turns = [] if turns is None else turns
+        self.counts = TokenCounts() if counts is None else counts
+        self.models = set() if models is None else models
+        self.first_time = first_time
+        self.last_time = last_time
+        self._digest = _digest
+
+    def __repr__(self) -> str:
+        return (
+            f"SessionInfo(conversation_id={self.conversation_id!r}, source={self.source!r}, "
+            f"calls={self.counts.calls!r}, title={self.title!r})"
+        )
 
     @property
     def agent_family(self) -> str:
@@ -761,23 +1166,20 @@ class SessionInfo:
 
     @property
     def active_duration_secs(self) -> int:
-        times = sorted(t.timestamp for t in self.turns if t.timestamp is not None)
-        if not times:
-            return 0
-        if len(times) == 1:
-            return 15
-        secs = 0
-        for a, b in zip(times, times[1:]):
-            d = int((b - a).total_seconds())
-            if d > 0:
-                secs += min(d, 600)
-        return max(secs, 15)
+        if self._digest is not None and not self.turns:
+            return self._digest.active_duration_secs
+        times = [t.timestamp for t in self.turns if t.timestamp is not None]
+        return _active_duration_from_times(times)
 
     @property
     def thinking_turns(self) -> int:
+        if self._digest is not None and not self.turns:
+            return self._digest.thinking_turns
         return sum(1 for t in self.turns if t.has_thinking)
 
     def tool_counts(self) -> dict[str, int]:
+        if self._digest is not None and not self.turns:
+            return dict(self._digest.tool_counts)
         counts: dict[str, int] = defaultdict(int)
         for t in self.turns:
             for name in t.tool_names:
@@ -802,18 +1204,49 @@ class SessionInfo:
                 self.last_time = turn.timestamp
 
 
-@dataclass
 class ScanReport:
-    data_dir: pathlib.Path
-    sessions: list[SessionInfo]
-    warnings: list[str]
-    data_dirs: list[pathlib.Path] = field(default_factory=list)
-    archived_sessions_count: int = 0
-    skipped_empty_sessions: int = 0
-    skipped_lines: int = 0
-    scan_ms: float = 0.0
-    files_cached: int = 0
-    files_reparsed: int = 0
+    __slots__ = (
+        "data_dir",
+        "sessions",
+        "warnings",
+        "data_dirs",
+        "archived_sessions_count",
+        "skipped_empty_sessions",
+        "skipped_lines",
+        "scan_ms",
+        "files_cached",
+        "files_reparsed",
+    )
+
+    def __init__(
+        self,
+        data_dir: pathlib.Path,
+        sessions: list[SessionInfo],
+        warnings: list[str],
+        data_dirs: list[pathlib.Path] | None = None,
+        archived_sessions_count: int = 0,
+        skipped_empty_sessions: int = 0,
+        skipped_lines: int = 0,
+        scan_ms: float = 0.0,
+        files_cached: int = 0,
+        files_reparsed: int = 0,
+    ) -> None:
+        self.data_dir = data_dir
+        self.sessions = sessions
+        self.warnings = warnings
+        self.data_dirs = [] if data_dirs is None else data_dirs
+        self.archived_sessions_count = archived_sessions_count
+        self.skipped_empty_sessions = skipped_empty_sessions
+        self.skipped_lines = skipped_lines
+        self.scan_ms = scan_ms
+        self.files_cached = files_cached
+        self.files_reparsed = files_reparsed
+
+    def __repr__(self) -> str:
+        return (
+            f"ScanReport(data_dir={self.data_dir!r}, sessions={len(self.sessions)}, "
+            f"archived_sessions_count={self.archived_sessions_count!r}, scan_ms={self.scan_ms:.1f})"
+        )
 
 
 def iso_week_key(date_obj: dt.date) -> str:
@@ -822,7 +1255,7 @@ def iso_week_key(date_obj: dt.date) -> str:
 
 
 def iso_week_bounds(week_key: str) -> tuple[dt.date, dt.date] | None:
-    m = re.match(r"^(\d{4})-W(\d{2})$", week_key)
+    m = _ISO_WEEK_RE.match(week_key)
     if not m:
         return None
     year, week = int(m.group(1)), int(m.group(2))
@@ -852,20 +1285,58 @@ def _configure_stdio() -> None:
                 pass
 
 
-def _is_within_dir(path: pathlib.Path, root: pathlib.Path) -> bool:
+def _is_within_dir(
+    path: pathlib.Path,
+    root: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+) -> bool:
     try:
         resolved_path = path.resolve(strict=True)
-        resolved_root = root.resolve(strict=True)
-        resolved_path.relative_to(resolved_root)
+        res_root = resolved_root if resolved_root is not None else root.resolve(strict=True)
+        resolved_path.relative_to(res_root)
         return True
     except (OSError, ValueError):
         return False
 
 
-def _safe_read_text(path: pathlib.Path, root: pathlib.Path) -> str | None:
-    if path.is_symlink() or not path.is_file():
+def _lstat_regular_file(path: pathlib.Path) -> os.stat_result | None:
+    """Single-syscall check that path is a regular non-symlink file, returning lstat result."""
+    try:
+        st = path.lstat()
+    except OSError:
         return None
-    if not _is_within_dir(path, root):
+    return st if stat.S_ISREG(st.st_mode) else None
+
+
+def _lstat_regular_file_str(path_str: str) -> os.stat_result | None:
+    """Zero-Path-alloc single-syscall check for regular non-symlink files."""
+    try:
+        st = os.lstat(path_str)
+    except OSError:
+        return None
+    return st if stat.S_ISREG(st.st_mode) else None
+
+
+def _lstat_dir(path: pathlib.Path) -> os.stat_result | None:
+    """Single-syscall check that path is a non-symlink directory, returning lstat result."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return st if stat.S_ISDIR(st.st_mode) else None
+
+
+def _safe_read_text(
+    path: pathlib.Path,
+    root: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+    skip_lstat: bool = False,
+) -> str | None:
+    if not skip_lstat and _lstat_regular_file(path) is None:
+        return None
+    if not _is_within_dir(path, root, resolved_root=resolved_root):
         return None
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -874,29 +1345,35 @@ def _safe_read_text(path: pathlib.Path, root: pathlib.Path) -> str | None:
         return None
 
 
+_PBTXT_SIMPLE_ESCAPES: dict[str, bytes] = {
+    "a": b"\a",
+    "b": b"\b",
+    "f": b"\f",
+    "n": b"\n",
+    "r": b"\r",
+    "t": b"\t",
+    "v": b"\v",
+    "\\": b"\\",
+    '"': b'"',
+    "'": b"'",
+    "?": b"?",
+}
+
+
 def _unescape_pbtxt_string(raw: str) -> str:
     """Decode protobuf text-format string escapes (including octal UTF-8 bytes)."""
-    simple = {
-        "a": b"\a",
-        "b": b"\b",
-        "f": b"\f",
-        "n": b"\n",
-        "r": b"\r",
-        "t": b"\t",
-        "v": b"\v",
-        "\\": b"\\",
-        '"': b'"',
-        "'": b"'",
-        "?": b"?",
-    }
+    if "\\" not in raw:
+        return raw
+    simple = _PBTXT_SIMPLE_ESCAPES
     out = bytearray()
     pos = 0
     for match in _PBTXT_ESCAPE_RE.finditer(raw):
         if match.start() > pos:
             out.extend(raw[pos : match.start()].encode("utf-8"))
         esc = match.group(1)
-        if esc in simple:
-            out.extend(simple[esc])
+        b_val = simple.get(esc)
+        if b_val is not None:
+            out.extend(b_val)
         elif esc.startswith("x"):
             out.append(int(esc[1:], 16))
         else:
@@ -907,8 +1384,14 @@ def _unescape_pbtxt_string(raw: str) -> str:
     return out.decode("utf-8", errors="replace")
 
 
-def _parse_annotation_title(path: pathlib.Path, root: pathlib.Path) -> str:
-    text = _safe_read_text(path, root)
+def _parse_annotation_title(
+    path: pathlib.Path,
+    root: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+    skip_lstat: bool = False,
+) -> str:
+    text = _safe_read_text(path, root, resolved_root=resolved_root, skip_lstat=skip_lstat)
     if not text:
         return ""
     match = _PBTXT_TITLE_RE.search(text)
@@ -921,10 +1404,12 @@ def _decode_workspace_uri(uri: str) -> str:
     if not uri:
         return ""
     if uri.lower().startswith("file://"):
+        import urllib.parse
+
         parsed = urllib.parse.urlparse(uri)
         path = urllib.parse.unquote(parsed.path or "")
         # On Windows, file:///C:/Users/... parses path as /C:/Users/...
-        if re.match(r"^/[A-Za-z]:/", path):
+        if _WIN_DRIVE_URI_RE.match(path):
             path = path[1:]
         return path
     return uri
@@ -1019,40 +1504,87 @@ def _extract_subagent_meta(content: str) -> tuple[str | None, str, bool, bool]:
 
 
 def _parse_iso_timestamp(value: Any, tz: dt.tzinfo) -> dt.datetime | None:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str and not isinstance(value, str):
         return None
     s = value.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    # Python <3.11 does not accept >6 fractional digits (nanoseconds).
-    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
-    try:
-        parsed = dt.datetime.fromisoformat(s)
-    except ValueError:
+    if not s:
         return None
+    if "." in s:
+        s = _FRAC_SEC_RE.sub(r"\1", s)
+    if not _PY311_PLUS and s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        parsed = _FROMISOFORMAT(s)
+    except ValueError:
+        if _PY311_PLUS and s.endswith("Z"):
+            try:
+                parsed = _FROMISOFORMAT(s[:-1] + "+00:00")
+            except ValueError:
+                return None
+        else:
+            return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=_UTC)
+    if parsed.tzinfo is tz or parsed.tzinfo == tz:
+        return parsed
     return parsed.astimezone(tz)
 
 
+def _parse_utc_timestamp_fast(value: Any) -> dt.datetime | None:
+    """Fast-path UTC timestamp parser using Python 3.11+ C fromisoformat directly."""
+    if _PY311_PLUS and type(value) is str:
+        try:
+            parsed = _FROMISOFORMAT(value)
+            tzinfo = parsed.tzinfo
+            if tzinfo is _UTC:
+                return parsed
+            if tzinfo is None:
+                return parsed.replace(tzinfo=_UTC)
+            return parsed.astimezone(_UTC)
+        except ValueError:
+            pass
+    return _parse_iso_timestamp(value, _UTC)
+
+
 def _to_non_neg_int(value: Any) -> int:
+    t = type(value)
+    if t is int:
+        return value if value > 0 else 0
+    if value is None or t is bool:
+        return 0
+    if t is float:
+        return int(value) if value > 0 else 0
+    if t is str:
+        s = value.strip()
+        if not s:
+            return 0
+        try:
+            v = int(s)
+            return v if v > 0 else 0
+        except ValueError:
+            return 0
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
-        return max(0, value)
+        return value if value > 0 else 0
     if isinstance(value, float):
-        return max(0, int(value))
+        return int(value) if value > 0 else 0
     if isinstance(value, str):
         try:
-            return max(0, int(value.strip()))
+            v = int(value.strip())
+            return v if v > 0 else 0
         except ValueError:
             return 0
     return 0
 
 
-def _load_metadata_cache(data_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
+def _load_metadata_cache(
+    data_dir: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+) -> dict[str, dict[str, Any]]:
     meta_path = data_dir / "cache" / "conversation_metadata.json"
-    text = _safe_read_text(meta_path, data_dir)
+    text = _safe_read_text(meta_path, data_dir, resolved_root=resolved_root)
     if not text:
         return {}
     try:
@@ -1092,20 +1624,24 @@ def _load_metadata_cache(data_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
 
 
 def _has_token_metrics(record: dict[str, Any]) -> bool:
-    token_keys = (
-        "input_tokens",
-        "output_tokens",
-        "cache_read_tokens",
-        "cache_write_tokens",
-        "cache_creation_tokens",
-        "cache_creation_input_tokens",
+    return (
+        record.get("input_tokens") is not None
+        or record.get("output_tokens") is not None
+        or record.get("cache_read_tokens") is not None
+        or record.get("cache_write_tokens") is not None
+        or record.get("cache_creation_tokens") is not None
+        or record.get("cache_creation_input_tokens") is not None
     )
-    return any(k in record and record[k] is not None for k in token_keys)
 
 
 def _parse_transcript_file(
     transcript_path: pathlib.Path,
     cid: str,
+    *,
+    scalar_only: bool = False,
+    skip_meta: bool = False,
+    retain_thinking_len: bool = True,
+    utc_date_bounds: tuple[str | None, str | None] | None = None,
 ) -> tuple[list[TurnRecord], str, str | None, str, bool, int]:
     """Parse a single transcript JSONL file in UTC (tz conversion happens later)."""
     turns_by_step: dict[int, TurnRecord] = {}
@@ -1117,128 +1653,319 @@ def _parse_transcript_file(
     is_swarm_subagent = False
     subagent_meta_is_swarm_ping = False
     skipped_lines = 0
+    intern = sys.intern
+    decode = _JSON_DECODE
+    fast_match = _AGY_FAST_RE.match
+    parse_utc = _parse_utc_timestamp_fast
+    to_non_neg_int = _to_non_neg_int
+    turn_cls = TurnRecord
+    zero_cost = _ZERO_COST
+    utc = _UTC
+    min_day_str = utc_date_bounds[0] if utc_date_bounds is not None else None
+    max_day_str = utc_date_bounds[1] if utc_date_bounds is not None else None
+    has_day_bounds = (min_day_str is not None) or (max_day_str is not None)
+    last_raw_model = ""
+    last_model = ""
+    tool_cache: dict[str, str] = {}
 
-    with transcript_path.open("r", encoding="utf-8", errors="replace") as fh:
+    with transcript_path.open("r", encoding="utf-8", errors="replace", newline="\n", buffering=65536) as fh:
+        if hasattr(fh, "_CHUNK_SIZE"):
+            fh._CHUNK_SIZE = 65536
         for line in fh:
-            stripped = line.strip()
-            if not stripped:
+            if not line:
                 continue
-            need_preview = (not seen_user_input) and ("USER_INPUT" in stripped)
-            want_subagent_meta = (
-                (not seen_user_input)
-                and (not turns_by_step)
-                and (
-                    (subagent_parent_id is None and not subagent_preview)
-                    or subagent_meta_is_swarm_ping
-                )
-            )
-            need_subagent_meta = want_subagent_meta and ("SYSTEM_MESSAGE" in stripped)
-            if (
-                stripped.startswith("{")
-                and stripped.endswith("}")
-                and not need_preview
-                and not need_subagent_meta
-                and "_tokens" not in stripped
-            ):
-                continue
+            if '_tokens"' not in line:
+                if skip_meta:
+                    if line[0] == "{" and (
+                        (line[-1] == "\n" and (line[-2] == "}" or (line[-2] == "\r" and line[-3] == "}")))
+                        or line[-1] == "}"
+                    ):
+                        continue
+                    stripped = line.strip()
+                    if not stripped or (stripped[0] == "{" and stripped[-1] == "}"):
+                        continue
+                else:
+                    if seen_user_input or (
+                        "USER_INPUT" not in line
+                        and (
+                            turns_by_step
+                            or (
+                                (subagent_parent_id is not None or subagent_preview)
+                                and not subagent_meta_is_swarm_ping
+                            )
+                            or "SYSTEM_MESSAGE" not in line
+                        )
+                    ):
+                        if line[0] == "{" and (
+                            (line[-1] == "\n" and (line[-2] == "}" or (line[-2] == "\r" and line[-3] == "}")))
+                            or line[-1] == "}"
+                        ):
+                            continue
+                        stripped = line.strip()
+                        if not stripped or (stripped[0] == "{" and stripped[-1] == "}"):
+                            continue
+            else:
+                # Fast prefix-regex extraction for standard Antigravity token lines (0/21.7K scalar-after-blob).
+                # Skip regex completely on in-date tool_calls lines when full tool extraction is required,
+                # and use zero-copy str.find/startswith instead of slicing line[end_pos:].
+                try_fast = scalar_only
+                if not try_fast:
+                    if '"tool_calls"' not in line:
+                        try_fast = True
+                    elif has_day_bounds:
+                        ca_idx = line.find('"created_at":"', 0, 220)
+                        if ca_idx != -1:
+                            d_pfx = line[ca_idx + 14 : ca_idx + 24]
+                            if len(d_pfx) == 10 and d_pfx[4] == "-" and d_pfx[7] == "-":
+                                if (min_day_str is not None and d_pfx < min_day_str) or (
+                                    max_day_str is not None and d_pfx > max_day_str
+                                ):
+                                    try_fast = True
+                if try_fast and line[0] == "{" and (
+                    (line[-1] == "\n" and (line[-2] == "}" or (line[-2] == "\r" and line[-3] == "}")))
+                    or line[-1] == "}"
+                ):
+                    m = fast_match(line)
+                    if m is not None:
+                        end_pos = m.end()
+                        if end_pos < len(line):
+                            ch = line[end_pos]
+                            if ch == "," or ch == "}":
+                                use_fast = False
+                                thinking_chars = 0
+                                g_step, g_type, g_status, ca_str, g_model, g_in, g_cr, g_cw, g_out = m.groups()
+                                out_of_date = False
+                                if (
+                                    has_day_bounds
+                                    and len(ca_str) >= 10
+                                    and ca_str[4] == "-"
+                                    and ca_str[7] == "-"
+                                    and ca_str.endswith("Z")
+                                ):
+                                    d_pfx = ca_str[:10]
+                                    if (min_day_str is not None and d_pfx < min_day_str) or (
+                                        max_day_str is not None and d_pfx > max_day_str
+                                    ):
+                                        out_of_date = True
+                                if scalar_only or out_of_date:
+                                    if ch == "}" or line.find('"cache_creation', end_pos) == -1:
+                                        use_fast = True
+                                elif ch == "}":
+                                    use_fast = True
+                                elif (
+                                    line.find('"tool_calls"', end_pos) == -1
+                                    and line.find('"cache_creation', end_pos) == -1
+                                ):
+                                    if line.find('"thinking"', end_pos) == -1:
+                                        use_fast = True
+                                    elif not retain_thinking_len and line.startswith(',"thinking":"', end_pos):
+                                        thinking_chars = 0 if line.startswith(',"thinking":""', end_pos) else 1
+                                        use_fast = True
+                                if use_fast:
+                                    in_tok = int(g_in)
+                                    cache_read = int(g_cr)
+                                    cache_write = int(g_cw) if g_cw else 0
+                                    out_tok = int(g_out)
+                                    if (in_tok + cache_read + cache_write + out_tok) == 0:
+                                        continue
+                                    step_key = int(g_step)
+                                    step_type = "PLANNER_RESPONSE" if g_type == "PLANNER_RESPONSE" else intern(g_type)
+                                    status_s = "DONE" if g_status == "DONE" else intern(g_status)
+                                    if g_model:
+                                        if g_model == last_raw_model:
+                                            model = last_model
+                                        else:
+                                            raw_model = g_model.strip()
+                                            model = (
+                                                intern(raw_model)
+                                                if raw_model
+                                                else ("compaction" if step_type == "CHECKPOINT" else "unknown")
+                                            )
+                                            last_raw_model = g_model
+                                            last_model = model
+                                    elif step_type == "CHECKPOINT":
+                                        model = "compaction"
+                                    else:
+                                        model = "unknown"
+                                    turns_by_step[step_key] = turn_cls(
+                                        cid,
+                                        step_key,
+                                        parse_utc(ca_str),
+                                        model,
+                                        step_type,
+                                        status_s,
+                                        in_tok,
+                                        cache_read,
+                                        cache_write,
+                                        out_tok,
+                                        (),
+                                        thinking_chars,
+                                        0,
+                                        0,
+                                        zero_cost,
+                                    )
+                                    continue
             try:
-                obj = json.loads(stripped)
+                obj = decode(line)
             except json.JSONDecodeError:
+                if not line.strip():
+                    continue
                 skipped_lines += 1
                 continue
-            if not isinstance(obj, dict):
+            if type(obj) is not dict and not isinstance(obj, dict):
                 continue
 
-            step_type_peek = obj.get("type")
-            if step_type_peek == "USER_INPUT":
-                seen_user_input = True
-                if not first_user_preview and isinstance(obj.get("content"), str):
-                    first_user_preview = _extract_user_preview(obj["content"])
-            elif (
-                want_subagent_meta
-                and step_type_peek == "SYSTEM_MESSAGE"
-                and isinstance(obj.get("content"), str)
-            ):
-                pid, prev, is_swarm, is_ping = _extract_subagent_meta(obj["content"])
-                if is_swarm:
-                    is_swarm_subagent = True
-                if subagent_meta_is_swarm_ping:
-                    if is_ping:
-                        if subagent_parent_id is None and pid is not None:
+            obj_get = obj.get
+            step_type_peek = obj_get("type")
+            if not skip_meta and not seen_user_input:
+                if step_type_peek == "USER_INPUT":
+                    seen_user_input = True
+                    if not first_user_preview:
+                        raw_c = obj_get("content")
+                        if isinstance(raw_c, str):
+                            first_user_preview = _extract_user_preview(raw_c)
+                elif (
+                    step_type_peek == "SYSTEM_MESSAGE"
+                    and (not turns_by_step)
+                    and (
+                        (subagent_parent_id is None and not subagent_preview)
+                        or subagent_meta_is_swarm_ping
+                    )
+                ):
+                    raw_c = obj_get("content")
+                    if isinstance(raw_c, str):
+                        pid, prev, is_swarm, is_ping = _extract_subagent_meta(raw_c)
+                        if is_swarm:
+                            is_swarm_subagent = True
+                        if subagent_meta_is_swarm_ping:
+                            if is_ping:
+                                if subagent_parent_id is None and pid is not None:
+                                    subagent_parent_id = pid
+                            else:
+                                if pid is not None:
+                                    subagent_parent_id = pid
+                                if prev:
+                                    subagent_preview = prev
+                                subagent_meta_is_swarm_ping = False
+                        else:
                             subagent_parent_id = pid
-                    else:
-                        if pid is not None:
-                            subagent_parent_id = pid
-                        if prev:
                             subagent_preview = prev
-                        subagent_meta_is_swarm_ping = False
-                else:
-                    subagent_parent_id = pid
-                    subagent_preview = prev
-                    subagent_meta_is_swarm_ping = is_ping
+                            subagent_meta_is_swarm_ping = is_ping
 
-            if not _has_token_metrics(obj):
-                continue
-
-            in_tok = _to_non_neg_int(obj.get("input_tokens"))
-            cache_read = _to_non_neg_int(obj.get("cache_read_tokens"))
-            cache_write = _to_non_neg_int(
-                obj.get("cache_write_tokens")
-                or obj.get("cache_creation_tokens")
-                or obj.get("cache_creation_input_tokens")
-            )
-            out_tok = _to_non_neg_int(obj.get("output_tokens"))
+            raw_in = obj_get("input_tokens")
+            in_tok = raw_in if (type(raw_in) is int and raw_in >= 0) else to_non_neg_int(raw_in)
+            raw_cr = obj_get("cache_read_tokens")
+            cache_read = raw_cr if (type(raw_cr) is int and raw_cr >= 0) else to_non_neg_int(raw_cr)
+            raw_cw = obj_get("cache_write_tokens")
+            if not raw_cw:
+                raw_cw = obj_get("cache_creation_tokens") or obj_get("cache_creation_input_tokens")
+            cache_write = raw_cw if (type(raw_cw) is int and raw_cw >= 0) else to_non_neg_int(raw_cw)
+            raw_out = obj_get("output_tokens")
+            out_tok = raw_out if (type(raw_out) is int and raw_out >= 0) else to_non_neg_int(raw_out)
             if (in_tok + cache_read + cache_write + out_tok) == 0:
                 continue
 
-            ts = _parse_iso_timestamp(obj.get("created_at"), dt.timezone.utc)
-            step_type = str(obj.get("type") or "")
-            raw_model = str(obj.get("model") or "").strip()
-            if raw_model:
-                model = raw_model
-            elif step_type == "CHECKPOINT":
-                model = "compaction"
+            ts = parse_utc(obj_get("created_at"))
+            if step_type_peek == "PLANNER_RESPONSE":
+                step_type = "PLANNER_RESPONSE"
+            elif type(step_type_peek) is str:
+                step_type = intern(step_type_peek)
             else:
-                model = "unknown"
+                step_type = intern(str(step_type_peek or ""))
 
-            raw_step = obj.get("step_index")
-            if isinstance(raw_step, int) and not isinstance(raw_step, bool):
+            raw_model_val = obj_get("model")
+            if type(raw_model_val) is str and raw_model_val:
+                if raw_model_val == last_raw_model:
+                    model = last_model
+                else:
+                    rm = raw_model_val.strip()
+                    model = intern(rm) if rm else ("compaction" if step_type == "CHECKPOINT" else "unknown")
+                    last_raw_model = raw_model_val
+                    last_model = model
+            else:
+                rm = str(raw_model_val or "").strip()
+                if rm:
+                    model = intern(rm)
+                elif step_type == "CHECKPOINT":
+                    model = "compaction"
+                else:
+                    model = "unknown"
+
+            raw_step = obj_get("step_index")
+            if type(raw_step) is int:
+                step_key = raw_step
+            elif isinstance(raw_step, int) and not isinstance(raw_step, bool):
                 step_key = raw_step
             else:
                 step_key = fallback_order
                 fallback_order -= 1
 
-            raw_tools = obj.get("tool_calls")
-            tool_names: list[str] = []
-            if isinstance(raw_tools, list):
-                for item in raw_tools:
-                    if isinstance(item, dict):
-                        tname = str(item.get("name") or "").strip()
-                        if tname:
-                            tool_names.append(tname)
-            raw_thinking = obj.get("thinking")
-            thinking_chars = len(raw_thinking) if isinstance(raw_thinking, str) else 0
+            if scalar_only:
+                tool_names: tuple[str, ...] = ()
+                thinking_chars = 0
+            else:
+                raw_tools = obj_get("tool_calls")
+                if raw_tools and (type(raw_tools) is list or isinstance(raw_tools, list)):
+                    tlist: list[str] = []
+                    for item in raw_tools:
+                        if type(item) is dict or isinstance(item, dict):
+                            tn = item.get("name")
+                            if type(tn) is str:
+                                cached_tn = tool_cache.get(tn)
+                                if cached_tn is not None:
+                                    if cached_tn:
+                                        tlist.append(cached_tn)
+                                else:
+                                    st_tn = tn.strip()
+                                    val_tn = intern(st_tn) if st_tn else ""
+                                    tool_cache[tn] = val_tn
+                                    if val_tn:
+                                        tlist.append(val_tn)
+                            elif tn:
+                                st_tn = str(tn).strip()
+                                if st_tn:
+                                    tlist.append(intern(st_tn))
+                    tool_names = tuple(tlist) if tlist else ()
+                else:
+                    tool_names = ()
+                raw_thinking = obj_get("thinking")
+                if raw_thinking and (type(raw_thinking) is str or isinstance(raw_thinking, str)):
+                    thinking_chars = len(raw_thinking)
+                else:
+                    thinking_chars = 0
 
-            turns_by_step[step_key] = TurnRecord(
-                conversation_id=cid,
-                step_index=step_key,
-                timestamp=ts,
-                model=model,
-                step_type=str(obj.get("type") or ""),
-                status=str(obj.get("status") or ""),
-                input_tokens=in_tok,
-                cache_read_tokens=cache_read,
-                cache_write_tokens=cache_write,
-                output_tokens=out_tok,
-                tool_names=tuple(tool_names),
-                thinking_chars=thinking_chars,
+            raw_status = obj_get("status")
+            if raw_status == "DONE":
+                status_s = "DONE"
+            elif type(raw_status) is str:
+                status_s = intern(raw_status)
+            else:
+                status_s = intern(str(raw_status or ""))
+
+            turns_by_step[step_key] = turn_cls(
+                cid,
+                step_key,
+                ts,
+                model,
+                step_type,
+                status_s,
+                in_tok,
+                cache_read,
+                cache_write,
+                out_tok,
+                tool_names,
+                thinking_chars,
+                0,
+                0,
+                zero_cost,
             )
 
+    min_utc = dt.datetime.min.replace(tzinfo=utc)
     ordered = sorted(
         turns_by_step.values(),
         key=lambda t: (
             t.step_index if t.step_index >= 0 else 10**9,
-            t.timestamp or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            t.timestamp or min_utc,
         ),
     )
     if seen_user_input:
@@ -1304,10 +2031,13 @@ def _is_allowed_claude_agent_id(agent_id: str) -> bool:
 
 
 def _load_claude_sessions_index(
-    index_path: pathlib.Path, root_dir: pathlib.Path
+    index_path: pathlib.Path,
+    root_dir: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
 ) -> dict[str, dict[str, str]]:
     """Read optional Claude Code projects/<proj>/sessions-index.json."""
-    text = _safe_read_text(index_path, root_dir)
+    text = _safe_read_text(index_path, root_dir, resolved_root=resolved_root)
     if not text:
         return {}
     try:
@@ -1340,9 +2070,14 @@ def _load_claude_sessions_index(
     return out
 
 
-def _parse_claude_agent_meta(meta_path: pathlib.Path, root_dir: pathlib.Path) -> tuple[str, str]:
+def _parse_claude_agent_meta(
+    meta_path: pathlib.Path,
+    root_dir: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+) -> tuple[str, str]:
     """Read optional subagents/agent-<id>.meta.json -> (agent_type, description)."""
-    text = _safe_read_text(meta_path, root_dir)
+    text = _safe_read_text(meta_path, root_dir, resolved_root=resolved_root)
     if not text:
         return "", ""
     try:
@@ -1373,18 +2108,40 @@ def _parse_claude_jsonl(
     session_id_in_file = ""
     agent_id_in_file = ""
     skipped_lines = 0
+    intern = sys.intern
+    decode = _JSON_DECODE
+    parse_utc = _parse_utc_timestamp_fast
 
-    with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+    with jsonl_path.open("r", encoding="utf-8", errors="replace", newline="\n", buffering=65536) as fh:
+        if hasattr(fh, "_CHUNK_SIZE"):
+            fh._CHUNK_SIZE = 65536
         for line_idx, line in enumerate(fh):
-            stripped = line.strip()
-            if not stripped:
+            if not line:
                 continue
+            if (
+                '"assistant"' not in line
+                and '"custom-title"' not in line
+                and '"summary"' not in line
+                and (first_user_preview or '"user"' not in line)
+                and (cwd or '"cwd"' not in line)
+                and (session_id_in_file or '"sessionId"' not in line)
+                and (not is_subagent or agent_id_in_file or '"agentId"' not in line)
+            ):
+                if line[0] == "{" and (
+                    line.endswith("}\n") or line.endswith("}\r\n") or line.endswith("}")
+                ):
+                    continue
+                stripped = line.strip()
+                if not stripped or (stripped[0] == "{" and stripped[-1] == "}"):
+                    continue
             try:
-                obj = json.loads(stripped)
+                obj = decode(line)
             except json.JSONDecodeError:
+                if not line.strip():
+                    continue
                 skipped_lines += 1
                 continue
-            if not isinstance(obj, dict):
+            if type(obj) is not dict and not isinstance(obj, dict):
                 continue
 
             if not cwd and isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
@@ -1451,7 +2208,7 @@ def _parse_claude_jsonl(
                 cw_1h = 0
                 out_tok = 0
 
-            ts = _parse_iso_timestamp(obj.get("timestamp"), dt.timezone.utc)
+            ts = parse_utc(obj.get("timestamp"))
             stop_reason = str(msg.get("stop_reason") or "").strip()
 
             chunk_tools: list[tuple[str | None, str]] = []
@@ -1466,7 +2223,7 @@ def _parse_claude_jsonl(
                         tname = str(block.get("name") or "").strip()
                         tid = str(block.get("id") or "").strip() or None
                         if tname:
-                            chunk_tools.append((tid, tname))
+                            chunk_tools.append((tid, intern(tname)))
                     elif btype == "thinking":
                         t_txt = block.get("thinking")
                         chunk_thinking += max(1, len(t_txt) if isinstance(t_txt, str) else 1)
@@ -1500,8 +2257,8 @@ def _parse_claude_jsonl(
                         tools_list.append(tname)
                 dedup_entries[dkey] = {
                     "timestamp": ts,
-                    "model": raw_model or "unknown",
-                    "status": stop_reason or "DONE",
+                    "model": intern(raw_model) if raw_model else "unknown",
+                    "status": intern(stop_reason) if stop_reason else "DONE",
                     "input_tokens": in_tok,
                     "cache_read_tokens": cache_read,
                     "cache_write_tokens": cache_write,
@@ -1516,9 +2273,9 @@ def _parse_claude_jsonl(
                 if ts is not None:
                     existing["timestamp"] = ts
                 if raw_model:
-                    existing["model"] = raw_model
+                    existing["model"] = intern(raw_model)
                 if stop_reason:
-                    existing["status"] = stop_reason
+                    existing["status"] = intern(stop_reason)
                 if has_usage and (in_tok + cache_read + cache_write) > 0:
                     existing["input_tokens"] = in_tok
                     existing["cache_read_tokens"] = cache_read
@@ -1563,6 +2320,7 @@ def _parse_claude_jsonl(
         if total_tok == 0:
             continue
         step_idx += 1
+        tools_t = tuple(entry["tools"]) if entry["tools"] else ()
         turns.append(
             TurnRecord(
                 conversation_id=cid,
@@ -1575,9 +2333,10 @@ def _parse_claude_jsonl(
                 cache_read_tokens=entry["cache_read_tokens"],
                 cache_write_tokens=entry["cache_write_tokens"],
                 output_tokens=entry["output_tokens"],
-                tool_names=tuple(entry["tools"]),
+                tool_names=tools_t,
                 thinking_chars=entry["thinking_chars"],
                 cache_write_1h_tokens=entry["cache_write_1h_tokens"],
+                cost=_ZERO_COST,
             )
         )
 
@@ -1602,10 +2361,14 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
 )
 
 
-def _load_codex_session_index(root_dir: pathlib.Path) -> dict[str, str]:
+def _load_codex_session_index(
+    root_dir: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+) -> dict[str, str]:
     """Read optional <codex_home>/session_index.jsonl -> {session_id: title}."""
     idx_path = root_dir / "session_index.jsonl"
-    text = _safe_read_text(idx_path, root_dir)
+    text = _safe_read_text(idx_path, root_dir, resolved_root=resolved_root)
     if not text:
         return {}
     titles: dict[str, str] = {}
@@ -1653,18 +2416,44 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
     prev_total: tuple[int, int, int, int] | None = None
     turns: list[TurnRecord] = []
     skipped_lines = 0
+    intern = sys.intern
+    decode = _JSON_DECODE
+    parse_utc = _parse_utc_timestamp_fast
 
-    with rollout_path.open("r", encoding="utf-8", errors="replace") as fh:
+    with rollout_path.open("r", encoding="utf-8", errors="replace", newline="\n", buffering=65536) as fh:
+        if hasattr(fh, "_CHUNK_SIZE"):
+            fh._CHUNK_SIZE = 65536
         for line in fh:
-            stripped = line.strip()
-            if not stripped:
+            if not line:
                 continue
+            if (
+                '"token_count"' not in line
+                and '"turn_context"' not in line
+                and '"session_meta"' not in line
+                and '"agent_reasoning"' not in line
+                and '"reasoning"' not in line
+                and '"function_call"' not in line
+                and '"custom_tool_call"' not in line
+                and '"local_shell_call"' not in line
+                and '"web_search_call"' not in line
+                and '"mcp_tool_call"' not in line
+                and (first_user_preview or ('"user_message"' not in line and '"user"' not in line))
+            ):
+                if line[0] == "{" and (
+                    line.endswith("}\n") or line.endswith("}\r\n") or line.endswith("}")
+                ):
+                    continue
+                stripped = line.strip()
+                if not stripped or (stripped[0] == "{" and stripped[-1] == "}"):
+                    continue
             try:
-                obj = json.loads(stripped)
+                obj = decode(line)
             except json.JSONDecodeError:
+                if not line.strip():
+                    continue
                 skipped_lines += 1
                 continue
-            if not isinstance(obj, dict):
+            if type(obj) is not dict and not isinstance(obj, dict):
                 continue
 
             rec_type = str(obj.get("type") or "")
@@ -1679,7 +2468,7 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
                 if not cwd and isinstance(payload.get("cwd"), str) and payload["cwd"].strip():
                     cwd = payload["cwd"].strip()
                 if not current_model and isinstance(payload.get("model"), str) and payload["model"].strip():
-                    current_model = payload["model"].strip()
+                    current_model = intern(payload["model"].strip())
                 src = payload.get("source")
                 if isinstance(src, dict) and src.get("subagent") is not None:
                     is_subagent = True
@@ -1702,7 +2491,7 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
             if rec_type == "turn_context":
                 mdl = str(payload.get("model") or "").strip()
                 if mdl:
-                    current_model = mdl
+                    current_model = intern(mdl)
                 if not cwd and isinstance(payload.get("cwd"), str) and payload["cwd"].strip():
                     cwd = payload["cwd"].strip()
                 continue
@@ -1712,7 +2501,7 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
                 if ptype in _CODEX_TOOL_ITEM_TYPES:
                     tname = str(payload.get("name") or ptype).strip()
                     if tname:
-                        buffered_tools.append(tname)
+                        buffered_tools.append(intern(tname))
                 elif ptype == "reasoning":
                     r_len = 0
                     for field_key in ("summary", "content"):
@@ -1785,8 +2574,13 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
             if (uncached_in + cache_read + output_tok) == 0:
                 continue
 
-            ts = _parse_iso_timestamp(obj.get("timestamp"), dt.timezone.utc)
-            turn_model = current_model or str(info.get("model") or "").strip() or "unknown"
+            ts = parse_utc(obj.get("timestamp"))
+            if current_model:
+                turn_model = current_model
+            else:
+                info_m = str(info.get("model") or "").strip()
+                turn_model = intern(info_m) if info_m else "unknown"
+            tools_t = tuple(buffered_tools) if buffered_tools else ()
             turns.append(
                 TurnRecord(
                     conversation_id=session_id,
@@ -1799,9 +2593,10 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
                     cache_read_tokens=cache_read,
                     cache_write_tokens=0,
                     output_tokens=output_tok,
-                    tool_names=tuple(buffered_tools),
+                    tool_names=tools_t,
                     thinking_chars=buffered_thinking_chars,
                     reasoning_tokens=d_reason,
+                    cost=_ZERO_COST,
                 )
             )
             buffered_tools = []
@@ -1809,44 +2604,14 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
 
     if turns and (buffered_tools or buffered_thinking_chars > 0):
         last_t = turns[-1]
-        turns[-1] = TurnRecord(
-            conversation_id=last_t.conversation_id,
-            step_index=last_t.step_index,
-            timestamp=last_t.timestamp,
-            model=last_t.model,
-            step_type=last_t.step_type,
-            status=last_t.status,
-            input_tokens=last_t.input_tokens,
-            cache_read_tokens=last_t.cache_read_tokens,
-            cache_write_tokens=last_t.cache_write_tokens,
-            output_tokens=last_t.output_tokens,
-            tool_names=last_t.tool_names + tuple(buffered_tools),
-            thinking_chars=last_t.thinking_chars + buffered_thinking_chars,
-            reasoning_tokens=last_t.reasoning_tokens,
-            cache_write_1h_tokens=last_t.cache_write_1h_tokens,
-        )
+        if buffered_tools:
+            last_t.tool_names = last_t.tool_names + tuple(buffered_tools)
+        last_t.thinking_chars += buffered_thinking_chars
 
     # Ensure conversation_id on every turn reflects final session_id
     if turns and any(t.conversation_id != session_id for t in turns):
-        turns = [
-            TurnRecord(
-                conversation_id=session_id,
-                step_index=t.step_index,
-                timestamp=t.timestamp,
-                model=t.model,
-                step_type=t.step_type,
-                status=t.status,
-                input_tokens=t.input_tokens,
-                cache_read_tokens=t.cache_read_tokens,
-                cache_write_tokens=t.cache_write_tokens,
-                output_tokens=t.output_tokens,
-                tool_names=t.tool_names,
-                thinking_chars=t.thinking_chars,
-                reasoning_tokens=t.reasoning_tokens,
-                cache_write_1h_tokens=t.cache_write_1h_tokens,
-            )
-            for t in turns
-        ]
+        for t in turns:
+            t.conversation_id = session_id
 
     return {
         "cid": session_id,
@@ -1862,10 +2627,14 @@ def _parse_codex_jsonl(rollout_path: pathlib.Path) -> dict[str, Any]:
 # ---------- Gemini CLI read-only parser ----------
 
 
-def _load_gemini_projects_map(home_root: pathlib.Path) -> dict[str, str]:
+def _load_gemini_projects_map(
+    home_root: pathlib.Path,
+    *,
+    resolved_root: pathlib.Path | None = None,
+) -> dict[str, str]:
     """Read optional <gemini_home>/projects.json -> {slug_or_hash: workspace_path}."""
     proj_path = home_root / "projects.json"
-    text = _safe_read_text(proj_path, home_root)
+    text = _safe_read_text(proj_path, home_root, resolved_root=resolved_root)
     if not text:
         return {}
     try:
@@ -1874,6 +2643,8 @@ def _load_gemini_projects_map(home_root: pathlib.Path) -> dict[str, str]:
         return {}
     if not isinstance(payload, dict):
         return {}
+    import hashlib
+
     mapping_obj = payload.get("projects") if isinstance(payload.get("projects"), dict) else payload
     result: dict[str, str] = {}
     for k, v in mapping_obj.items():
@@ -1896,24 +2667,38 @@ def _load_gemini_projects_map(home_root: pathlib.Path) -> dict[str, str]:
     return result
 
 
+def _rebuild_gemini_id_index(messages: list[dict[str, Any]]) -> dict[str, int]:
+    idx_map: dict[str, int] = {}
+    for idx, m in enumerate(messages):
+        raw_id = str(m.get("id") or "")
+        if raw_id and raw_id not in idx_map:
+            idx_map[raw_id] = idx
+    return idx_map
+
+
 def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dict[str, Any]], int]:
     """Replay Gemini CLI append-only session-*.jsonl including $set and $rewindTo mutations."""
     session_id = session_path.stem
     summary = ""
     messages: list[dict[str, Any]] = []
+    id_to_idx: dict[str, int] = {}
     skipped_lines = 0
+    decode = _JSON_DECODE
 
-    with session_path.open("r", encoding="utf-8", errors="replace") as fh:
+    with session_path.open("r", encoding="utf-8", errors="replace", newline="\n", buffering=65536) as fh:
+        if hasattr(fh, "_CHUNK_SIZE"):
+            fh._CHUNK_SIZE = 65536
         for line in fh:
-            stripped = line.strip()
-            if not stripped:
+            if not line:
                 continue
             try:
-                obj = json.loads(stripped)
+                obj = decode(line)
             except json.JSONDecodeError:
+                if not line.strip():
+                    continue
                 skipped_lines += 1
                 continue
-            if not isinstance(obj, dict):
+            if type(obj) is not dict and not isinstance(obj, dict):
                 continue
 
             if "$rewindTo" in obj:
@@ -1922,22 +2707,25 @@ def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dic
                     target = target.get("messageId") or target.get("id")
                 if isinstance(target, str) and target.strip():
                     tid = target.strip()
-                    for idx, m in enumerate(messages):
-                        if str(m.get("id") or "") == tid:
-                            messages = messages[:idx]
-                            break
+                    idx = id_to_idx.get(tid)
+                    if idx is not None:
+                        messages = messages[:idx]
+                        id_to_idx = _rebuild_gemini_id_index(messages)
                 elif isinstance(target, int) and not isinstance(target, bool) and target >= 0:
                     messages = messages[:target]
+                    id_to_idx = _rebuild_gemini_id_index(messages)
                 continue
 
             if "$set" in obj and isinstance(obj["$set"], dict):
                 patch = obj["$set"]
                 target_id = str(obj.get("id") or obj.get("messageId") or "").strip()
                 if target_id:
-                    for m in messages:
-                        if str(m.get("id") or "") == target_id:
-                            m.update(patch)
-                            break
+                    idx = id_to_idx.get(target_id)
+                    if idx is not None:
+                        messages[idx].update(patch)
+                        new_id = str(messages[idx].get("id") or "")
+                        if new_id != target_id:
+                            id_to_idx = _rebuild_gemini_id_index(messages)
                 else:
                     if isinstance(patch.get("summary"), str):
                         summary = _clean_single_line(patch["summary"])
@@ -1945,12 +2733,12 @@ def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dic
                         session_id = patch["sessionId"].strip()
                     if isinstance(patch.get("messages"), list):
                         messages = [dict(m) for m in patch["messages"] if isinstance(m, dict)]
+                        id_to_idx = _rebuild_gemini_id_index(messages)
                     elif isinstance(patch.get("id"), str) and patch["id"].strip():
                         pid = patch["id"].strip()
-                        for m in messages:
-                            if str(m.get("id") or "") == pid:
-                                m.update(patch)
-                                break
+                        idx = id_to_idx.get(pid)
+                        if idx is not None:
+                            messages[idx].update(patch)
                 continue
 
             rec_type = str(obj.get("type") or "")
@@ -1963,6 +2751,7 @@ def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dic
                     summary = _clean_single_line(obj["summary"])
                 if isinstance(obj.get("messages"), list):
                     messages = [dict(m) for m in obj["messages"] if isinstance(m, dict)]
+                    id_to_idx = _rebuild_gemini_id_index(messages)
                 continue
 
             if rec_type == "message_update":
@@ -1973,25 +2762,29 @@ def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dic
                     else {k: v for k, v in obj.items() if k not in ("type", "messageId")}
                 )
                 if target_id:
-                    for m in messages:
-                        if str(m.get("id") or "") == target_id:
-                            m.update(patch)
-                            break
+                    idx = id_to_idx.get(target_id)
+                    if idx is not None:
+                        messages[idx].update(patch)
+                        new_id = str(messages[idx].get("id") or "")
+                        if new_id != target_id:
+                            id_to_idx = _rebuild_gemini_id_index(messages)
                 continue
 
             if rec_type or "id" in obj or "tokens" in obj:
-                mid = str(obj.get("id") or "").strip()
+                raw_id = str(obj.get("id") or "")
+                mid = raw_id.strip()
                 if mid:
-                    replaced = False
-                    for idx, existing in enumerate(messages):
-                        if str(existing.get("id") or "") == mid:
-                            messages[idx] = dict(obj)
-                            replaced = True
-                            break
-                    if not replaced:
-                        messages.append(dict(obj))
+                    idx = id_to_idx.get(mid)
+                    if idx is not None:
+                        messages[idx] = obj
+                        if raw_id != mid:
+                            id_to_idx = _rebuild_gemini_id_index(messages)
+                    else:
+                        if raw_id and raw_id not in id_to_idx:
+                            id_to_idx[raw_id] = len(messages)
+                        messages.append(obj)
                 else:
-                    messages.append(dict(obj))
+                    messages.append(obj)
 
     return session_id, summary, messages, skipped_lines
 
@@ -1999,11 +2792,13 @@ def _replay_gemini_jsonl(session_path: pathlib.Path) -> tuple[str, str, list[dic
 def _parse_gemini_session_file(session_path: pathlib.Path) -> dict[str, Any]:
     """Parse a Gemini CLI session-*.json or session-*.jsonl file strictly read-only in UTC."""
     skipped_lines = 0
+    intern = sys.intern
+    parse_utc = _parse_utc_timestamp_fast
     if session_path.suffix.lower() == ".jsonl":
         session_id, summary, messages, skipped_lines = _replay_gemini_jsonl(session_path)
     else:
         try:
-            with session_path.open("r", encoding="utf-8", errors="replace") as fh:
+            with session_path.open("r", encoding="utf-8", errors="replace", newline="\n", buffering=65536) as fh:
                 payload = json.load(fh)
         except json.JSONDecodeError:
             return {
@@ -2058,14 +2853,17 @@ def _parse_gemini_session_file(session_path: pathlib.Path) -> dict[str, Any]:
         if (uncached_in + cache_read + output_tok) == 0:
             continue
 
-        tool_names: list[str] = []
         raw_tc = msg.get("toolCalls")
-        if isinstance(raw_tc, list):
+        if isinstance(raw_tc, list) and raw_tc:
+            tlist: list[str] = []
             for tc in raw_tc:
                 if isinstance(tc, dict):
                     tname = str(tc.get("name") or "").strip()
                     if tname:
-                        tool_names.append(tname)
+                        tlist.append(intern(tname))
+            tool_names: tuple[str, ...] = tuple(tlist) if tlist else ()
+        else:
+            tool_names = ()
 
         thinking_chars = 0
         raw_thoughts_list = msg.get("thoughts")
@@ -2078,22 +2876,24 @@ def _parse_gemini_session_file(session_path: pathlib.Path) -> dict[str, Any]:
                 elif isinstance(th, str):
                     thinking_chars += max(1, len(th))
 
+        raw_m = str(msg.get("model") or "").strip()
         step_idx += 1
         turns.append(
             TurnRecord(
                 conversation_id=session_id,
                 step_index=step_idx,
-                timestamp=_parse_iso_timestamp(msg.get("timestamp"), dt.timezone.utc),
-                model=str(msg.get("model") or "").strip() or "unknown",
+                timestamp=parse_utc(msg.get("timestamp")),
+                model=intern(raw_m) if raw_m else "unknown",
                 step_type="GEMINI",
                 status="DONE",
                 input_tokens=uncached_in,
                 cache_read_tokens=cache_read,
                 cache_write_tokens=0,
                 output_tokens=output_tok,
-                tool_names=tuple(tool_names),
+                tool_names=tool_names,
                 thinking_chars=thinking_chars,
                 reasoning_tokens=raw_thoughts,
+                cost=_ZERO_COST,
             )
         )
 
@@ -2223,6 +3023,146 @@ def _fmt_duration(secs: int) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
+def _compute_mtime_cutoff_ns(since: dt.date | None, tz: dt.tzinfo) -> int | None:
+    """Return safe st_mtime_ns lower bound for `since`, or None if pruning is unsafe."""
+    if since is None:
+        return None
+    since_start_ts = dt.datetime.combine(since, dt.time.min, tzinfo=tz).timestamp()
+    # Guard synthetic future-dated fixtures when host clock precedes `since`.
+    if since_start_ts > time.time():
+        return None
+    # 1-hour safety margin for DST shifts, filesystem timestamp granularity, and slight clock skew.
+    return int((since_start_ts - 3600.0) * 1_000_000_000)
+
+
+def _iter_archive_sessions(
+    path: pathlib.Path | None,
+    *,
+    chunk_size: int = 262144,
+) -> Iterator[tuple[str, Any]]:
+    """Stream-decode top-level entries of archive.json's 'sessions' object in chunks.
+
+    Avoids loading the entire file into one giant str (which inflates 2x-4x to
+    UCS-2/UCS-4 if any title contains CJK/emoji) and holds only one session dict
+    in memory at a time.
+    """
+    if path is None or _lstat_regular_file(path) is None:
+        return
+    dec = json.JSONDecoder()
+    ws_match = _JSON_WS_RE.match
+    step_size = max(16, chunk_size)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="\n", buffering=max(65536, step_size)) as fh:
+            buf = fh.read(step_size)
+            if not buf:
+                return
+            idx = 0
+            eof = False
+
+            def skip_ws() -> bool:
+                nonlocal buf, idx, eof
+                while True:
+                    if idx < len(buf) and buf[idx] > " ":
+                        return True
+                    m = ws_match(buf, idx)
+                    if m is not None:
+                        idx = m.end()
+                    if idx < len(buf):
+                        return True
+                    if eof:
+                        return False
+                    more = fh.read(step_size)
+                    if not more:
+                        eof = True
+                        return False
+                    buf = more
+                    idx = 0
+
+            def decode_next() -> tuple[bool, Any]:
+                nonlocal buf, idx, eof
+                while True:
+                    try:
+                        ch0 = buf[idx]
+                        val, next_idx = dec.raw_decode(buf, idx)
+                        # Guard primitives (numbers/bools/null) split right at chunk end.
+                        if next_idx == len(buf) and not eof and ch0 not in ('"', "{", "["):
+                            more = fh.read(step_size)
+                            if not more:
+                                eof = True
+                            else:
+                                buf = buf[idx:] + more
+                                idx = 0
+                                continue
+                        idx = next_idx
+                        if idx >= step_size:
+                            buf = buf[idx:]
+                            idx = 0
+                        return True, val
+                    except (json.JSONDecodeError, IndexError):
+                        if eof:
+                            return False, None
+                        more = fh.read(step_size)
+                        if not more:
+                            eof = True
+                            return False, None
+                        buf = buf[idx:] + more
+                        idx = 0
+
+            if not skip_ws() or buf[idx] != "{":
+                return
+            idx += 1
+            while skip_ws() and buf[idx] != "}":
+                if buf[idx] != '"':
+                    return
+                ok, key = decode_next()
+                if not ok or not isinstance(key, str):
+                    return
+                if not skip_ws() or buf[idx] != ":":
+                    return
+                idx += 1
+                if not skip_ws():
+                    return
+                if key == "sessions":
+                    if buf[idx] != "{":
+                        return
+                    idx += 1
+                    while skip_ws() and buf[idx] != "}":
+                        if buf[idx] != '"':
+                            return
+                        ok_k, skey = decode_next()
+                        if not ok_k or not isinstance(skey, str):
+                            return
+                        if not skip_ws() or buf[idx] != ":":
+                            return
+                        idx += 1
+                        if not skip_ws():
+                            return
+                        ok_v, sval = decode_next()
+                        if not ok_v:
+                            return
+                        yield skey, sval
+                        if not skip_ws():
+                            return
+                        if buf[idx] == ",":
+                            idx += 1
+                        elif buf[idx] == "}":
+                            break
+                        else:
+                            return
+                    return
+                ok_skip, _ = decode_next()
+                if not ok_skip:
+                    return
+                if not skip_ws():
+                    return
+                if buf[idx] == ",":
+                    idx += 1
+                else:
+                    break
+    except OSError:
+        return
+
+
 class IncrementalScanner:
     """In-memory mtime/size cached read-only scanner for low-CPU live polling.
 
@@ -2239,7 +3179,10 @@ class IncrementalScanner:
         archive_path: pathlib.Path | None = None,
         sources: Sequence[SourceSpec] | None = None,
         agent_filter: set[str] | None = None,
+        *,
+        use_cache: bool = True,
     ) -> None:
+        self.use_cache = use_cache
         self.agent_filter = set(agent_filter) if agent_filter is not None else None
         if sources is not None:
             specs = [
@@ -2272,58 +3215,83 @@ class IncrementalScanner:
         self._meta_caches: dict[str, dict[str, dict[str, Any]]] = {}
         self._aux_json_cache: dict[str, tuple[int, int, Any]] = {}
 
-    def _get_metadata_cache(self, root_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
+    def _get_metadata_cache(
+        self,
+        root_dir: pathlib.Path,
+        *,
+        resolved_root: pathlib.Path | None = None,
+    ) -> dict[str, dict[str, Any]]:
         rk = str(root_dir)
         meta_path = root_dir / "cache" / "conversation_metadata.json"
-        if meta_path.is_symlink() or not meta_path.is_file():
+        st = _lstat_regular_file(meta_path)
+        if st is None:
             self._meta_sigs.pop(rk, None)
             self._meta_caches[rk] = {}
             return self._meta_caches[rk]
-        try:
-            st = meta_path.stat()
-            sig = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return self._meta_caches.get(rk, {})
-        if sig != self._meta_sigs.get(rk):
-            self._meta_caches[rk] = _load_metadata_cache(root_dir)
+        sig = (st.st_mtime_ns, st.st_size)
+        if not self.use_cache or sig != self._meta_sigs.get(rk):
+            self._meta_caches[rk] = _load_metadata_cache(root_dir, resolved_root=resolved_root)
             self._meta_sigs[rk] = sig
         return self._meta_caches[rk]
 
-    def _get_annotation_title(self, root_dir: pathlib.Path, cid: str) -> str:
-        ann_path = root_dir / "annotations" / f"{cid}.pbtxt"
-        key = str(ann_path)
-        if ann_path.is_symlink() or not ann_path.is_file():
-            self._ann_cache.pop(key, None)
-            return ""
-        try:
-            st = ann_path.stat()
+    def _get_annotation_title(
+        self,
+        root_dir: pathlib.Path,
+        cid: str,
+        *,
+        resolved_root: pathlib.Path | None = None,
+        ann_entries: dict[str, os.DirEntry[str]] | None = None,
+    ) -> str:
+        fname = f"{cid}.pbtxt"
+        if ann_entries is not None:
+            entry = ann_entries.get(fname)
+            if entry is None:
+                return ""
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    return ""
+                st = entry.stat(follow_symlinks=False)
+                mtime_ns, size = st.st_mtime_ns, st.st_size
+            except OSError:
+                return ""
+            ann_path = pathlib.Path(entry.path)
+            key = entry.path
+        else:
+            ann_path = root_dir / "annotations" / fname
+            key = str(ann_path)
+            st = _lstat_regular_file(ann_path)
+            if st is None:
+                self._ann_cache.pop(key, None)
+                return ""
             mtime_ns, size = st.st_mtime_ns, st.st_size
-        except OSError:
-            return ""
-        cached = self._ann_cache.get(key)
-        if cached is not None and cached[0] == mtime_ns and cached[1] == size:
-            return cached[2]
-        title = _parse_annotation_title(ann_path, root_dir)
-        self._ann_cache[key] = (mtime_ns, size, title)
+
+        if self.use_cache:
+            cached = self._ann_cache.get(key)
+            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                return cached[2]
+        title = _parse_annotation_title(
+            ann_path, root_dir, resolved_root=resolved_root, skip_lstat=True
+        )
+        if self.use_cache:
+            self._ann_cache[key] = (mtime_ns, size, title)
         return title
 
     def _get_cached_aux(
         self, path: pathlib.Path, loader: Any, default_val: Any
     ) -> Any:
         key = str(path)
-        if path.is_symlink() or not path.is_file():
+        st = _lstat_regular_file(path)
+        if st is None:
             self._aux_json_cache.pop(key, None)
             return default_val
-        try:
-            st = path.stat()
-            sig = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return default_val
-        cached = self._aux_json_cache.get(key)
-        if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
-            return cached[2]
+        sig = (st.st_mtime_ns, st.st_size)
+        if self.use_cache:
+            cached = self._aux_json_cache.get(key)
+            if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+                return cached[2]
         val = loader()
-        self._aux_json_cache[key] = (sig[0], sig[1], val)
+        if self.use_cache:
+            self._aux_json_cache[key] = (sig[0], sig[1], val)
         return val
 
     def _filter_and_price_turns(
@@ -2333,61 +3301,275 @@ class IncrementalScanner:
         since: dt.date | None,
         until: dt.date | None,
         model_needle: str | None,
+        *,
+        mutate_in_place: bool = False,
     ) -> list[TurnRecord]:
-        real_totals: dict[str, int] = defaultdict(int)
+        if not raw_turns:
+            return []
+        has_cp_or_unknown = False
         for t in raw_turns:
-            if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
-                real_totals[t.model] += t.total_tokens
-        fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0] if real_totals else ""
+            if t.step_type == "CHECKPOINT" or t.model in ("compaction", "unknown"):
+                has_cp_or_unknown = True
+                break
+        fallback_model = ""
+        if has_cp_or_unknown:
+            real_totals: dict[str, int] = defaultdict(int)
+            for t in raw_turns:
+                if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
+                    real_totals[t.model] += t.total_tokens
+            if real_totals:
+                fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0]
         last_real_model = ""
+        price_turn = self.pricing.price_turn
+        is_utc = tz == dt.timezone.utc
 
         filtered_turns: list[TurnRecord] = []
         for turn in raw_turns:
-            is_cp = turn.step_type == "CHECKPOINT" or turn.model == "compaction"
-            if not is_cp and turn.model not in ("compaction", "unknown"):
-                last_real_model = turn.model
-                eff_model = turn.model
-            elif turn.model not in ("compaction", "unknown"):
-                eff_model = turn.model
+            tm = turn.model
+            if has_cp_or_unknown:
+                is_cp = turn.step_type == "CHECKPOINT" or tm == "compaction"
+                if not is_cp and tm not in ("compaction", "unknown"):
+                    last_real_model = tm
+                    eff_model = tm
+                elif tm not in ("compaction", "unknown"):
+                    eff_model = tm
+                else:
+                    eff_model = last_real_model or fallback_model or tm
             else:
-                eff_model = last_real_model or fallback_model or turn.model
+                eff_model = tm
 
-            local_ts = turn.timestamp.astimezone(tz) if turn.timestamp is not None else None
-            if since is not None and (local_ts is None or local_ts.date() < since):
+            ts = turn.timestamp
+            if ts is None:
+                local_ts = None
+            elif is_utc and (ts.tzinfo is tz or ts.tzinfo == tz):
+                local_ts = ts
+            else:
+                local_ts = ts.astimezone(tz)
+
+            local_date = local_ts.date() if local_ts is not None else None
+            if since is not None and (local_date is None or local_date < since):
                 continue
-            if until is not None and (local_ts is None or local_ts.date() > until):
+            if until is not None and (local_date is None or local_date > until):
                 continue
-            if model_needle and model_needle not in turn.model.lower():
+            if model_needle and model_needle not in tm.lower():
                 continue
-            turn_cost = self.pricing.price_turn(
+            turn_cost = price_turn(
                 eff_model,
                 turn.input_tokens,
                 turn.cache_read_tokens,
                 turn.cache_write_tokens,
                 turn.output_tokens,
-                local_ts.date() if local_ts is not None else None,
+                local_date,
                 cache_write_1h_tokens=turn.cache_write_1h_tokens,
             )
-            filtered_turns.append(
-                TurnRecord(
-                    conversation_id=turn.conversation_id,
-                    step_index=turn.step_index,
-                    timestamp=local_ts,
-                    model=turn.model,
-                    step_type=turn.step_type,
-                    status=turn.status,
-                    input_tokens=turn.input_tokens,
-                    cache_read_tokens=turn.cache_read_tokens,
-                    cache_write_tokens=turn.cache_write_tokens,
-                    output_tokens=turn.output_tokens,
-                    tool_names=turn.tool_names,
-                    thinking_chars=turn.thinking_chars,
-                    reasoning_tokens=turn.reasoning_tokens,
-                    cache_write_1h_tokens=turn.cache_write_1h_tokens,
-                    cost=turn_cost,
+            if mutate_in_place:
+                turn.timestamp = local_ts
+                turn.cost = turn_cost
+                filtered_turns.append(turn)
+            else:
+                filtered_turns.append(
+                    TurnRecord(
+                        conversation_id=turn.conversation_id,
+                        step_index=turn.step_index,
+                        timestamp=local_ts,
+                        model=tm,
+                        step_type=turn.step_type,
+                        status=turn.status,
+                        input_tokens=turn.input_tokens,
+                        cache_read_tokens=turn.cache_read_tokens,
+                        cache_write_tokens=turn.cache_write_tokens,
+                        output_tokens=turn.output_tokens,
+                        tool_names=turn.tool_names,
+                        thinking_chars=turn.thinking_chars,
+                        reasoning_tokens=turn.reasoning_tokens,
+                        cache_write_1h_tokens=turn.cache_write_1h_tokens,
+                        cost=turn_cost,
+                    )
                 )
-            )
         return filtered_turns
+
+    def _filter_and_fold_turns(
+        self,
+        raw_turns: Sequence[TurnRecord],
+        tz: dt.tzinfo,
+        since: dt.date | None,
+        until: dt.date | None,
+        model_needle: str | None,
+    ) -> tuple[TokenCounts, set[str], dt.datetime | None, dt.datetime | None, _SessionDigest] | None:
+        if not raw_turns:
+            return None
+        has_cp_or_unknown = False
+        for t in raw_turns:
+            if t.step_type == "CHECKPOINT" or t.model in ("compaction", "unknown"):
+                has_cp_or_unknown = True
+                break
+        fallback_model = ""
+        if has_cp_or_unknown:
+            real_totals: dict[str, int] = defaultdict(int)
+            for t in raw_turns:
+                if t.step_type != "CHECKPOINT" and t.model not in ("compaction", "unknown"):
+                    real_totals[t.model] += t.total_tokens
+            if real_totals:
+                fallback_model = max(real_totals.items(), key=lambda kv: kv[1])[0]
+
+        last_real_model = ""
+        resolve_rate = self.pricing.resolve_rate
+        is_utc = tz == _UTC
+        inv_m = 1e-6
+
+        counts = TokenCounts()
+        models: set[str] = set()
+        first_time: dt.datetime | None = None
+        last_time: dt.datetime | None = None
+        times: list[dt.datetime] = []
+        by_model: dict[str, TokenCounts] = {}
+        by_day: dict[str, TokenCounts] = {}
+        by_hour: dict[int, TokenCounts] = {}
+        day_to_wm: dict[str, tuple[str, str]] = {}
+        date_cache: dict[tuple[int, int, int], str] = {}
+        tool_counts: dict[str, int] = {}
+        model_tokens: dict[str, tuple[bool, int]] = {}
+        thinking_turns = 0
+
+        for turn in raw_turns:
+            tm = turn.model
+            if has_cp_or_unknown:
+                is_cp = turn.step_type == "CHECKPOINT" or tm == "compaction"
+                if not is_cp and tm not in ("compaction", "unknown"):
+                    last_real_model = tm
+                    eff_model = tm
+                elif tm not in ("compaction", "unknown"):
+                    eff_model = tm
+                else:
+                    eff_model = last_real_model or fallback_model or tm
+            else:
+                eff_model = tm
+
+            ts = turn.timestamp
+            if ts is None:
+                local_ts = None
+            elif is_utc and (ts.tzinfo is tz or ts.tzinfo == tz):
+                local_ts = ts
+            else:
+                local_ts = ts.astimezone(tz)
+
+            local_date = local_ts.date() if local_ts is not None else None
+            if since is not None and (local_date is None or local_date < since):
+                continue
+            if until is not None and (local_date is None or local_date > until):
+                continue
+            if model_needle and model_needle not in tm.lower():
+                continue
+
+            in_t = turn.input_tokens
+            cr_t = turn.cache_read_tokens
+            cw_t = turn.cache_write_tokens
+            out_t = turn.output_tokens
+            ctx = in_t + cr_t + cw_t
+            rate = resolve_rate(eff_model, ctx, local_date)
+            if rate is None:
+                in_usd = 0.0
+                cr_usd = 0.0
+                cw_usd = 0.0
+                out_usd = 0.0
+                saved_usd = 0.0
+                unpriced = 1
+            else:
+                in_usd = in_t * inv_m * rate.input
+                cr_usd = cr_t * inv_m * rate.cache_read
+                if cw_t > 0:
+                    cw_1h_raw = turn.cache_write_1h_tokens
+                    if cw_1h_raw > 0:
+                        cw_1h = cw_1h_raw if cw_1h_raw < cw_t else cw_t
+                        cw_usd = (
+                            (cw_t - cw_1h) * inv_m * rate.cache_write
+                            + cw_1h * inv_m * (rate.input * 2.0)
+                        )
+                    else:
+                        cw_usd = cw_t * inv_m * rate.cache_write
+                else:
+                    cw_usd = 0.0
+                out_usd = out_t * inv_m * rate.output
+                saved_usd = (
+                    cr_t * inv_m * (rate.input - rate.cache_read)
+                    if cr_t > 0 and rate.input > rate.cache_read
+                    else 0.0
+                )
+                unpriced = 0
+
+            counts.add_call_inline(
+                in_t, cr_t, cw_t, out_t, ctx, in_usd, cr_usd, cw_usd, out_usd, saved_usd, unpriced
+            )
+            if tm:
+                models.add(tm)
+
+            bm = by_model.get(tm)
+            if bm is None:
+                bm = TokenCounts()
+                by_model[tm] = bm
+            bm.add_call_inline(
+                in_t, cr_t, cw_t, out_t, ctx, in_usd, cr_usd, cw_usd, out_usd, saved_usd, unpriced
+            )
+
+            is_cp_step = turn.step_type == "CHECKPOINT"
+            tot_tok = ctx + out_t
+            prev_mt = model_tokens.get(tm)
+            if prev_mt is None:
+                model_tokens[tm] = (is_cp_step, tot_tok)
+            else:
+                model_tokens[tm] = (prev_mt[0] and is_cp_step, prev_mt[1] + tot_tok)
+
+            if turn.thinking_chars > 0 or turn.reasoning_tokens > 0:
+                thinking_turns += 1
+            if turn.tool_names:
+                for tn in turn.tool_names:
+                    tool_counts[tn] = tool_counts.get(tn, 0) + 1
+
+            if local_ts is not None:
+                times.append(local_ts)
+                if first_time is None or local_ts < first_time:
+                    first_time = local_ts
+                if last_time is None or local_ts > last_time:
+                    last_time = local_ts
+                ymd = (local_ts.year, local_ts.month, local_ts.day)
+                day_key = date_cache.get(ymd)
+                if day_key is None:
+                    day_key = f"{local_ts.year:04d}-{local_ts.month:02d}-{local_ts.day:02d}"
+                    iso = local_ts.isocalendar()
+                    day_to_wm[day_key] = (f"{iso.year}-W{iso.week:02d}", day_key[:7])
+                    date_cache[ymd] = day_key
+                hr = local_ts.hour
+                bh = by_hour.get(hr)
+                if bh is None:
+                    bh = TokenCounts()
+                    by_hour[hr] = bh
+                bh.add_call_inline(
+                    in_t, cr_t, cw_t, out_t, ctx, in_usd, cr_usd, cw_usd, out_usd, saved_usd, unpriced
+                )
+            else:
+                day_key = "unknown"
+
+            bd = by_day.get(day_key)
+            if bd is None:
+                bd = TokenCounts()
+                by_day[day_key] = bd
+            bd.add_call_inline(
+                in_t, cr_t, cw_t, out_t, ctx, in_usd, cr_usd, cw_usd, out_usd, saved_usd, unpriced
+            )
+
+        if counts.calls == 0:
+            return None
+        digest = _SessionDigest(
+            by_model=by_model,
+            by_day=by_day,
+            by_hour=by_hour,
+            day_to_wm=day_to_wm,
+            tool_counts=tool_counts,
+            model_tokens=model_tokens,
+            active_duration_secs=_active_duration_from_times(times),
+            thinking_turns=thinking_turns,
+        )
+        return counts, models, first_time, last_time, digest
 
     def _load_archived_backfill(
         self,
@@ -2397,12 +3579,20 @@ class IncrementalScanner:
         until: dt.date | None,
         model_needle: str | None,
         session_needle: str | None,
+        *,
+        retain_turns: bool = True,
+        scalar_only: bool = False,
     ) -> list[SessionInfo]:
-        raw = _read_companion_json(self.archive_path)
-        if not raw or not isinstance(raw.get("sessions"), dict):
+        if self.archive_path is None:
             return []
+        min_day_prefix = (since - dt.timedelta(days=1)).isoformat() if since is not None else None
+        max_day_prefix = (until + dt.timedelta(days=1)).isoformat() if until is not None else None
+        has_date_bounds = (min_day_prefix is not None) or (max_day_prefix is not None)
+        intern = sys.intern
+        parse_utc = _parse_utc_timestamp_fast
+
         out: list[SessionInfo] = []
-        for raw_key, s_obj in raw["sessions"].items():
+        for raw_key, s_obj in _iter_archive_sessions(self.archive_path):
             if not isinstance(s_obj, dict):
                 continue
             raw_src = str(s_obj.get("source") or "cli")
@@ -2425,17 +3615,48 @@ class IncrementalScanner:
             raw_turns = s_obj.get("turns")
             if not isinstance(raw_turns, list) or not raw_turns:
                 continue
+
+            if has_date_bounds:
+                any_in_window = False
+                for t_obj in raw_turns:
+                    if not isinstance(t_obj, dict):
+                        continue
+                    raw_ts = t_obj.get("ts")
+                    if not isinstance(raw_ts, str):
+                        continue
+                    s_ts = raw_ts.strip()
+                    if len(s_ts) < 10 or s_ts[4] != "-" or s_ts[7] != "-":
+                        any_in_window = True
+                        break
+                    d_pfx = s_ts[:10]
+                    if (min_day_prefix is None or d_pfx >= min_day_prefix) and (
+                        max_day_prefix is None or d_pfx <= max_day_prefix
+                    ):
+                        any_in_window = True
+                        break
+                if not any_in_window:
+                    continue
+
             parsed_turns: list[TurnRecord] = []
             for t_obj in raw_turns:
                 if not isinstance(t_obj, dict):
                     continue
-                ts = _parse_iso_timestamp(t_obj.get("ts"), dt.timezone.utc)
+                ts = parse_utc(t_obj.get("ts"))
                 is_cp = bool(t_obj.get("cp"))
-                model = str(t_obj.get("m") or ("compaction" if is_cp else "unknown"))
-                tools_raw = t_obj.get("tools")
-                tools = tuple(str(x) for x in tools_raw if isinstance(x, str)) if isinstance(tools_raw, list) else ()
+                raw_m = t_obj.get("m")
+                model = intern(str(raw_m)) if raw_m else ("compaction" if is_cp else "unknown")
+                if scalar_only:
+                    tools: tuple[str, ...] = ()
+                    th_val = 0
+                else:
+                    tools_raw = t_obj.get("tools")
+                    if isinstance(tools_raw, list) and tools_raw:
+                        tools = tuple(intern(x) for x in tools_raw if isinstance(x, str))
+                    else:
+                        tools = ()
+                    th_val = _to_non_neg_int(t_obj.get("th"))
                 cw = _to_non_neg_int(t_obj.get("cw"))
-                cw1h = min(_to_non_neg_int(t_obj.get("cw1h")), cw)
+                cw1h = min(_to_non_neg_int(t_obj.get("cw1h")), cw) if cw > 0 else 0
                 parsed_turns.append(
                     TurnRecord(
                         conversation_id=cid,
@@ -2449,28 +3670,53 @@ class IncrementalScanner:
                         cache_write_tokens=cw,
                         output_tokens=_to_non_neg_int(t_obj.get("out")),
                         tool_names=tools,
-                        thinking_chars=_to_non_neg_int(t_obj.get("th")),
+                        thinking_chars=th_val,
                         reasoning_tokens=_to_non_neg_int(t_obj.get("rt")),
                         cache_write_1h_tokens=cw1h,
+                        cost=_ZERO_COST,
                     )
                 )
-            filtered_turns = self._filter_and_price_turns(
-                parsed_turns, tz, since, until, model_needle
-            )
-            if not filtered_turns:
-                continue
-            sess = SessionInfo(
-                conversation_id=cid,
-                title=str(s_obj.get("title") or "(archived)"),
-                workspace=str(s_obj.get("workspace") or "(unknown)"),
-                source=src,
-                is_archived=True,
-                is_subagent=bool(s_obj.get("is_subagent")),
-                parent_id=str(s_obj["parent_id"]) if s_obj.get("parent_id") else None,
-                parent_title=str(s_obj.get("parent_title") or ""),
-            )
-            for t in filtered_turns:
-                sess.add_turn(t)
+            if retain_turns:
+                filtered_turns = self._filter_and_price_turns(
+                    parsed_turns, tz, since, until, model_needle, mutate_in_place=True
+                )
+                if not filtered_turns:
+                    continue
+                sess = SessionInfo(
+                    conversation_id=cid,
+                    title=str(s_obj.get("title") or "(archived)"),
+                    workspace=str(s_obj.get("workspace") or "(unknown)"),
+                    source=src,
+                    is_archived=True,
+                    is_subagent=bool(s_obj.get("is_subagent")),
+                    parent_id=str(s_obj["parent_id"]) if s_obj.get("parent_id") else None,
+                    parent_title=str(s_obj.get("parent_title") or ""),
+                )
+                for t in filtered_turns:
+                    sess.add_turn(t)
+            else:
+                folded = self._filter_and_fold_turns(
+                    parsed_turns, tz, since, until, model_needle
+                )
+                if folded is None:
+                    continue
+                counts, models, first_time, last_time, digest = folded
+                sess = SessionInfo(
+                    conversation_id=cid,
+                    title=str(s_obj.get("title") or "(archived)"),
+                    workspace=str(s_obj.get("workspace") or "(unknown)"),
+                    source=src,
+                    is_archived=True,
+                    is_subagent=bool(s_obj.get("is_subagent")),
+                    parent_id=str(s_obj["parent_id"]) if s_obj.get("parent_id") else None,
+                    parent_title=str(s_obj.get("parent_title") or ""),
+                    turns=[],
+                    counts=counts,
+                    models=models,
+                    first_time=first_time,
+                    last_time=last_time,
+                    _digest=digest,
+                )
             out.append(sess)
         return out
 
@@ -2480,62 +3726,101 @@ class IncrementalScanner:
         tz: dt.tzinfo,
         since: dt.date | None,
         until: dt.date | None,
+        mtime_cutoff_ns: int | None,
         model_needle: str | None,
         session_needle: str | None,
         sessions_by_key: dict[tuple[str, str], SessionInfo],
+        discovered_live_keys: set[tuple[str, str]],
         seen_agy_keys: set[str],
+        ann_indices: dict[str, tuple[dict[str, os.DirEntry[str]], pathlib.Path]],
         warnings: list[str],
+        *,
+        retain_turns: bool = True,
+        scalar_only: bool = False,
+        skip_meta: bool = False,
+        retain_thinking_len: bool = True,
+        utc_date_bounds: tuple[str | None, str | None] | None = None,
     ) -> tuple[bool, int, int, int, int]:
         root_dir = spec.root
-        if root_dir.is_symlink() or not root_dir.exists() or not root_dir.is_dir():
+        if _lstat_dir(root_dir) is None:
             return False, 0, 0, 0, 0
         brain_dir = root_dir / "brain"
-        if brain_dir.is_symlink() or not brain_dir.exists() or not brain_dir.is_dir():
+        if _lstat_dir(brain_dir) is None:
+            return False, 0, 0, 0, 0
+        try:
+            resolved_root = root_dir.resolve(strict=True)
+        except OSError:
             return False, 0, 0, 0, 0
 
         source_name = spec.source_name
-        meta_cache = self._get_metadata_cache(root_dir)
+        ann_entries: dict[str, os.DirEntry[str]] = {}
+        if skip_meta:
+            meta_cache: dict[str, dict[str, Any]] = {}
+        else:
+            meta_cache = self._get_metadata_cache(root_dir, resolved_root=resolved_root)
+            ann_dir = root_dir / "annotations"
+            if _lstat_dir(ann_dir) is not None:
+                try:
+                    with os.scandir(ann_dir) as it:
+                        for ent in it:
+                            if ent.name.endswith(".pbtxt"):
+                                ann_entries[ent.name] = ent
+                except OSError:
+                    pass
+            ann_indices[str(root_dir)] = (ann_entries, resolved_root)
+
         skipped_empty = 0
         skipped_lines = 0
         files_cached = 0
         files_reparsed = 0
 
         try:
-            conv_dirs = sorted(brain_dir.iterdir(), key=lambda p: p.name)
+            with os.scandir(brain_dir) as it:
+                conv_entries = sorted(it, key=lambda e: e.name)
         except OSError as exc:
             warnings.append(f"Failed to list {brain_dir}: {exc}")
             return True, 0, 0, 0, 0
 
-        for conv_dir in conv_dirs:
-            if conv_dir.is_symlink() or not conv_dir.is_dir():
+        mutate_turns = not self.use_cache
+        path_join = os.path.join
+        lstat_reg_str = _lstat_regular_file_str
+        for entry in conv_entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
                 continue
-            cid = conv_dir.name
+            cid = entry.name
             if session_needle and not cid.lower().startswith(session_needle):
                 continue
 
-            logs_dir = conv_dir / ".system_generated" / "logs"
-            transcript_path = logs_dir / "transcript.jsonl"
-            if not transcript_path.is_file() or transcript_path.is_symlink():
-                fallback = logs_dir / "transcript_full.jsonl"
-                if fallback.is_file() and not fallback.is_symlink():
-                    transcript_path = fallback
+            logs_dir_str = path_join(entry.path, ".system_generated", "logs")
+            transcript_str = path_join(logs_dir_str, "transcript.jsonl")
+            st = lstat_reg_str(transcript_str)
+            if st is None:
+                fallback_str = path_join(logs_dir_str, "transcript_full.jsonl")
+                st = lstat_reg_str(fallback_str)
+                if st is not None:
+                    transcript_str = fallback_str
                 else:
                     skipped_empty += 1
                     continue
 
-            if not _is_within_dir(transcript_path, root_dir):
-                continue
-
-            cache_key = str(transcript_path)
+            cache_key = transcript_str
             seen_agy_keys.add(cache_key)
-            try:
-                st = transcript_path.stat()
-                mtime_ns, size = st.st_mtime_ns, st.st_size
-            except OSError as exc:
-                warnings.append(f"Could not stat {transcript_path}: {exc}")
+            mtime_ns, size = st.st_mtime_ns, st.st_size
+
+            if mtime_cutoff_ns is not None and mtime_ns < mtime_cutoff_ns:
+                if size > 0:
+                    discovered_live_keys.add(("antigravity", cid))
+                skipped_empty += 1
                 continue
 
-            cached = self._transcript_cache.get(cache_key)
+            transcript_path = pathlib.Path(transcript_str)
+            if not _is_within_dir(transcript_path, root_dir, resolved_root=resolved_root):
+                continue
+
+            cached = self._transcript_cache.get(cache_key) if self.use_cache else None
             if cached is not None and cached[0] == mtime_ns and cached[1] == size:
                 (
                     raw_turns,
@@ -2562,61 +3847,110 @@ class IncrementalScanner:
                         subagent_preview,
                         is_swarm_subagent,
                         file_skipped,
-                    ) = _parse_transcript_file(transcript_path, cid)
+                    ) = _parse_transcript_file(
+                        transcript_path,
+                        cid,
+                        scalar_only=scalar_only,
+                        skip_meta=skip_meta,
+                        retain_thinking_len=retain_thinking_len,
+                        utc_date_bounds=utc_date_bounds,
+                    )
                 except OSError as exc:
                     warnings.append(f"Could not read {transcript_path}: {exc}")
                     continue
-                self._transcript_cache[cache_key] = (
-                    mtime_ns,
-                    size,
-                    raw_turns,
-                    first_user_preview,
-                    subagent_parent_id,
-                    subagent_preview,
-                    is_swarm_subagent,
-                    file_skipped,
-                )
+                if self.use_cache:
+                    self._transcript_cache[cache_key] = (
+                        mtime_ns,
+                        size,
+                        raw_turns,
+                        first_user_preview,
+                        subagent_parent_id,
+                        subagent_preview,
+                        is_swarm_subagent,
+                        file_skipped,
+                    )
                 files_reparsed += 1
 
             skipped_lines += file_skipped
-            filtered_turns = self._filter_and_price_turns(raw_turns, tz, since, until, model_needle)
-            if not filtered_turns:
-                skipped_empty += 1
-                continue
+            if raw_turns:
+                discovered_live_keys.add(("antigravity", cid))
 
-            ann_title = self._get_annotation_title(root_dir, cid)
-            meta = meta_cache.get(cid)
-            if meta is not None:
-                is_subagent = bool(meta.get("is_internal"))
+            if retain_turns:
+                filtered_turns = self._filter_and_price_turns(
+                    raw_turns, tz, since, until, model_needle, mutate_in_place=mutate_turns
+                )
+                if not filtered_turns:
+                    skipped_empty += 1
+                    continue
+                folded_tuple = None
             else:
-                is_subagent = (subagent_parent_id is not None) or is_swarm_subagent
-            parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
-            meta_dict = meta or {}
-            title = (
-                ann_title
-                or str(meta_dict.get("title") or "")
-                or str(meta_dict.get("preview") or "")
-                or first_user_preview
-                or (subagent_preview if is_subagent else "")
-                or ("(subagent)" if is_subagent else "(untitled)")
-            )
-            workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
+                folded_tuple = self._filter_and_fold_turns(
+                    raw_turns, tz, since, until, model_needle
+                )
+                if folded_tuple is None:
+                    skipped_empty += 1
+                    continue
+                filtered_turns = []
 
-            session = SessionInfo(
-                conversation_id=cid,
-                title=title,
-                workspace=workspace,
-                transcript_path=cache_key,
-                source=source_name,
-                is_subagent=is_subagent,
-                parent_id=parent_id,
-            )
-            for t in filtered_turns:
-                session.add_turn(t)
+            if skip_meta:
+                is_subagent = False
+                parent_id = None
+                title = ""
+                workspace = "(unknown)"
+            else:
+                ann_title = self._get_annotation_title(
+                    root_dir, cid, resolved_root=resolved_root, ann_entries=ann_entries
+                )
+                meta = meta_cache.get(cid)
+                if meta is not None:
+                    is_subagent = bool(meta.get("is_internal"))
+                else:
+                    is_subagent = (subagent_parent_id is not None) or is_swarm_subagent
+                parent_id = subagent_parent_id if (is_subagent and subagent_parent_id != cid) else None
+                meta_dict = meta or {}
+                title = (
+                    ann_title
+                    or str(meta_dict.get("title") or "")
+                    or str(meta_dict.get("preview") or "")
+                    or first_user_preview
+                    or (subagent_preview if is_subagent else "")
+                    or ("(subagent)" if is_subagent else "(untitled)")
+                )
+                workspace = str(meta_dict.get("workspace") or "") or "(unknown)"
+
+            if folded_tuple is not None:
+                counts, models, first_time, last_time, digest = folded_tuple
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=title,
+                    workspace=workspace,
+                    transcript_path=cache_key,
+                    source=source_name,
+                    is_subagent=is_subagent,
+                    parent_id=parent_id,
+                    turns=[],
+                    counts=counts,
+                    models=models,
+                    first_time=first_time,
+                    last_time=last_time,
+                    _digest=digest,
+                )
+            else:
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=title,
+                    workspace=workspace,
+                    transcript_path=cache_key,
+                    source=source_name,
+                    is_subagent=is_subagent,
+                    parent_id=parent_id,
+                )
+                for t in filtered_turns:
+                    session.add_turn(t)
 
             skey = ("antigravity", cid)
             prev = sessions_by_key.get(skey)
-            if prev is None or len(session.turns) > len(prev.turns):
+            if prev is None or session.counts.calls > prev.counts.calls:
                 sessions_by_key[skey] = session
 
         return True, skipped_empty, skipped_lines, files_cached, files_reparsed
@@ -2627,18 +3961,27 @@ class IncrementalScanner:
         tz: dt.tzinfo,
         since: dt.date | None,
         until: dt.date | None,
+        mtime_cutoff_ns: int | None,
         model_needle: str | None,
         session_needle: str | None,
         sessions_by_key: dict[tuple[str, str], SessionInfo],
+        discovered_live_keys: set[tuple[str, str]],
         seen_agent_keys: set[str],
         claude_parent_meta: dict[str, tuple[str, str]],
+        pruned_claude_parents: dict[str, tuple[pathlib.Path, pathlib.Path, pathlib.Path]],
         warnings: list[str],
+        *,
+        retain_turns: bool = True,
     ) -> tuple[bool, int, int, int, int]:
         root_dir = spec.root
-        if root_dir.is_symlink() or not root_dir.is_dir():
+        if _lstat_dir(root_dir) is None:
             return False, 0, 0, 0, 0
         projects_dir = root_dir / "projects"
-        if projects_dir.is_symlink() or not projects_dir.is_dir():
+        if _lstat_dir(projects_dir) is None:
+            return False, 0, 0, 0, 0
+        try:
+            resolved_root = root_dir.resolve(strict=True)
+        except OSError:
             return False, 0, 0, 0, 0
 
         skipped_empty = 0
@@ -2647,21 +3990,29 @@ class IncrementalScanner:
         files_reparsed = 0
 
         try:
-            proj_dirs = sorted(projects_dir.iterdir(), key=lambda p: p.name)
+            with os.scandir(projects_dir) as it:
+                proj_entries = sorted(it, key=lambda e: e.name)
         except OSError as exc:
             warnings.append(f"Failed to list {projects_dir}: {exc}")
             return True, 0, 0, 0, 0
 
-        for proj_dir in proj_dirs:
-            if proj_dir.is_symlink() or not proj_dir.is_dir():
+        mutate_turns = not self.use_cache
+        for proj_ent in proj_entries:
+            try:
+                if proj_ent.is_symlink() or not proj_ent.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
                 continue
-            if not _is_within_dir(proj_dir, root_dir):
+            proj_dir = pathlib.Path(proj_ent.path)
+            if not _is_within_dir(proj_dir, root_dir, resolved_root=resolved_root):
                 continue
 
             idx_path = proj_dir / "sessions-index.json"
             sess_index: dict[str, dict[str, str]] = self._get_cached_aux(
                 idx_path,
-                lambda p=idx_path, r=root_dir: _load_claude_sessions_index(p, r),
+                lambda p=idx_path, r=root_dir, rr=resolved_root: _load_claude_sessions_index(
+                    p, r, resolved_root=rr
+                ),
                 {},
             )
             for sid, info in sess_index.items():
@@ -2669,51 +4020,69 @@ class IncrementalScanner:
                     claude_parent_meta.setdefault(sid, (info.get("title", ""), info.get("workspace", "")))
 
             # Collect main session JSONL files and subagent JSONL files strictly under projects/<proj>/
-            file_jobs: list[tuple[pathlib.Path, bool, str | None, str]] = []
+            file_jobs: list[tuple[pathlib.Path, os.stat_result, bool, str | None, str]] = []
             try:
-                children = sorted(proj_dir.iterdir(), key=lambda p: p.name)
+                with os.scandir(proj_dir) as it:
+                    children = sorted(it, key=lambda e: e.name)
             except OSError as exc:
                 warnings.append(f"Failed to list {proj_dir}: {exc}")
                 continue
 
             for child in children:
-                if child.is_symlink():
+                try:
+                    if child.is_symlink():
+                        continue
+                    cname = child.name
+                    if child.is_file(follow_symlinks=False) and cname.lower().endswith(".jsonl"):
+                        stem = cname[:-6]
+                        if _is_allowed_claude_session_stem(stem):
+                            file_jobs.append((pathlib.Path(child.path), child.stat(follow_symlinks=False), False, None, ""))
+                    elif child.is_dir(follow_symlinks=False) and _is_allowed_claude_session_stem(cname):
+                        sub_dir = pathlib.Path(child.path) / "subagents"
+                        if _lstat_dir(sub_dir) is None:
+                            continue
+                        try:
+                            with os.scandir(sub_dir) as sub_it:
+                                sub_files = sorted(sub_it, key=lambda e: e.name)
+                        except OSError:
+                            continue
+                        for sf in sub_files:
+                            try:
+                                sf_name = sf.name
+                                if (
+                                    not sf.is_symlink()
+                                    and sf.is_file(follow_symlinks=False)
+                                    and sf_name.startswith("agent-")
+                                    and sf_name.lower().endswith(".jsonl")
+                                ):
+                                    aid_hint = sf_name[len("agent-") : -6]
+                                    if _is_allowed_claude_agent_id(aid_hint):
+                                        file_jobs.append(
+                                            (pathlib.Path(sf.path), sf.stat(follow_symlinks=False), True, cname, aid_hint)
+                                        )
+                            except OSError:
+                                continue
+                except OSError:
                     continue
-                if child.is_file() and child.suffix.lower() == ".jsonl":
-                    if _is_allowed_claude_session_stem(child.stem):
-                        file_jobs.append((child, False, None, ""))
-                elif child.is_dir() and _is_allowed_claude_session_stem(child.name):
-                    sub_dir = child / "subagents"
-                    if sub_dir.is_symlink() or not sub_dir.is_dir():
-                        continue
-                    try:
-                        sub_files = sorted(sub_dir.iterdir(), key=lambda p: p.name)
-                    except OSError:
-                        continue
-                    for sf in sub_files:
-                        if (
-                            not sf.is_symlink()
-                            and sf.is_file()
-                            and sf.name.startswith("agent-")
-                            and sf.suffix.lower() == ".jsonl"
-                        ):
-                            aid_hint = sf.stem[len("agent-") :]
-                            if _is_allowed_claude_agent_id(aid_hint):
-                                file_jobs.append((sf, True, child.name, aid_hint))
 
-            for fpath, is_sub, parent_hint, aid_hint in file_jobs:
-                if not _is_within_dir(fpath, root_dir):
-                    continue
+            for fpath, st, is_sub, parent_hint, aid_hint in file_jobs:
                 cache_key = f"claude:{fpath}"
                 seen_agent_keys.add(cache_key)
-                try:
-                    st = fpath.stat()
-                    mtime_ns, size = st.st_mtime_ns, st.st_size
-                except OSError as exc:
-                    warnings.append(f"Could not stat {fpath}: {exc}")
+                mtime_ns, size = st.st_mtime_ns, st.st_size
+
+                if mtime_cutoff_ns is not None and mtime_ns < mtime_cutoff_ns:
+                    if size > 0:
+                        est_cid = f"{parent_hint}__{aid_hint}" if (is_sub and parent_hint and aid_hint) else fpath.stem
+                        discovered_live_keys.add(("claude", est_cid))
+                        if not is_sub:
+                            pruned_claude_parents[fpath.stem] = (fpath, root_dir, resolved_root)
+                    skipped_empty += 1
                     continue
 
-                cached = self._agent_file_cache.get(cache_key)
+                if not _is_within_dir(fpath, root_dir, resolved_root=resolved_root):
+                    continue
+
+                cached = self._agent_file_cache.get(cache_key) if self.use_cache else None
                 if cached is not None and cached[0] == mtime_ns and cached[1] == size:
                     parsed = cached[2]
                     files_cached += 1
@@ -2729,11 +4098,14 @@ class IncrementalScanner:
                     except OSError as exc:
                         warnings.append(f"Could not read {fpath}: {exc}")
                         continue
-                    self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
+                    if self.use_cache:
+                        self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
                     files_reparsed += 1
 
                 skipped_lines += int(parsed.get("skipped_lines", 0))
                 cid = str(parsed["cid"])
+                if parsed["turns"]:
+                    discovered_live_keys.add(("claude", cid))
                 if not is_sub and (parsed.get("title_hint") or parsed.get("cwd")):
                     prev_pm = claude_parent_meta.get(cid, ("", ""))
                     claude_parent_meta[cid] = (
@@ -2745,10 +4117,22 @@ class IncrementalScanner:
                     continue
 
                 raw_turns: list[TurnRecord] = parsed["turns"]
-                filtered_turns = self._filter_and_price_turns(raw_turns, tz, since, until, model_needle)
-                if not filtered_turns:
-                    skipped_empty += 1
-                    continue
+                if retain_turns:
+                    filtered_turns = self._filter_and_price_turns(
+                        raw_turns, tz, since, until, model_needle, mutate_in_place=mutate_turns
+                    )
+                    if not filtered_turns:
+                        skipped_empty += 1
+                        continue
+                    folded_tuple = None
+                else:
+                    folded_tuple = self._filter_and_fold_turns(
+                        raw_turns, tz, since, until, model_needle
+                    )
+                    if folded_tuple is None:
+                        skipped_empty += 1
+                        continue
+                    filtered_turns = []
 
                 parent_id: str | None = parsed.get("parent_id")
                 idx_info = sess_index.get(parent_id or cid, {}) if is_sub else sess_index.get(cid, {})
@@ -2757,7 +4141,9 @@ class IncrementalScanner:
                     meta_path = fpath.with_name(f"{fpath.stem}.meta.json")
                     agent_type, desc = self._get_cached_aux(
                         meta_path,
-                        lambda p=meta_path, r=root_dir: _parse_claude_agent_meta(p, r),
+                        lambda p=meta_path, r=root_dir, rr=resolved_root: _parse_claude_agent_meta(
+                            p, r, resolved_root=rr
+                        ),
                         ("", ""),
                     )
                     if agent_type and desc:
@@ -2783,21 +4169,39 @@ class IncrementalScanner:
                     or "(unknown)"
                 )
 
-                session = SessionInfo(
-                    conversation_id=cid,
-                    title=title,
-                    workspace=workspace,
-                    transcript_path=str(fpath),
-                    source="claude",
-                    is_subagent=is_sub,
-                    parent_id=parent_id,
-                )
-                for t in filtered_turns:
-                    session.add_turn(t)
+                if folded_tuple is not None:
+                    counts, models, first_time, last_time, digest = folded_tuple
+                    session = SessionInfo(
+                        conversation_id=cid,
+                        title=title,
+                        workspace=workspace,
+                        transcript_path=str(fpath),
+                        source="claude",
+                        is_subagent=is_sub,
+                        parent_id=parent_id,
+                        turns=[],
+                        counts=counts,
+                        models=models,
+                        first_time=first_time,
+                        last_time=last_time,
+                        _digest=digest,
+                    )
+                else:
+                    session = SessionInfo(
+                        conversation_id=cid,
+                        title=title,
+                        workspace=workspace,
+                        transcript_path=str(fpath),
+                        source="claude",
+                        is_subagent=is_sub,
+                        parent_id=parent_id,
+                    )
+                    for t in filtered_turns:
+                        session.add_turn(t)
 
                 skey = ("claude", cid)
                 prev = sessions_by_key.get(skey)
-                if prev is None or len(session.turns) > len(prev.turns):
+                if prev is None or session.counts.calls > prev.counts.calls:
                     sessions_by_key[skey] = session
 
         return True, skipped_empty, skipped_lines, files_cached, files_reparsed
@@ -2808,102 +4212,161 @@ class IncrementalScanner:
         tz: dt.tzinfo,
         since: dt.date | None,
         until: dt.date | None,
+        mtime_cutoff_ns: int | None,
         model_needle: str | None,
         session_needle: str | None,
         sessions_by_key: dict[tuple[str, str], SessionInfo],
+        discovered_live_keys: set[tuple[str, str]],
         seen_agent_keys: set[str],
         codex_parent_meta: dict[str, tuple[str, str]],
+        pruned_codex_parents: dict[str, tuple[pathlib.Path, pathlib.Path, pathlib.Path]],
         warnings: list[str],
+        *,
+        retain_turns: bool = True,
     ) -> tuple[bool, int, int, int, int]:
         root_dir = spec.root
-        if root_dir.is_symlink() or not root_dir.is_dir():
+        if _lstat_dir(root_dir) is None:
             return False, 0, 0, 0, 0
         sessions_dir = root_dir / "sessions"
         archived_dir = root_dir / "archived_sessions"
-        has_sessions = sessions_dir.is_dir() and not sessions_dir.is_symlink()
-        has_archived = archived_dir.is_dir() and not archived_dir.is_symlink()
+        has_sessions = _lstat_dir(sessions_dir) is not None
+        has_archived = _lstat_dir(archived_dir) is not None
         if not has_sessions and not has_archived:
+            return False, 0, 0, 0, 0
+        try:
+            resolved_root = root_dir.resolve(strict=True)
+        except OSError:
             return False, 0, 0, 0, 0
 
         idx_path = root_dir / "session_index.jsonl"
         index_titles: dict[str, str] = self._get_cached_aux(
             idx_path,
-            lambda r=root_dir: _load_codex_session_index(r),
+            lambda r=root_dir, rr=resolved_root: _load_codex_session_index(r, resolved_root=rr),
             {},
         )
         for sid, t_val in index_titles.items():
             codex_parent_meta.setdefault(sid, (t_val, ""))
 
-        rollout_files: list[pathlib.Path] = []
+        until_plus_1 = (until + dt.timedelta(days=1)) if until is not None else None
+        rollout_files: list[tuple[pathlib.Path, os.stat_result]] = []
         if has_sessions:
             try:
-                year_dirs = sorted(sessions_dir.iterdir(), key=lambda p: p.name)
+                with os.scandir(sessions_dir) as it:
+                    year_dirs = sorted(it, key=lambda e: e.name)
             except OSError as exc:
                 warnings.append(f"Failed to list {sessions_dir}: {exc}")
                 year_dirs = []
             for y_dir in year_dirs:
-                if y_dir.is_symlink() or not y_dir.is_dir():
-                    continue
                 try:
-                    month_dirs = sorted(y_dir.iterdir(), key=lambda p: p.name)
+                    if y_dir.is_symlink() or not y_dir.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                y_num: int | None = None
+                if len(y_dir.name) == 4 and y_dir.name.isdigit():
+                    y_num = int(y_dir.name)
+                    if until_plus_1 is not None and y_num > until_plus_1.year:
+                        continue
+                try:
+                    with os.scandir(y_dir.path) as it:
+                        month_dirs = sorted(it, key=lambda e: e.name)
                 except OSError:
                     continue
                 for m_dir in month_dirs:
-                    if m_dir.is_symlink() or not m_dir.is_dir():
-                        continue
                     try:
-                        day_dirs = sorted(m_dir.iterdir(), key=lambda p: p.name)
+                        if m_dir.is_symlink() or not m_dir.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    m_num: int | None = None
+                    if y_num is not None and m_dir.name.isdigit():
+                        mv = int(m_dir.name)
+                        if 1 <= mv <= 12:
+                            m_num = mv
+                            if until_plus_1 is not None and (y_num, m_num) > (until_plus_1.year, until_plus_1.month):
+                                continue
+                    try:
+                        with os.scandir(m_dir.path) as it:
+                            day_dirs = sorted(it, key=lambda e: e.name)
                     except OSError:
                         continue
                     for d_dir in day_dirs:
-                        if d_dir.is_symlink() or not d_dir.is_dir():
-                            continue
                         try:
-                            files = sorted(d_dir.iterdir(), key=lambda p: p.name)
+                            if d_dir.is_symlink() or not d_dir.is_dir(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        if until_plus_1 is not None and y_num is not None and m_num is not None and d_dir.name.isdigit():
+                            dv = int(d_dir.name)
+                            if 1 <= dv <= 31 and (y_num, m_num, dv) > (
+                                until_plus_1.year,
+                                until_plus_1.month,
+                                until_plus_1.day,
+                            ):
+                                continue
+                        try:
+                            with os.scandir(d_dir.path) as it:
+                                files = sorted(it, key=lambda e: e.name)
                         except OSError:
                             continue
                         for f in files:
-                            if (
-                                not f.is_symlink()
-                                and f.is_file()
-                                and f.name.startswith("rollout-")
-                                and f.suffix.lower() == ".jsonl"
-                            ):
-                                rollout_files.append(f)
+                            try:
+                                fn = f.name
+                                if (
+                                    not f.is_symlink()
+                                    and f.is_file(follow_symlinks=False)
+                                    and fn.startswith("rollout-")
+                                    and fn.lower().endswith(".jsonl")
+                                ):
+                                    rollout_files.append((pathlib.Path(f.path), f.stat(follow_symlinks=False)))
+                            except OSError:
+                                continue
 
         if has_archived:
             try:
-                a_files = sorted(archived_dir.iterdir(), key=lambda p: p.name)
+                with os.scandir(archived_dir) as it:
+                    a_files = sorted(it, key=lambda e: e.name)
             except OSError as exc:
                 warnings.append(f"Failed to list {archived_dir}: {exc}")
                 a_files = []
             for f in a_files:
-                if (
-                    not f.is_symlink()
-                    and f.is_file()
-                    and f.name.startswith("rollout-")
-                    and f.suffix.lower() == ".jsonl"
-                ):
-                    rollout_files.append(f)
+                try:
+                    fn = f.name
+                    if (
+                        not f.is_symlink()
+                        and f.is_file(follow_symlinks=False)
+                        and fn.startswith("rollout-")
+                        and fn.lower().endswith(".jsonl")
+                    ):
+                        rollout_files.append((pathlib.Path(f.path), f.stat(follow_symlinks=False)))
+                except OSError:
+                    continue
 
         skipped_empty = 0
         skipped_lines = 0
         files_cached = 0
         files_reparsed = 0
+        mutate_turns = not self.use_cache
 
-        for fpath in rollout_files:
-            if not _is_within_dir(fpath, root_dir):
-                continue
+        for fpath, st in rollout_files:
             cache_key = f"codex:{fpath}"
             seen_agent_keys.add(cache_key)
-            try:
-                st = fpath.stat()
-                mtime_ns, size = st.st_mtime_ns, st.st_size
-            except OSError as exc:
-                warnings.append(f"Could not stat {fpath}: {exc}")
+            mtime_ns, size = st.st_mtime_ns, st.st_size
+
+            if mtime_cutoff_ns is not None and mtime_ns < mtime_cutoff_ns:
+                if size > 0:
+                    stem = fpath.stem
+                    m_uuid = _CODEX_UUID_TAIL_RE.search(stem)
+                    est_cid = m_uuid.group(1) if m_uuid else stem
+                    discovered_live_keys.add(("codex", est_cid))
+                    pruned_codex_parents[est_cid] = (fpath, root_dir, resolved_root)
+                skipped_empty += 1
                 continue
 
-            cached = self._agent_file_cache.get(cache_key)
+            if not _is_within_dir(fpath, root_dir, resolved_root=resolved_root):
+                continue
+
+            cached = self._agent_file_cache.get(cache_key) if self.use_cache else None
             if cached is not None and cached[0] == mtime_ns and cached[1] == size:
                 parsed = cached[2]
                 files_cached += 1
@@ -2913,11 +4376,14 @@ class IncrementalScanner:
                 except OSError as exc:
                     warnings.append(f"Could not read {fpath}: {exc}")
                     continue
-                self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
+                if self.use_cache:
+                    self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
                 files_reparsed += 1
 
             skipped_lines += int(parsed.get("skipped_lines", 0))
             cid = str(parsed["cid"])
+            if parsed["turns"]:
+                discovered_live_keys.add(("codex", cid))
             is_sub = bool(parsed.get("is_subagent"))
             idx_title = index_titles.get(cid, "")
             title = (
@@ -2932,28 +4398,51 @@ class IncrementalScanner:
             if session_needle and not cid.lower().startswith(session_needle):
                 continue
 
-            filtered_turns = self._filter_and_price_turns(
-                parsed["turns"], tz, since, until, model_needle
-            )
-            if not filtered_turns:
-                skipped_empty += 1
-                continue
-
-            session = SessionInfo(
-                conversation_id=cid,
-                title=title,
-                workspace=workspace,
-                transcript_path=str(fpath),
-                source="codex",
-                is_subagent=is_sub,
-                parent_id=parsed.get("parent_id"),
-            )
-            for t in filtered_turns:
-                session.add_turn(t)
+            if retain_turns:
+                filtered_turns = self._filter_and_price_turns(
+                    parsed["turns"], tz, since, until, model_needle, mutate_in_place=mutate_turns
+                )
+                if not filtered_turns:
+                    skipped_empty += 1
+                    continue
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=title,
+                    workspace=workspace,
+                    transcript_path=str(fpath),
+                    source="codex",
+                    is_subagent=is_sub,
+                    parent_id=parsed.get("parent_id"),
+                )
+                for t in filtered_turns:
+                    session.add_turn(t)
+            else:
+                folded_tuple = self._filter_and_fold_turns(
+                    parsed["turns"], tz, since, until, model_needle
+                )
+                if folded_tuple is None:
+                    skipped_empty += 1
+                    continue
+                counts, models, first_time, last_time, digest = folded_tuple
+                session = SessionInfo(
+                    conversation_id=cid,
+                    title=title,
+                    workspace=workspace,
+                    transcript_path=str(fpath),
+                    source="codex",
+                    is_subagent=is_sub,
+                    parent_id=parsed.get("parent_id"),
+                    turns=[],
+                    counts=counts,
+                    models=models,
+                    first_time=first_time,
+                    last_time=last_time,
+                    _digest=digest,
+                )
 
             skey = ("codex", cid)
             prev = sessions_by_key.get(skey)
-            if prev is None or len(session.turns) > len(prev.turns):
+            if prev is None or session.counts.calls > prev.counts.calls:
                 sessions_by_key[skey] = session
 
         return True, skipped_empty, skipped_lines, files_cached, files_reparsed
@@ -2964,31 +4453,42 @@ class IncrementalScanner:
         tz: dt.tzinfo,
         since: dt.date | None,
         until: dt.date | None,
+        mtime_cutoff_ns: int | None,
         model_needle: str | None,
         session_needle: str | None,
         sessions_by_key: dict[tuple[str, str], SessionInfo],
+        discovered_live_keys: set[tuple[str, str]],
         seen_agent_keys: set[str],
         warnings: list[str],
+        *,
+        retain_turns: bool = True,
     ) -> tuple[bool, int, int, int, int]:
         root = spec.root
-        if root.is_symlink() or not root.is_dir():
+        if _lstat_dir(root) is None:
             return False, 0, 0, 0, 0
-        if (root / "tmp").is_dir() and not (root / "tmp").is_symlink():
-            tmp_dir = root / "tmp"
+        tmp_candidate = root / "tmp"
+        if _lstat_dir(tmp_candidate) is not None:
+            tmp_dir = tmp_candidate
             home_root = root
         else:
             tmp_dir = root
             home_root = root.parent
+        try:
+            resolved_tmp = tmp_dir.resolve(strict=True)
+            resolved_home = home_root.resolve(strict=True)
+        except OSError:
+            return False, 0, 0, 0, 0
 
         proj_json_path = home_root / "projects.json"
         projects_map: dict[str, str] = self._get_cached_aux(
             proj_json_path,
-            lambda hr=home_root: _load_gemini_projects_map(hr),
+            lambda hr=home_root, rh=resolved_home: _load_gemini_projects_map(hr, resolved_root=rh),
             {},
         )
 
         try:
-            proj_dirs = sorted(tmp_dir.iterdir(), key=lambda p: p.name)
+            with os.scandir(tmp_dir) as it:
+                proj_entries = sorted(it, key=lambda e: e.name)
         except OSError as exc:
             warnings.append(f"Failed to list {tmp_dir}: {exc}")
             return True, 0, 0, 0, 0
@@ -2997,51 +4497,67 @@ class IncrementalScanner:
         skipped_lines = 0
         files_cached = 0
         files_reparsed = 0
+        mutate_turns = not self.use_cache
 
-        for proj_dir in proj_dirs:
-            if proj_dir.is_symlink() or not proj_dir.is_dir():
+        for proj_ent in proj_entries:
+            try:
+                if proj_ent.is_symlink() or not proj_ent.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
                 continue
-            if not _is_within_dir(proj_dir, tmp_dir):
+            proj_dir = pathlib.Path(proj_ent.path)
+            if not _is_within_dir(proj_dir, tmp_dir, resolved_root=resolved_tmp):
                 continue
             chats_dir = proj_dir / "chats"
-            if chats_dir.is_symlink() or not chats_dir.is_dir():
+            if _lstat_dir(chats_dir) is None:
                 continue
 
             pr_path = proj_dir / ".project_root"
             proj_root_txt: str = self._get_cached_aux(
                 pr_path,
-                lambda p=pr_path, r=tmp_dir: (_safe_read_text(p, r) or "").strip(),
+                lambda p=pr_path, r=tmp_dir, rr=resolved_tmp: (
+                    _safe_read_text(p, r, resolved_root=rr) or ""
+                ).strip(),
                 "",
             )
-            workspace = proj_root_txt or projects_map.get(proj_dir.name, "") or "(unknown)"
+            workspace = proj_root_txt or projects_map.get(proj_ent.name, "") or "(unknown)"
 
             try:
-                chat_files = sorted(chats_dir.iterdir(), key=lambda p: p.name)
+                with os.scandir(chats_dir) as it:
+                    chat_entries = sorted(it, key=lambda e: e.name)
             except OSError as exc:
                 warnings.append(f"Failed to list {chats_dir}: {exc}")
                 continue
 
-            for fpath in chat_files:
-                if (
-                    fpath.is_symlink()
-                    or not fpath.is_file()
-                    or not fpath.name.startswith("session-")
-                    or fpath.suffix.lower() not in (".json", ".jsonl")
-                ):
+            for cf in chat_entries:
+                try:
+                    cf_name = cf.name
+                    low_name = cf_name.lower()
+                    if (
+                        cf.is_symlink()
+                        or not cf.is_file(follow_symlinks=False)
+                        or not cf_name.startswith("session-")
+                        or not (low_name.endswith(".json") or low_name.endswith(".jsonl"))
+                    ):
+                        continue
+                    st = cf.stat(follow_symlinks=False)
+                except OSError:
                     continue
-                if not _is_within_dir(fpath, tmp_dir):
-                    continue
-
+                fpath = pathlib.Path(cf.path)
                 cache_key = f"gemini:{fpath}"
                 seen_agent_keys.add(cache_key)
-                try:
-                    st = fpath.stat()
-                    mtime_ns, size = st.st_mtime_ns, st.st_size
-                except OSError as exc:
-                    warnings.append(f"Could not stat {fpath}: {exc}")
+                mtime_ns, size = st.st_mtime_ns, st.st_size
+
+                if mtime_cutoff_ns is not None and mtime_ns < mtime_cutoff_ns:
+                    if size > 0:
+                        discovered_live_keys.add(("gemini", fpath.stem))
+                    skipped_empty += 1
                     continue
 
-                cached = self._agent_file_cache.get(cache_key)
+                if not _is_within_dir(fpath, tmp_dir, resolved_root=resolved_tmp):
+                    continue
+
+                cached = self._agent_file_cache.get(cache_key) if self.use_cache else None
                 if cached is not None and cached[0] == mtime_ns and cached[1] == size:
                     parsed = cached[2]
                     files_cached += 1
@@ -3051,36 +4567,62 @@ class IncrementalScanner:
                     except OSError as exc:
                         warnings.append(f"Could not read {fpath}: {exc}")
                         continue
-                    self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
+                    if self.use_cache:
+                        self._agent_file_cache[cache_key] = (mtime_ns, size, parsed)
                     files_reparsed += 1
 
                 skipped_lines += int(parsed.get("skipped_lines", 0))
                 cid = str(parsed["cid"])
+                if parsed["turns"]:
+                    discovered_live_keys.add(("gemini", cid))
                 if session_needle and not cid.lower().startswith(session_needle):
                     continue
 
-                filtered_turns = self._filter_and_price_turns(
-                    parsed["turns"], tz, since, until, model_needle
-                )
-                if not filtered_turns:
-                    skipped_empty += 1
-                    continue
-
-                session = SessionInfo(
-                    conversation_id=cid,
-                    title=str(parsed.get("title_hint") or "") or "(untitled)",
-                    workspace=workspace,
-                    transcript_path=str(fpath),
-                    source="gemini",
-                    is_subagent=False,
-                    parent_id=None,
-                )
-                for t in filtered_turns:
-                    session.add_turn(t)
+                if retain_turns:
+                    filtered_turns = self._filter_and_price_turns(
+                        parsed["turns"], tz, since, until, model_needle, mutate_in_place=mutate_turns
+                    )
+                    if not filtered_turns:
+                        skipped_empty += 1
+                        continue
+                    session = SessionInfo(
+                        conversation_id=cid,
+                        title=str(parsed.get("title_hint") or "") or "(untitled)",
+                        workspace=workspace,
+                        transcript_path=str(fpath),
+                        source="gemini",
+                        is_subagent=False,
+                        parent_id=None,
+                    )
+                    for t in filtered_turns:
+                        session.add_turn(t)
+                else:
+                    folded_tuple = self._filter_and_fold_turns(
+                        parsed["turns"], tz, since, until, model_needle
+                    )
+                    if folded_tuple is None:
+                        skipped_empty += 1
+                        continue
+                    counts, models, first_time, last_time, digest = folded_tuple
+                    session = SessionInfo(
+                        conversation_id=cid,
+                        title=str(parsed.get("title_hint") or "") or "(untitled)",
+                        workspace=workspace,
+                        transcript_path=str(fpath),
+                        source="gemini",
+                        is_subagent=False,
+                        parent_id=None,
+                        turns=[],
+                        counts=counts,
+                        models=models,
+                        first_time=first_time,
+                        last_time=last_time,
+                        _digest=digest,
+                    )
 
                 skey = ("gemini", cid)
                 prev = sessions_by_key.get(skey)
-                if prev is None or len(session.turns) > len(prev.turns):
+                if prev is None or session.counts.calls > prev.counts.calls:
                     sessions_by_key[skey] = session
 
         return True, skipped_empty, skipped_lines, files_cached, files_reparsed
@@ -3093,11 +4635,16 @@ class IncrementalScanner:
         model_filter: str | None = None,
         session_filter: str | None = None,
         workspace_filter: str | None = None,
+        *,
+        retain_turns: bool = True,
+        scalar_only: bool = False,
+        skip_meta: bool = False,
     ) -> ScanReport:
         t0 = time.perf_counter()
         self.pricing.refresh()
         warnings: list[str] = []
         sessions_by_key: dict[tuple[str, str], SessionInfo] = {}
+        discovered_live_keys: set[tuple[str, str]] = set()
         skipped_empty = 0
         skipped_lines = 0
         files_cached = 0
@@ -3107,33 +4654,58 @@ class IncrementalScanner:
         model_needle = model_filter.lower().strip() if model_filter else None
         session_needle = session_filter.lower().strip() if session_filter else None
         workspace_needle = workspace_filter.lower().strip() if workspace_filter else None
+        mtime_cutoff_ns = _compute_mtime_cutoff_ns(since, tz)
         seen_agy_keys: set[str] = set()
         seen_agent_keys: set[str] = set()
         claude_parent_meta: dict[str, tuple[str, str]] = {}
         codex_parent_meta: dict[str, tuple[str, str]] = {}
+        pruned_claude_parents: dict[str, tuple[pathlib.Path, pathlib.Path, pathlib.Path]] = {}
+        pruned_codex_parents: dict[str, tuple[pathlib.Path, pathlib.Path, pathlib.Path]] = {}
+        ann_indices: dict[str, tuple[dict[str, os.DirEntry[str]], pathlib.Path]] = {}
+
+        # Never pollute reusable per-file cache with partial/date-bounded parses.
+        effective_scalar_only = scalar_only and (not self.use_cache)
+        effective_skip_meta = skip_meta and (not self.use_cache) and (workspace_needle is None)
+        effective_retain_thinking_len = retain_turns or self.use_cache
+        utc_date_bounds: tuple[str | None, str | None] | None = None
+        if not self.use_cache and (since is not None or until is not None):
+            utc_date_bounds = (
+                (since - dt.timedelta(days=1)).isoformat() if since is not None else None,
+                (until + dt.timedelta(days=1)).isoformat() if until is not None else None,
+            )
 
         for spec in self.sources:
             if self.agent_filter is not None and spec.kind not in self.agent_filter:
                 continue
             if spec.kind == "antigravity":
                 found, se, sl, fc, fr = self._scan_antigravity_source(
-                    spec, tz, since, until, model_needle, session_needle,
-                    sessions_by_key, seen_agy_keys, warnings,
+                    spec, tz, since, until, mtime_cutoff_ns, model_needle, session_needle,
+                    sessions_by_key, discovered_live_keys, seen_agy_keys, ann_indices, warnings,
+                    retain_turns=retain_turns,
+                    scalar_only=effective_scalar_only,
+                    skip_meta=effective_skip_meta,
+                    retain_thinking_len=effective_retain_thinking_len,
+                    utc_date_bounds=utc_date_bounds,
                 )
             elif spec.kind == "claude":
                 found, se, sl, fc, fr = self._scan_claude_source(
-                    spec, tz, since, until, model_needle, session_needle,
-                    sessions_by_key, seen_agent_keys, claude_parent_meta, warnings,
+                    spec, tz, since, until, mtime_cutoff_ns, model_needle, session_needle,
+                    sessions_by_key, discovered_live_keys, seen_agent_keys,
+                    claude_parent_meta, pruned_claude_parents, warnings,
+                    retain_turns=retain_turns,
                 )
             elif spec.kind == "codex":
                 found, se, sl, fc, fr = self._scan_codex_source(
-                    spec, tz, since, until, model_needle, session_needle,
-                    sessions_by_key, seen_agent_keys, codex_parent_meta, warnings,
+                    spec, tz, since, until, mtime_cutoff_ns, model_needle, session_needle,
+                    sessions_by_key, discovered_live_keys, seen_agent_keys,
+                    codex_parent_meta, pruned_codex_parents, warnings,
+                    retain_turns=retain_turns,
                 )
             elif spec.kind == "gemini":
                 found, se, sl, fc, fr = self._scan_gemini_source(
-                    spec, tz, since, until, model_needle, session_needle,
-                    sessions_by_key, seen_agent_keys, warnings,
+                    spec, tz, since, until, mtime_cutoff_ns, model_needle, session_needle,
+                    sessions_by_key, discovered_live_keys, seen_agent_keys, warnings,
+                    retain_turns=retain_turns,
                 )
             else:
                 continue
@@ -3146,46 +4718,88 @@ class IncrementalScanner:
         sessions = list(sessions_by_key.values())
 
         # Link subagent sessions to their parent within the same agent family.
-        parent_lookup: dict[tuple[str, str], tuple[str, str]] = {
-            (s.agent_family, s.conversation_id): (s.title, s.workspace) for s in sessions
-        }
-        agy_roots = [s.root for s in self.sources if s.kind == "antigravity"]
-        for s in sessions:
-            if not s.is_subagent or not s.parent_id:
-                continue
-            fam = s.agent_family
-            pid = s.parent_id
-            resolved = parent_lookup.get((fam, pid))
-            if resolved is None:
-                if fam == "antigravity":
-                    for root_dir in agy_roots:
-                        p_ann = self._get_annotation_title(root_dir, pid)
-                        p_meta = self._meta_caches.get(str(root_dir), {}).get(pid, {})
-                        ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
-                        pws = str(p_meta.get("workspace") or "")
-                        if ptitle or pws:
-                            resolved = (ptitle, pws)
-                            break
-                elif fam == "claude":
-                    resolved = claude_parent_meta.get(pid)
-                elif fam == "codex":
-                    resolved = codex_parent_meta.get(pid)
-            if resolved is not None:
-                ptitle, pws = resolved
-                if ptitle:
-                    s.parent_title = ptitle
-                if (not s.workspace or s.workspace == "(unknown)") and pws and pws != "(unknown)":
-                    s.workspace = pws
-                if s.title in ("(subagent)", "(untitled)") and ptitle:
-                    s.title = f"subtask · {ptitle}"
+        if not effective_skip_meta:
+            parent_lookup: dict[tuple[str, str], tuple[str, str]] = {
+                (s.agent_family, s.conversation_id): (s.title, s.workspace) for s in sessions
+            }
+            agy_roots = [s.root for s in self.sources if s.kind == "antigravity"]
+            for s in sessions:
+                if not s.is_subagent or not s.parent_id:
+                    continue
+                fam = s.agent_family
+                pid = s.parent_id
+                resolved = parent_lookup.get((fam, pid))
+                if resolved is None:
+                    if fam == "antigravity":
+                        for root_dir in agy_roots:
+                            rk = str(root_dir)
+                            ann_pair = ann_indices.get(rk)
+                            if ann_pair is not None:
+                                p_ann = self._get_annotation_title(
+                                    root_dir, pid, resolved_root=ann_pair[1], ann_entries=ann_pair[0]
+                                )
+                            else:
+                                p_ann = self._get_annotation_title(root_dir, pid)
+                            p_meta = self._meta_caches.get(rk, {}).get(pid, {})
+                            ptitle = p_ann or str(p_meta.get("title") or "") or str(p_meta.get("preview") or "")
+                            pws = str(p_meta.get("workspace") or "")
+                            if ptitle or pws:
+                                resolved = (ptitle, pws)
+                                break
+                    elif fam == "claude":
+                        resolved = claude_parent_meta.get(pid)
+                        if resolved is None and pid in pruned_claude_parents:
+                            pfpath, proot, pres_root = pruned_claude_parents[pid]
+                            if _is_within_dir(pfpath, proot, resolved_root=pres_root):
+                                try:
+                                    p_parsed = _parse_claude_jsonl(
+                                        pfpath, fallback_cid=pfpath.stem, is_subagent=False
+                                    )
+                                    resolved = (
+                                        str(p_parsed.get("title_hint") or ""),
+                                        str(p_parsed.get("cwd") or ""),
+                                    )
+                                    claude_parent_meta[pid] = resolved
+                                except OSError:
+                                    pass
+                    elif fam == "codex":
+                        resolved = codex_parent_meta.get(pid)
+                        if resolved is None and pid in pruned_codex_parents:
+                            pfpath, proot, pres_root = pruned_codex_parents[pid]
+                            if _is_within_dir(pfpath, proot, resolved_root=pres_root):
+                                try:
+                                    p_parsed = _parse_codex_jsonl(pfpath)
+                                    resolved = (
+                                        str(p_parsed.get("title_hint") or ""),
+                                        str(p_parsed.get("cwd") or ""),
+                                    )
+                                    codex_parent_meta[pid] = resolved
+                                except OSError:
+                                    pass
+                if resolved is not None:
+                    ptitle, pws = resolved
+                    if ptitle:
+                        s.parent_title = ptitle
+                    if (not s.workspace or s.workspace == "(unknown)") and pws and pws != "(unknown)":
+                        s.workspace = pws
+                    if s.title in ("(subagent)", "(untitled)") and ptitle:
+                        s.title = f"subtask · {ptitle}"
 
+        if not self.use_cache:
+            self._meta_caches.clear()
+            self._meta_sigs.clear()
+            ann_indices.clear()
+
+        live_keys = discovered_live_keys | set(sessions_by_key.keys())
         archived_backfill = self._load_archived_backfill(
-            set(sessions_by_key.keys()),
+            live_keys,
             tz,
             since,
             until,
             model_needle,
             session_needle,
+            retain_turns=retain_turns,
+            scalar_only=effective_scalar_only,
         )
         sessions.extend(archived_backfill)
 
@@ -3195,7 +4809,7 @@ class IncrementalScanner:
         if not found_any_source and not archived_backfill:
             warnings.append(f"Data directory not found: {self.data_dir}")
 
-        if not session_needle:
+        if self.use_cache and not session_needle:
             for stale_key in list(self._transcript_cache.keys()):
                 if stale_key not in seen_agy_keys:
                     self._transcript_cache.pop(stale_key, None)
@@ -3237,6 +4851,8 @@ def scan_usage(
     archive_path: pathlib.Path | None = None,
     sources: Sequence[SourceSpec] | None = None,
     agent_filter: set[str] | None = None,
+    *,
+    retain_turns: bool = True,
 ) -> ScanReport:
     return IncrementalScanner(
         data_dir,
@@ -3245,6 +4861,7 @@ def scan_usage(
         archive_path=archive_path,
         sources=sources,
         agent_filter=agent_filter,
+        use_cache=False,
     ).scan(
         tz=tz,
         since=since,
@@ -3252,6 +4869,7 @@ def scan_usage(
         model_filter=model_filter,
         session_filter=session_filter,
         workspace_filter=workspace_filter,
+        retain_turns=retain_turns,
     )
 
 
@@ -3259,6 +4877,10 @@ def scan_usage(
 
 
 def _display_width(text: str) -> int:
+    if text.isascii():
+        return len(text)
+    import unicodedata
+
     width = 0
     for ch in text:
         if unicodedata.combining(ch):
@@ -3271,10 +4893,18 @@ def _display_width(text: str) -> int:
 def _truncate_display(text: str, max_width: int) -> str:
     if max_width <= 0:
         return ""
+    if text.isascii():
+        if len(text) <= max_width:
+            return text
+        if max_width == 1:
+            return "…"
+        return text[: max_width - 1] + "…"
     if _display_width(text) <= max_width:
         return text
     if max_width == 1:
         return "…"
+    import unicodedata
+
     out: list[str] = []
     cur = 0
     limit = max_width - 1
@@ -3288,6 +4918,17 @@ def _truncate_display(text: str, max_width: int) -> str:
 
 
 def _pad_display(text: str, width: int, align: str = "left") -> str:
+    if text.isascii():
+        n = len(text)
+        if n > width:
+            if width <= 0:
+                return ""
+            text = "…" if width == 1 else text[: width - 1] + "…"
+            n = width
+        pad = width - n
+        if align == "right":
+            return (" " * pad) + text
+        return text + (" " * pad)
     text = _truncate_display(text, width)
     pad = max(0, width - _display_width(text))
     if align == "right":
@@ -3420,45 +5061,77 @@ def aggregate_sessions(sessions: Sequence[SessionInfo]) -> dict[str, Any]:
     total_thinking_turns = 0
     total_active_secs = 0
 
+    date_cache: dict[tuple[int, int, int], tuple[str, str, str]] = {}
+    day_to_wm: dict[str, tuple[str, str]] = {}
+
     for s in sessions:
-        total.merge(s.counts)
+        sc = s.counts
+        total.merge(sc)
         total_active_secs += s.active_duration_secs
-        by_workspace[s.workspace].merge(s.counts)
-        workspace_sessions[s.workspace] += 1
-        by_source[s.source].merge(s.counts)
-        source_sessions[s.source] += 1
+        ws = s.workspace
+        by_workspace[ws].merge(sc)
+        workspace_sessions[ws] += 1
+        src = s.source
+        by_source[src].merge(sc)
+        source_sessions[src] += 1
         fam = s.agent_family
-        by_agent[fam].merge(s.counts)
+        by_agent[fam].merge(sc)
         agent_sessions[fam] += 1
+        digest = s._digest
+        if digest is not None and not s.turns:
+            total_thinking_turns += digest.thinking_turns
+            for tool_name, cnt in digest.tool_counts.items():
+                by_tool[tool_name] += cnt
+            for m_key, m_cnt in digest.by_model.items():
+                by_model[m_key].merge(m_cnt)
+            for h_key, h_cnt in digest.by_hour.items():
+                by_hour[h_key].merge(h_cnt)
+            for d_key, d_cnt in digest.by_day.items():
+                by_day[d_key].merge(d_cnt)
+            if digest.day_to_wm:
+                day_to_wm.update(digest.day_to_wm)
+            continue
         for t in s.turns:
-            if t.has_thinking:
+            if t.thinking_chars > 0 or t.reasoning_tokens > 0:
                 total_thinking_turns += 1
-            for tool_name in t.tool_names:
-                by_tool[tool_name] += 1
-            by_model[t.model].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
-            )
-            if t.timestamp is not None:
-                day_key = t.timestamp.strftime("%Y-%m-%d")
-                week_key = iso_week_key(t.timestamp.date())
-                month_key = t.timestamp.strftime("%Y-%m")
-                by_hour[t.timestamp.hour].add_call(
-                    t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
-                )
-                week_days[week_key].add(day_key)
+            if t.tool_names:
+                for tool_name in t.tool_names:
+                    by_tool[tool_name] += 1
+            in_t = t.input_tokens
+            cr_t = t.cache_read_tokens
+            cw_t = t.cache_write_tokens
+            out_t = t.output_tokens
+            cost_t = t.cost
+            by_model[t.model].add_call(in_t, cr_t, cw_t, out_t, cost_t)
+            ts = t.timestamp
+            if ts is not None:
+                ymd = (ts.year, ts.month, ts.day)
+                dk_entry = date_cache.get(ymd)
+                if dk_entry is None:
+                    day_key = f"{ts.year:04d}-{ts.month:02d}-{ts.day:02d}"
+                    iso = ts.isocalendar()
+                    week_key = f"{iso.year}-W{iso.week:02d}"
+                    month_key = day_key[:7]
+                    dk_entry = (day_key, week_key, month_key)
+                    date_cache[ymd] = dk_entry
+                    day_to_wm[day_key] = (week_key, month_key)
+                else:
+                    day_key = dk_entry[0]
+                by_hour[ts.hour].add_call(in_t, cr_t, cw_t, out_t, cost_t)
             else:
                 day_key = "unknown"
-                week_key = "unknown"
-                month_key = "unknown"
-            by_day[day_key].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
-            )
-            by_week[week_key].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
-            )
-            by_month[month_key].add_call(
-                t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost
-            )
+            by_day[day_key].add_call(in_t, cr_t, cw_t, out_t, cost_t)
+
+    # Roll up by_day into by_week and by_month (every calendar day maps to exactly one week & month).
+    for day_key, day_counts in by_day.items():
+        if day_key == "unknown":
+            by_week["unknown"].merge(day_counts)
+            by_month["unknown"].merge(day_counts)
+        else:
+            wk, mk = day_to_wm[day_key]
+            week_days[wk].add(day_key)
+            by_week[wk].merge(day_counts)
+            by_month[mk].merge(day_counts)
 
     return {
         "total": total,
@@ -3508,11 +5181,15 @@ def _sort_sessions(sessions: Sequence[SessionInfo], sort_by: str) -> list[Sessio
 
 
 def _primary_model(s: SessionInfo) -> str:
-    by_m: dict[str, tuple[bool, int]] = {}
-    for t in s.turns:
-        is_cp = t.step_type == "CHECKPOINT"
-        prev_cp, prev_tok = by_m.get(t.model, (is_cp, 0))
-        by_m[t.model] = (prev_cp and is_cp, prev_tok + t.total_tokens)
+    digest = s._digest
+    if digest is not None and not s.turns:
+        by_m = digest.model_tokens
+    else:
+        by_m = {}
+        for t in s.turns:
+            is_cp = t.step_type == "CHECKPOINT"
+            prev_cp, prev_tok = by_m.get(t.model, (is_cp, 0))
+            by_m[t.model] = (prev_cp and is_cp, prev_tok + t.total_tokens)
     if not by_m:
         return "-"
     return max(by_m.items(), key=lambda kv: (not kv[1][0], kv[1][1]))[0]
@@ -3750,10 +5427,19 @@ def _group_sessions_for_display(
         # Compute primary model across root + grouped children
         by_m: dict[str, tuple[bool, int]] = {}
         for src in (s, *kids):
-            for t in src.turns:
-                is_cp = t.step_type == "CHECKPOINT"
-                prev_cp, prev_tok = by_m.get(t.model, (is_cp, 0))
-                by_m[t.model] = (prev_cp and is_cp, prev_tok + t.total_tokens)
+            src_digest = src._digest
+            if src_digest is not None and not src.turns:
+                for m_name, (m_cp, m_tok) in src_digest.model_tokens.items():
+                    prev_mt = by_m.get(m_name)
+                    if prev_mt is None:
+                        by_m[m_name] = (m_cp, m_tok)
+                    else:
+                        by_m[m_name] = (prev_mt[0] and m_cp, prev_mt[1] + m_tok)
+            else:
+                for t in src.turns:
+                    is_cp = t.step_type == "CHECKPOINT"
+                    prev_cp, prev_tok = by_m.get(t.model, (is_cp, 0))
+                    by_m[t.model] = (prev_cp and is_cp, prev_tok + t.total_tokens)
         primary = max(by_m.items(), key=lambda kv: (not kv[1][0], kv[1][1]))[0] if by_m else "-"
         rows.append((s, counts, last_time, models, primary, len(kids)))
     return rows
@@ -4334,6 +6020,8 @@ def render_csv(
     sort_by: str,
     redact: bool = False,
 ) -> str:
+    import csv
+
     redactor = Redactor(report.sessions, agg) if redact else None
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
@@ -4401,6 +6089,8 @@ def _parse_date_arg(value: str) -> dt.date:
     try:
         return dt.date.fromisoformat(value.strip())
     except ValueError as exc:
+        import argparse
+
         raise argparse.ArgumentTypeError(f"Invalid date '{value}', expected YYYY-MM-DD.") from exc
 
 
@@ -4448,6 +6138,8 @@ def render_pricing_table(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="gauge_stats.py",
         description="Gauge — strictly read-only multi-agent token usage analyzer (Antigravity, Claude Code, Codex CLI, Gemini CLI).",
@@ -4651,6 +6343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     today = dt.datetime.now(tz).date()
     since = args.since
     until = args.until
+    loaded_bcfg: dict[str, float] | None = None
     if args.today:
         since = today
         until = today
@@ -4658,6 +6351,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         since = today - dt.timedelta(days=args.days - 1)
         if until is None:
             until = today
+    elif args.compact and since is None and until is None:
+        need_weekly_budget = args.budget_weekly is not None
+        if not need_weekly_budget and args.check_budget:
+            loaded_bcfg = load_budget_config(DEFAULT_BUDGET_PATH)
+            need_weekly_budget = loaded_bcfg["weekly_usd"] > 0.0
+        if need_weekly_budget:
+            iso = today.isocalendar()
+            since = dt.date.fromisocalendar(iso.year, iso.week, 1)
+        else:
+            since = today
+        until = today
 
     if since and until and since > until:
         parser.error(f"--since ({since}) cannot be after --until ({until}).")
@@ -4685,19 +6389,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         primary_dir = sources[0].root if sources else DEFAULT_DATA_DIR
 
     archive_path = None if (args.no_archive or args.data_dir is not None) else DEFAULT_ARCHIVE_PATH
-    report = scan_usage(
+    scanner = IncrementalScanner(
         data_dir=primary_dir,
+        pricing_path=pricing_path,
+        extra_dirs=extra_dirs,
+        archive_path=archive_path,
+        sources=sources,
+        agent_filter=agent_filter,
+        use_cache=False,
+    )
+    retain_turns = bool(args.session)
+    is_compact_fast = bool(args.compact and not args.session and not args.workspace)
+    is_pricing_fast = bool(
+        args.view == "pricing"
+        and args.format == "table"
+        and not args.compact
+        and not args.workspace
+        and not args.session
+    )
+    scalar_only = bool(is_compact_fast or is_pricing_fast or args.format == "csv")
+    skip_meta = bool(is_compact_fast or is_pricing_fast)
+
+    report = scanner.scan(
         tz=tz,
         since=since,
         until=until,
         model_filter=args.model,
         session_filter=args.session,
         workspace_filter=args.workspace,
-        pricing_path=pricing_path,
-        extra_dirs=extra_dirs,
-        archive_path=archive_path,
-        sources=sources,
-        agent_filter=agent_filter,
+        retain_turns=retain_turns,
+        scalar_only=scalar_only,
+        skip_meta=skip_meta,
     )
     agg = _aggregate(report.sessions)
     sl_path = args.statusline_state.expanduser() if args.statusline_state else None
@@ -4714,7 +6436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         print(
             render_pricing_table(
-                PricingCatalog(pricing_path),
+                scanner.pricing,
                 observed,
                 today,
                 _use_color(args.no_color),
@@ -4767,7 +6489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Note: {w_out}", file=sys.stderr)
 
     if args.check_budget or args.budget_daily is not None or args.budget_weekly is not None:
-        bcfg = load_budget_config(DEFAULT_BUDGET_PATH)
+        bcfg = loaded_bcfg if loaded_bcfg is not None else load_budget_config(DEFAULT_BUDGET_PATH)
         daily_lim = args.budget_daily if args.budget_daily is not None else bcfg["daily_usd"]
         weekly_lim = args.budget_weekly if args.budget_weekly is not None else bcfg["weekly_usd"]
         warn_p = args.warn_pct if args.warn_pct is not None else bcfg["warn_pct"]

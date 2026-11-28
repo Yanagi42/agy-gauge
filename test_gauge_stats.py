@@ -2056,6 +2056,777 @@ class GaugeStatsTests(unittest.TestCase):
             self.assertEqual(len(rep_cl_only.sessions), 2)
             self.assertTrue(all(s.source == "claude" for s in rep_cl_only.sessions))
 
+    def test_mtime_pruning_future_guard_subagent_parent_and_codex_dir_prune(self) -> None:
+        tz_utc = dt.timezone.utc
+        now = dt.datetime.now(tz_utc).replace(microsecond=0)
+        today = now.date()
+        old_dt = now - dt.timedelta(days=5)
+        old_ts = old_dt.timestamp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            # 1. Antigravity: 1 old file (mtime 5 days ago) + 1 today file
+            agy_root = root / "antigravity-cli"
+            old_cid = "aaaa0001-0000-0000-0000-000000000001"
+            new_cid = "aaaa0002-0000-0000-0000-000000000002"
+            old_log = agy_root / "brain" / old_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            new_log = agy_root / "brain" / new_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            old_log.parent.mkdir(parents=True)
+            new_log.parent.mkdir(parents=True)
+            old_log.write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": old_dt.isoformat(),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 900,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(old_log, (old_ts, old_ts))
+            new_log.write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": now.isoformat(),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 500,
+                    "cache_read_tokens": 1000,
+                    "output_tokens": 200,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # Narrow scan (--today) prunes old_log without parsing it
+            scanner = mod.IncrementalScanner(agy_root, pricing_path=None)
+            rep_today = scanner.scan(tz=tz_utc, since=today, until=today)
+            self.assertEqual(len(rep_today.sessions), 1)
+            self.assertEqual(rep_today.sessions[0].conversation_id, new_cid)
+            self.assertEqual(rep_today.files_reparsed, 1)
+            self.assertEqual(rep_today.skipped_empty_sessions, 1)
+
+            # Subsequent wide scan on same IncrementalScanner still reads old_log (and caches new_log)
+            rep_all = scanner.scan(tz=tz_utc)
+            self.assertEqual(len(rep_all.sessions), 2)
+            self.assertEqual(rep_all.files_cached, 1)
+            self.assertEqual(rep_all.files_reparsed, 1)
+
+            # Wide-then-narrow must NOT evict old_log from cache!
+            rep_today2 = scanner.scan(tz=tz_utc, since=today, until=today)
+            self.assertEqual(len(rep_today2.sessions), 1)
+            rep_all2 = scanner.scan(tz=tz_utc)
+            self.assertEqual(len(rep_all2.sessions), 2)
+            self.assertEqual(rep_all2.files_cached, 2)
+            self.assertEqual(rep_all2.files_reparsed, 0)
+
+            # Future-dated fixture guard: when `since` is in the future relative to host clock, mtime pruning disables
+            future_date = today + dt.timedelta(days=30)
+            fut_cid = "aaaa0003-0000-0000-0000-000000000003"
+            fut_log = agy_root / "brain" / fut_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            fut_log.parent.mkdir(parents=True)
+            fut_log.write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": f"{future_date.isoformat()}T12:00:00Z",
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 300,
+                    "output_tokens": 50,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            rep_fut = mod.scan_usage(agy_root, tz=tz_utc, since=future_date, until=future_date, pricing_path=None)
+            self.assertEqual(len(rep_fut.sessions), 1)
+            self.assertEqual(rep_fut.sessions[0].conversation_id, fut_cid)
+
+            # 2. Claude subagent active today whose parent was mtime-pruned (and no sessions-index.json)
+            claude_root = root / ".claude"
+            proj_dir = claude_root / "projects" / "proj-x"
+            parent_uuid = "bbbb0001-0000-4000-8000-000000000001"
+            sub_dir = proj_dir / parent_uuid / "subagents"
+            sub_dir.mkdir(parents=True)
+            parent_file = proj_dir / f"{parent_uuid}.jsonl"
+            parent_file.write_text(
+                json.dumps({
+                    "type": "user",
+                    "uuid": "u0",
+                    "sessionId": parent_uuid,
+                    "cwd": "C:/Users/alice/lazy-parent",
+                    "timestamp": old_dt.isoformat(),
+                    "message": {"role": "user", "content": "Old Parent Task"},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(parent_file, (old_ts, old_ts))
+            (sub_dir / "agent-sub1.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "uuid": "a1",
+                    "sessionId": parent_uuid,
+                    "agentId": "sub1",
+                    "requestId": "r1",
+                    "timestamp": now.isoformat(),
+                    "message": {
+                        "id": "m1",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "usage": {"input_tokens": 100, "output_tokens": 50},
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            rep_cl = mod.scan_usage(
+                claude_root,
+                tz=tz_utc,
+                since=today,
+                until=today,
+                pricing_path=None,
+                sources=[mod.SourceSpec("claude", claude_root, "claude")],
+            )
+            self.assertEqual(len(rep_cl.sessions), 1)
+            self.assertEqual(rep_cl.sessions[0].parent_title, "Old Parent Task")
+            self.assertEqual(rep_cl.sessions[0].workspace, "C:/Users/alice/lazy-parent")
+
+            # 3. Codex directory pruning skips YYYY/MM/DD dirs strictly after until + 1 day
+            codex_root = root / ".codex"
+            day_ok = codex_root / "sessions" / f"{old_dt.year:04d}" / f"{old_dt.month:02d}" / f"{old_dt.day:02d}"
+            day_skip_dt = old_dt + dt.timedelta(days=3)
+            day_skip = codex_root / "sessions" / f"{day_skip_dt.year:04d}" / f"{day_skip_dt.month:02d}" / f"{day_skip_dt.day:02d}"
+            day_ok.mkdir(parents=True)
+            day_skip.mkdir(parents=True)
+            (day_ok / "rollout-2026-ok.jsonl").write_text(
+                json.dumps({
+                    "timestamp": old_dt.isoformat(),
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 100, "output_tokens": 20}}},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (day_skip / "rollout-2026-skip.jsonl").write_text(
+                json.dumps({
+                    "timestamp": day_skip_dt.isoformat(),
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 999, "output_tokens": 99}}},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            rep_cx = mod.scan_usage(
+                codex_root,
+                tz=tz_utc,
+                until=old_dt.date(),
+                pricing_path=None,
+                sources=[mod.SourceSpec("codex", codex_root, "codex")],
+            )
+            self.assertEqual(len(rep_cx.sessions), 1)
+            self.assertEqual(rep_cx.files_reparsed, 1)
+
+    def test_archive_discovered_live_keys_dedup_under_today_and_streaming_parity(self) -> None:
+        tz_utc = dt.timezone.utc
+        now = dt.datetime.now(tz_utc).replace(microsecond=0)
+        today = now.date()
+        old_dt = now - dt.timedelta(days=4)
+        old_ts = old_dt.timestamp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            agy_root = root / "antigravity-cli"
+            live_old_cid = "cccc0001-0000-0000-0000-000000000001"
+            deleted_today_cid = "cccc0002-0000-0000-0000-000000000002"
+            deleted_old_cid = "cccc0003-0000-0000-0000-000000000003"
+
+            live_log = agy_root / "brain" / live_old_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            live_log.parent.mkdir(parents=True)
+            live_log.write_text(
+                json.dumps({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": old_dt.isoformat(),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 1000,
+                    "output_tokens": 100,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(live_log, (old_ts, old_ts))
+
+            # Archive contains:
+            # 1) live_old_cid (shadowed by live file on disk -> MUST be deduped even under --today!)
+            # 2) deleted_today_cid (deleted from disk, has today turn + CJK/emoji title -> MUST backfill!)
+            # 3) deleted_old_cid (deleted from disk, only old turn -> skipped by date pre-check under --today)
+            arch_payload = {
+                "schema_version": 12345,
+                "extra_meta": {"note": "before sessions"},
+                "sessions": {
+                    live_old_cid: {
+                        "source": "cli",
+                        "title": "Live Old Shadowed",
+                        "workspace": "C:/w",
+                        "turns": [{"step": 1, "ts": now.isoformat(), "m": "gemini-4-neon-xhigh", "in": 77777, "out": 77}],
+                    },
+                    deleted_today_cid: {
+                        "source": "cli",
+                        "title": "已归档会话 🚀 " + ("x" * 200),
+                        "workspace": "C:/archived",
+                        "turns": [{"step": 1, "ts": now.isoformat(), "m": "gemini-4-neon-xhigh", "in": 2000, "cr": 4000, "out": 300, "tools": ["read_file"]}],
+                    },
+                    deleted_old_cid: {
+                        "source": "cli",
+                        "title": "Old Pruned",
+                        "workspace": "C:/old",
+                        "turns": [{"step": 1, "ts": old_dt.isoformat(), "m": "gemini-4-neon-xhigh", "in": 500, "out": 50}],
+                    },
+                },
+                "trailing_field": 99,
+            }
+            arch_path = root / "archive.json"
+            # Test both compact and pretty-printed streaming with tiny chunk_size=19 to stress chunk boundaries
+            for indent in (None, 2):
+                arch_path.write_text(json.dumps(arch_payload, ensure_ascii=False, indent=indent), encoding="utf-8")
+                streamed = dict(mod._iter_archive_sessions(arch_path, chunk_size=19))
+                self.assertEqual(set(streamed.keys()), set(arch_payload["sessions"].keys()))
+                self.assertEqual(streamed[deleted_today_cid]["title"], arch_payload["sessions"][deleted_today_cid]["title"])
+
+            rep_today = mod.scan_usage(
+                agy_root, tz=tz_utc, since=today, until=today, pricing_path=None, archive_path=arch_path
+            )
+            self.assertEqual(len(rep_today.sessions), 1)
+            self.assertEqual(rep_today.archived_sessions_count, 1)
+            self.assertEqual(rep_today.sessions[0].conversation_id, deleted_today_cid)
+            self.assertEqual(rep_today.sessions[0].counts.total_tokens, 6300)
+
+    def test_compact_scoping_with_and_without_weekly_budget(self) -> None:
+        tz_utc = dt.timezone.utc
+        now = dt.datetime.now(tz_utc).replace(microsecond=0)
+        today = now.date()
+        iso = today.isocalendar()
+        week_monday = dt.date.fromisocalendar(iso.year, iso.week, 1)
+        prev_week_day = week_monday - dt.timedelta(days=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agy_root = pathlib.Path(tmp) / "antigravity-cli"
+            c_today = "dddd0001-0000-0000-0000-000000000001"
+            c_prev_wk = "dddd0002-0000-0000-0000-000000000002"
+            p_today = agy_root / "brain" / c_today / ".system_generated" / "logs" / "transcript.jsonl"
+            p_prev_wk = agy_root / "brain" / c_prev_wk / ".system_generated" / "logs" / "transcript.jsonl"
+            p_today.parent.mkdir(parents=True)
+            p_prev_wk.parent.mkdir(parents=True)
+
+            # Today: 100k input of gemini-4-neon ($3/M = $0.30)
+            p_today.write_text(
+                json.dumps({
+                    "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": now.isoformat(), "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 100_000, "output_tokens": 0,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            # Previous ISO week: 2M input ($6.00) with old mtime
+            p_prev_wk.write_text(
+                json.dumps({
+                    "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": f"{prev_week_day.isoformat()}T12:00:00Z", "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2_000_000, "output_tokens": 0,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            old_ts = dt.datetime.combine(prev_week_day, dt.time(12, 0), tzinfo=tz_utc).timestamp()
+            os.utime(p_prev_wk, (old_ts, old_ts))
+
+            # Optional earlier day in SAME ISO week (if today is not Monday): 1M input ($3.00)
+            has_earlier_in_week = today > week_monday
+            if has_earlier_in_week:
+                c_wk = "dddd0003-0000-0000-0000-000000000003"
+                p_wk = agy_root / "brain" / c_wk / ".system_generated" / "logs" / "transcript.jsonl"
+                p_wk.parent.mkdir(parents=True)
+                p_wk.write_text(
+                    json.dumps({
+                        "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                        "created_at": f"{week_monday.isoformat()}T12:00:00Z", "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 1_000_000, "output_tokens": 0,
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+                wk_ts = dt.datetime.combine(week_monday, dt.time(12, 0), tzinfo=tz_utc).timestamp()
+                os.utime(p_wk, (wk_ts, wk_ts))
+
+            # 1. --compact alone prints today's $0.30 and returns 0
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = mod.main(["--data-dir", str(agy_root), "--compact", "--no-archive", "--utc", "--pricing", ""])
+            self.assertEqual(rc, 0)
+            self.assertIn("AGY today=100.0K ($0.30)", buf.getvalue())
+
+            # 2. --compact --check-budget --budget-weekly 1.0 triggers CRITICAL (20) when earlier day in week exists
+            buf2, err2 = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", buf2), mock.patch("sys.stderr", err2):
+                rc2 = mod.main([
+                    "--data-dir", str(agy_root), "--compact", "--no-archive", "--utc",
+                    "--check-budget", "--budget-weekly", "1.0",
+                ])
+            if has_earlier_in_week:
+                self.assertEqual(rc2, 20)
+                self.assertIn("CRITICAL: weekly", err2.getvalue())
+            else:
+                self.assertEqual(rc2, 0)
+
+    def test_prefilter_edge_cases_claude_codex_gemini_and_pricing_cache_invalidation(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            # 1. Claude prefilter: isMeta user, huge progress/file-history lines, malformed trailing line, late custom-title
+            cl_file = root / "claude-edge.jsonl"
+            cl_lines = [
+                json.dumps({"type": "progress", "cwd": "C:/cl-proj", "sessionId": "cl-edge-1", "blob": "x" * 4096}),
+                json.dumps({"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta noise"}}),
+                json.dumps({"type": "user", "isMeta": False, "message": {"role": "user", "content": "Real prompt"}}),
+                json.dumps({"type": "file-history-snapshot", "files": ["a" * 2048]}),
+                json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "y" * 4096}]}}),
+                json.dumps({
+                    "type": "assistant", "uuid": "a1", "requestId": "r1", "timestamp": "2026-11-24T10:00:00Z",
+                    "message": {"id": "m1", "model": "claude-sonnet-4-5-20250929", "usage": {"input_tokens": 100, "output_tokens": 20}},
+                }),
+                json.dumps({"type": "custom-title", "customTitle": "Late Custom Title"}),
+                '{"type": "progress", "truncated": ',  # malformed line MUST still count in skipped_lines
+            ]
+            cl_file.write_text("\n".join(cl_lines) + "\n", encoding="utf-8")
+            cl_res = mod._parse_claude_jsonl(cl_file, fallback_cid="fb", is_subagent=False)
+            self.assertEqual(cl_res["cid"], "cl-edge-1")
+            self.assertEqual(cl_res["cwd"], "C:/cl-proj")
+            self.assertEqual(cl_res["title_hint"], "Late Custom Title")
+            self.assertEqual(len(cl_res["turns"]), 1)
+            self.assertEqual(cl_res["skipped_lines"], 1)
+
+            # 2. Codex prefilter: huge function_call_output/custom_tool_call_output skipped, real calls + truncated line kept
+            cx_file = root / "rollout-2026-11-24-cx1.jsonl"
+            cx_lines = [
+                json.dumps({"timestamp": "2026-11-24T10:00:00Z", "type": "session_meta", "payload": {"id": "cx-edge-1", "cwd": "C:/cx"}}),
+                json.dumps({"timestamp": "2026-11-24T10:00:01Z", "type": "turn_context", "payload": {"model": "gpt-5.4"}}),
+                json.dumps({"timestamp": "2026-11-24T10:00:02Z", "type": "response_item", "payload": {"type": "function_call", "name": "shell"}}),
+                json.dumps({"timestamp": "2026-11-24T10:00:03Z", "type": "response_item", "payload": {"type": "function_call_output", "output": "z" * 8192}}),
+                json.dumps({"timestamp": "2026-11-24T10:00:03Z", "type": "response_item", "payload": {"type": "custom_tool_call_output", "output": "w" * 8192}}),
+                json.dumps({"timestamp": "2026-11-24T10:00:04Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 200, "cached_input_tokens": 50, "output_tokens": 40}}}}),
+                '{"type": "response_item", "broken": ',
+            ]
+            cx_file.write_text("\n".join(cx_lines) + "\n", encoding="utf-8")
+            cx_res = mod._parse_codex_jsonl(cx_file)
+            self.assertEqual(cx_res["cid"], "cx-edge-1")
+            self.assertEqual(len(cx_res["turns"]), 1)
+            self.assertEqual(cx_res["turns"][0].tool_names, ("shell",))
+            self.assertEqual(cx_res["skipped_lines"], 1)
+
+            # 3. Gemini O(N) replay: message_update, $set by id, int $rewindTo, duplicate id
+            gm_file = root / "session-edge.jsonl"
+            gm_lines = [
+                json.dumps({"sessionId": "gm-edge-1"}),
+                json.dumps({"id": "m1", "type": "gemini", "timestamp": "2026-11-24T10:00:00Z", "model": "gemini-2.5-flash", "tokens": {"input": 100, "cached": 0, "output": 10, "thoughts": 0}}),
+                json.dumps({"type": "message_update", "id": "m1", "patch": {"tokens": {"input": 200, "cached": 50, "output": 30, "thoughts": 10}}}),
+                json.dumps({"id": "m2", "type": "gemini", "timestamp": "2026-11-24T10:01:00Z", "model": "gemini-2.5-flash", "tokens": {"input": 999, "cached": 0, "output": 999, "thoughts": 0}}),
+                json.dumps({"$rewindTo": 1}),
+                json.dumps({"id": "m1", "$set": {"model": "gemini-2.5-pro"}}),
+            ]
+            gm_file.write_text("\n".join(gm_lines) + "\n", encoding="utf-8")
+            gm_res = mod._parse_gemini_session_file(gm_file)
+            self.assertEqual(gm_res["cid"], "gm-edge-1")
+            self.assertEqual(len(gm_res["turns"]), 1)
+            self.assertEqual(gm_res["turns"][0].model, "gemini-2.5-pro")
+            self.assertEqual(gm_res["turns"][0].input_tokens, 150)
+            self.assertEqual(gm_res["turns"][0].cache_read_tokens, 50)
+            self.assertEqual(gm_res["turns"][0].output_tokens, 40)
+
+            # 4. PricingCatalog cache invalidates when pricing.json changes
+            p_path = root / "pricing.json"
+            p_path.write_text(json.dumps({"models": {"gemini-4-neon": {"input": 9.0, "output": 18.0}}}), encoding="utf-8")
+            cat = mod.PricingCatalog(p_path)
+            r1 = cat.resolve_rate("gemini-4-neon-xhigh", 0, None)
+            self.assertIsNotNone(r1)
+            assert r1 is not None
+            self.assertAlmostEqual(r1.input, 9.0)
+            p_path.write_text(json.dumps({"models": {"gemini-4-neon": {"input": 12.5, "output": 25.0}}}), encoding="utf-8")
+            # Bump mtime explicitly so (mtime_ns, size) always differs even on coarse FS
+            st_p = p_path.stat()
+            os.utime(p_path, ns=(st_p.st_atime_ns, st_p.st_mtime_ns + 1_000_000_000))
+            self.assertTrue(cat.refresh())
+            r2 = cat.resolve_rate("gemini-4-neon-xhigh", 0, None)
+            self.assertIsNotNone(r2)
+            assert r2 is not None
+            self.assertAlmostEqual(r2.input, 12.5)
+
+    def test_retain_turns_false_digest_parity_across_all_views_and_agents(self) -> None:
+        tz_utc = dt.timezone.utc
+        now = dt.datetime(2026, 11, 26, 14, 30, 0, tzinfo=tz_utc)
+        earlier = dt.datetime(2026, 11, 25, 9, 15, 0, tzinfo=tz_utc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            # 1. Antigravity root session + subagent + checkpoint + unpriced model
+            agy_root = root / "antigravity-cli"
+            parent_cid = "eeee0001-0000-4000-8000-000000000001"
+            sub_cid = "eeee0002-0000-4000-8000-000000000002"
+            p_logs = agy_root / "brain" / parent_cid / ".system_generated" / "logs"
+            s_logs = agy_root / "brain" / sub_cid / ".system_generated" / "logs"
+            p_logs.mkdir(parents=True)
+            s_logs.mkdir(parents=True)
+            (agy_root / "cache").mkdir(parents=True)
+            (agy_root / "cache" / "conversation_metadata.json").write_text(
+                json.dumps({
+                    parent_cid: {
+                        "title": "Digest Parent 任务",
+                        "workspace": "C:/Users/alice/digest-repo",
+                        "is_internal": False,
+                    },
+                    sub_cid: {
+                        "title": "Digest Subagent",
+                        "is_internal": True,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (p_logs / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                        "created_at": earlier.isoformat().replace("+00:00", "Z"),
+                        "model": "gemini-4-neon-xhigh",
+                        "input_tokens": 10000, "cache_read_tokens": 20000, "output_tokens": 500,
+                        "thinking": "analyze", "tool_calls": [{"name": "read_file", "args": {}}],
+                    }, separators=(",", ":")),
+                    json.dumps({
+                        "step_index": 2, "type": "CHECKPOINT", "status": "DONE",
+                        "created_at": now.isoformat().replace("+00:00", "Z"),
+                        "model": "",
+                        "input_tokens": 4000, "cache_read_tokens": 0, "output_tokens": 200,
+                    }, separators=(",", ":")),
+                    json.dumps({
+                        "step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE",
+                        "created_at": (now + dt.timedelta(minutes=3)).isoformat().replace("+00:00", "Z"),
+                        "model": "mystery-unpriced-v9",
+                        "input_tokens": 1200, "cache_read_tokens": 300, "output_tokens": 100,
+                    }, separators=(",", ":")),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            (s_logs / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "step_index": 0, "type": "SYSTEM_MESSAGE",
+                        "content": f"Spawned by parent conversation {parent_cid} to inspect tests",
+                    }),
+                    json.dumps({
+                        "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                        "created_at": (now + dt.timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                        "model": "claude-opus-5-5",
+                        "input_tokens": 5000, "cache_read_tokens": 15000, "output_tokens": 800,
+                        "tool_calls": [{"name": "grep_search", "args": {}}],
+                    }, separators=(",", ":")),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # 2. Claude Code session with 1h cache write
+            cl_root = root / ".claude"
+            cl_proj = cl_root / "projects" / "proj-a"
+            cl_proj.mkdir(parents=True)
+            cl_cid = "ffff0001-0000-4000-8000-000000000001"
+            (cl_proj / f"{cl_cid}.jsonl").write_text(
+                json.dumps({
+                    "type": "assistant", "uuid": "a1", "sessionId": cl_cid, "cwd": "C:/Users/alice/digest-repo",
+                    "requestId": "req1", "timestamp": now.isoformat().replace("+00:00", "Z"),
+                    "message": {
+                        "id": "m1", "model": "claude-sonnet-4-5-20250929", "stop_reason": "end_turn",
+                        "content": [{"type": "thinking", "thinking": "hmm"}, {"type": "tool_use", "id": "t1", "name": "Read"}],
+                        "usage": {
+                            "input_tokens": 1000, "cache_read_input_tokens": 3000,
+                            "cache_creation_input_tokens": 1000, "output_tokens": 250,
+                            "cache_creation": {"ephemeral_5m_input_tokens": 600, "ephemeral_1h_input_tokens": 400},
+                        },
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # 3. Codex CLI session with reasoning tokens
+            cx_root = root / ".codex"
+            cx_day = cx_root / "sessions" / "2026" / "11" / "26"
+            cx_day.mkdir(parents=True)
+            cx_cid = "aaaa0001-0000-4000-8000-000000000001"
+            (cx_day / f"rollout-2026-11-26-{cx_cid}.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"timestamp": now.isoformat().replace("+00:00", "Z"), "type": "session_meta", "payload": {"id": cx_cid, "cwd": "C:/cx"}}),
+                    json.dumps({"timestamp": now.isoformat().replace("+00:00", "Z"), "type": "turn_context", "payload": {"model": "gpt-5.4"}}),
+                    json.dumps({"timestamp": now.isoformat().replace("+00:00", "Z"), "type": "response_item", "payload": {"type": "function_call", "name": "shell"}}),
+                    json.dumps({
+                        "timestamp": now.isoformat().replace("+00:00", "Z"), "type": "event_msg",
+                        "payload": {"type": "token_count", "info": {"last_token_usage": {
+                            "input_tokens": 2000, "cached_input_tokens": 500, "output_tokens": 400, "reasoning_output_tokens": 150,
+                        }}},
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # 4. Gemini CLI session + archive backfill
+            gm_root = root / ".gemini"
+            gm_chats = gm_root / "tmp" / "proj-g" / "chats"
+            gm_chats.mkdir(parents=True)
+            (gm_chats / "session-gm1.json").write_text(
+                json.dumps({
+                    "sessionId": "gm-sess-1", "summary": "Gemini Digest",
+                    "messages": [{
+                        "id": "g1", "type": "gemini", "timestamp": now.isoformat().replace("+00:00", "Z"),
+                        "model": "gemini-2.5-pro",
+                        "tokens": {"input": 1500, "cached": 500, "output": 200, "thoughts": 80},
+                        "toolCalls": [{"name": "run_shell"}],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            arch_path = root / "archive.json"
+            arch_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "sessions": {
+                        "arch-001": {
+                            "source": "ide", "title": "Archived Digest", "workspace": "C:/arch",
+                            "turns": [
+                                {"step": 1, "ts": earlier.isoformat().replace("+00:00", "Z"), "m": "gemini-4-hydrogen", "in": 3000, "cr": 9000, "out": 300, "tools": ["view_file"], "th": 20},
+                                {"step": 2, "ts": now.isoformat().replace("+00:00", "Z"), "cp": True, "m": "", "in": 1000, "cr": 0, "out": 50},
+                            ],
+                        }
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            specs = [
+                mod.SourceSpec("antigravity", agy_root, "cli"),
+                mod.SourceSpec("claude", cl_root, "claude"),
+                mod.SourceSpec("codex", cx_root, "codex"),
+                mod.SourceSpec("gemini", gm_root, "gemini"),
+            ]
+            rep_full = mod.scan_usage(agy_root, tz=tz_utc, pricing_path=None, archive_path=arch_path, sources=specs, retain_turns=True)
+            rep_fast = mod.scan_usage(agy_root, tz=tz_utc, pricing_path=None, archive_path=arch_path, sources=specs, retain_turns=False)
+
+            self.assertEqual(len(rep_full.sessions), 6)
+            self.assertEqual(len(rep_fast.sessions), 6)
+            self.assertTrue(all(len(s.turns) == 0 for s in rep_fast.sessions))
+            self.assertTrue(all(s._digest is not None for s in rep_fast.sessions))
+
+            agg_full = mod.aggregate_sessions(rep_full.sessions)
+            agg_fast = mod.aggregate_sessions(rep_fast.sessions)
+
+            for view in ("summary", "all", "daily", "weekly", "monthly", "hourly", "model", "session", "workspace", "tools", "sources"):
+                for show_sub in (False, True):
+                    for redact in (False, True):
+                        t_full = mod.render_text(
+                            rep_full, agg_full, view=view, sort_by="cost", limit=15, human=True,
+                            tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                            color=False, show_subagents=show_sub, redact=redact,
+                        )
+                        t_fast = mod.render_text(
+                            rep_fast, agg_fast, view=view, sort_by="cost", limit=15, human=True,
+                            tz_label="UTC", since=None, until=None, model_filter=None, session_filter=None,
+                            color=False, show_subagents=show_sub, redact=redact,
+                        )
+                        self.assertEqual(t_fast, t_full, f"Mismatch in render_text(view={view}, show_sub={show_sub}, redact={redact})")
+
+            for redact in (False, True):
+                j_full = mod.render_json(rep_full, agg_full, sort_by="time", tz_label="UTC", include_turns=False, redact=redact)
+                j_fast = mod.render_json(rep_fast, agg_fast, sort_by="time", tz_label="UTC", include_turns=False, redact=redact)
+                self.assertEqual(j_fast, j_full, f"Mismatch in render_json(redact={redact})")
+
+            for view in ("summary", "model", "daily", "weekly", "monthly", "hourly", "sources", "workspace"):
+                c_full = mod.render_csv(rep_full, agg_full, view=view, sort_by="total", redact=False)
+                c_fast = mod.render_csv(rep_fast, agg_fast, view=view, sort_by="total", redact=False)
+                self.assertEqual(c_fast, c_full, f"Mismatch in render_csv(view={view})")
+
+            self.assertEqual(
+                mod.render_compact(rep_fast, agg_fast, tz=tz_utc),
+                mod.render_compact(rep_full, agg_full, tz=tz_utc),
+            )
+            self.assertEqual(
+                mod.evaluate_budget_exit_code(agg_fast, tz=tz_utc, daily_usd=0.01, weekly_usd=0.01),
+                mod.evaluate_budget_exit_code(agg_full, tz=tz_utc, daily_usd=0.01, weekly_usd=0.01),
+            )
+
+            # Cached IncrementalScanner(use_cache=True) must never pollute cache with scalar_only/skip_meta
+            cached_scanner = mod.IncrementalScanner(agy_root, pricing_path=None, sources=[specs[0]], use_cache=True)
+            _ = cached_scanner.scan(tz=tz_utc, retain_turns=False, scalar_only=True, skip_meta=True)
+            rep_after = cached_scanner.scan(tz=tz_utc, retain_turns=True)
+            agg_after = mod.aggregate_sessions(rep_after.sessions)
+            self.assertEqual(agg_after["by_tool"], {"read_file": 1, "grep_search": 1})
+            self.assertEqual(agg_after["total_thinking_turns"], 1)
+
+    def test_agy_prefix_regex_fast_path_parity_and_fallbacks(self) -> None:
+        tz_utc = dt.timezone.utc
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            agy_root = root / "antigravity-cli"
+            cid = "ffff1111-0000-4000-8000-000000000001"
+            logs = agy_root / "brain" / cid / ".system_generated" / "logs"
+            logs.mkdir(parents=True)
+            tpath = logs / "transcript.jsonl"
+
+            lines = [
+                # Day 1: standard compact with tool_calls (skipped by out_of_date under Day 2 bounds, kept for last_real_model)
+                json.dumps({
+                    "step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-11-24T10:00:00Z", "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 5000, "cache_read_tokens": 10000, "output_tokens": 300,
+                    "tool_calls": [{"name": "run_command", "args": {"cmd": "echo hi"}}],
+                }, separators=(",", ":")),
+                # Day 2: standard compact with NO trailing fields (hits fast path)
+                json.dumps({
+                    "step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-11-26T10:00:00Z", "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 1000, "cache_read_tokens": 2000, "output_tokens": 100,
+                }, separators=(",", ":")),
+                # Day 2: standard compact with empty thinking (hits retain_thinking_len=False fast path -> 0)
+                json.dumps({
+                    "step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-11-26T10:01:00Z", "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 1100, "cache_read_tokens": 2100, "output_tokens": 110,
+                    "thinking": "",
+                }, separators=(",", ":")),
+                # Day 2: standard compact with non-empty thinking (hits retain_thinking_len=False fast path -> 1)
+                json.dumps({
+                    "step_index": 4, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-11-26T10:02:00Z", "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 1200, "cache_read_tokens": 2200, "cache_write_tokens": 500, "output_tokens": 120,
+                    "thinking": "step-by-step reasoning",
+                }, separators=(",", ":")),
+                # Day 2: content before thinking (falls back safely to json decoder)
+                json.dumps({
+                    "step_index": 5, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-11-26T10:03:00Z", "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 1300, "cache_read_tokens": 2300, "output_tokens": 130,
+                    "content": "answer", "thinking": "hidden thought",
+                }, separators=(",", ":")),
+                # Day 2: cache_creation_tokens (must fall back to json decoder so cache_write is captured!)
+                json.dumps({
+                    "step_index": 6, "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": "2026-11-26T10:04:00Z", "model": "claude-sonnet-4-5-20250929",
+                    "input_tokens": 1400, "cache_read_tokens": 2400, "output_tokens": 140,
+                    "cache_creation_tokens": 750,
+                }, separators=(",", ":")),
+                # Day 2: out-of-order keys (falls back safely)
+                json.dumps({
+                    "model": "gemini-4-hydrogen", "output_tokens": 150, "input_tokens": 1500,
+                    "cache_read_tokens": 2500, "step_index": 7, "type": "PLANNER_RESPONSE",
+                    "status": "DONE", "created_at": "2026-11-26T10:05:00Z",
+                }, separators=(",", ":")),
+                # Day 2: CHECKPOINT with empty model inherits last_real_model
+                json.dumps({
+                    "step_index": 8, "type": "CHECKPOINT", "status": "DONE",
+                    "created_at": "2026-11-26T10:06:00Z", "model": "",
+                    "input_tokens": 2000, "cache_read_tokens": 0, "output_tokens": 100,
+                }, separators=(",", ":")),
+                # Malformed trailing line MUST still increment skipped_lines
+                '{"step_index":9,"type":"PLANNER_RESPONSE","input_tokens":100,"broken":',
+            ]
+            tpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            t_full, _, _, _, _, sk_full = mod._parse_transcript_file(
+                tpath, cid, scalar_only=False, skip_meta=False, retain_thinking_len=True
+            )
+            t_bool, _, _, _, _, sk_bool = mod._parse_transcript_file(
+                tpath, cid, scalar_only=False, skip_meta=False, retain_thinking_len=False
+            )
+            t_scal, _, _, _, _, sk_scal = mod._parse_transcript_file(
+                tpath, cid, scalar_only=True, skip_meta=True, retain_thinking_len=False
+            )
+
+            self.assertEqual(sk_full, 1)
+            self.assertEqual(sk_bool, 1)
+            self.assertEqual(sk_scal, 1)
+            self.assertEqual(len(t_full), 8)
+            self.assertEqual(len(t_bool), 8)
+            self.assertEqual(len(t_scal), 8)
+
+            # Verify cache_creation_tokens fallback captured 750 in ALL modes
+            self.assertEqual(t_full[5].cache_write_tokens, 750)
+            self.assertEqual(t_bool[5].cache_write_tokens, 750)
+            self.assertEqual(t_scal[5].cache_write_tokens, 750)
+
+            for a, b, c in zip(t_full, t_bool, t_scal):
+                self.assertEqual((a.step_index, a.timestamp, a.model, a.step_type, a.status),
+                                 (b.step_index, b.timestamp, b.model, b.step_type, b.status))
+                self.assertEqual((a.step_index, a.timestamp, a.model, a.step_type, a.status),
+                                 (c.step_index, c.timestamp, c.model, c.step_type, c.status))
+                self.assertEqual((a.input_tokens, a.cache_read_tokens, a.cache_write_tokens, a.output_tokens),
+                                 (b.input_tokens, b.cache_read_tokens, b.cache_write_tokens, b.output_tokens))
+                self.assertEqual((a.input_tokens, a.cache_read_tokens, a.cache_write_tokens, a.output_tokens),
+                                 (c.input_tokens, c.cache_read_tokens, c.cache_write_tokens, c.output_tokens))
+                self.assertEqual(a.tool_names, b.tool_names)
+                self.assertEqual(a.has_thinking, b.has_thinking)
+
+            # Day-2 filtered scan via utc_date_bounds + retain_turns=False must match retain_turns=True
+            day2 = dt.date(2026, 11, 26)
+            rep_d2_full = mod.scan_usage(agy_root, tz=tz_utc, since=day2, until=day2, pricing_path=None, retain_turns=True)
+            rep_d2_fast = mod.scan_usage(agy_root, tz=tz_utc, since=day2, until=day2, pricing_path=None, retain_turns=False)
+            self.assertEqual(rep_d2_fast.sessions[0].counts, rep_d2_full.sessions[0].counts)
+            self.assertEqual(rep_d2_fast.sessions[0].thinking_turns, rep_d2_full.sessions[0].thinking_turns)
+            self.assertEqual(rep_d2_fast.sessions[0].tool_counts(), rep_d2_full.sessions[0].tool_counts())
+
+            # CLI --view pricing and --format csv fast paths work cleanly
+            buf_p = io.StringIO()
+            with mock.patch("sys.stdout", buf_p):
+                rc_p = mod.main(["--data-dir", str(agy_root), "--view", "pricing", "--no-archive", "--utc", "--pricing", ""])
+            self.assertEqual(rc_p, 0)
+            self.assertIn("gemini-4-neon-xhigh", buf_p.getvalue())
+
+            buf_c = io.StringIO()
+            with mock.patch("sys.stdout", buf_c):
+                rc_c = mod.main(["--data-dir", str(agy_root), "--format", "csv", "--view", "model", "--no-archive", "--utc", "--pricing", ""])
+            self.assertEqual(rc_c, 0)
+            self.assertIn("gemini-4-neon-xhigh", buf_c.getvalue())
+
+    def test_explicit_slots_classes_and_lazy_imports(self) -> None:
+        spec = mod.SourceSpec("antigravity", pathlib.Path("/tmp/a"), "cli")
+        self.assertFalse(hasattr(spec, "__dict__"))
+        self.assertEqual(spec, mod.SourceSpec("antigravity", pathlib.Path("/tmp/a"), "cli"))
+        self.assertEqual(hash(spec), hash(mod.SourceSpec("antigravity", pathlib.Path("/tmp/a"), "cli")))
+        with self.assertRaises(AttributeError):
+            spec.kind = "claude"  # type: ignore[misc]
+
+        rate = mod.ModelRate(3.0, 0.3, 3.75, 15.0)
+        self.assertFalse(hasattr(rate, "__dict__"))
+        self.assertEqual(rate, mod.ModelRate(3.0, 0.3, 3.75, 15.0))
+        self.assertEqual(hash(rate), hash(mod.ModelRate(3.0, 0.3, 3.75, 15.0)))
+        with self.assertRaises(AttributeError):
+            rate.input = 5.0  # type: ignore[misc]
+
+        cb = rate.calculate(1000, 2000, 500, 300, cache_write_1h_tokens=200)
+        self.assertFalse(hasattr(cb, "__dict__"))
+        tc_std = mod.TokenCounts()
+        tc_std.add_call(1000, 2000, 500, 300, cb)
+        tc_inl = mod.TokenCounts()
+        tc_inl.add_call_inline(
+            1000, 2000, 500, 300, 3500,
+            cb.input_usd, cb.cache_read_usd, cb.cache_write_usd, cb.output_usd, cb.cache_saved_usd, cb.unpriced_calls,
+        )
+        self.assertFalse(hasattr(tc_std, "__dict__"))
+        self.assertEqual(tc_inl, tc_std)
+
+        tr = mod.TurnRecord("c1", 1, None, "m1", "PLANNER_RESPONSE", "DONE", 10, 20, 0, 5)
+        self.assertFalse(hasattr(tr, "__dict__"))
+        si = mod.SessionInfo("c1")
+        self.assertFalse(hasattr(si, "__dict__"))
+        sr = mod.ScanReport(pathlib.Path("."), [], [])
+        self.assertFalse(hasattr(sr, "__dict__"))
+
+        # Verify lazy-imported argparse / unicodedata paths
+        import argparse
+
+        with self.assertRaises(argparse.ArgumentTypeError):
+            mod._parse_date_arg("not-a-date")
+        self.assertEqual(mod._display_width("中文ab"), 6)
+        self.assertEqual(mod._truncate_display("中文测试标题", 7), "中文测…")
+
     def test_no_file_writes_in_cli_source(self) -> None:
         base_dir = pathlib.Path(mod.__file__).parent
         forbidden_imports = {
