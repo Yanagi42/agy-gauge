@@ -23,7 +23,9 @@ use crate::d2d::{
     linear_v_brush, load_color, rect_f, rgba, stroke_round_rect, theme_for, with_alpha,
     D2DFactories, Fonts, LayeredSurface, Theme,
 };
-use crate::launcher::{TerminalAvailability, TerminalPreset};
+use crate::launcher::{
+    TerminalAvailability, TerminalConfig, TerminalPreset, WtProfileEntry, WtProfileKind,
+};
 use crate::pricing::fmt_cost_compact;
 use crate::quota::{AlertSeverity, QuotaProvenance};
 use crate::stats::{fmt_compact, ScanSnapshot, TokenCounts};
@@ -56,6 +58,10 @@ pub const CMD_TERMINAL_PRESET_BASE: u32 = 1400; // 1400..1407 -> TerminalPreset:
 pub const CMD_TERMINAL_TOGGLE_NEW_WIN: u32 = 1410;
 pub const CMD_TERMINAL_TOGGLE_KEEP_OPEN: u32 = 1411;
 pub const CMD_TERMINAL_OPEN_CONFIG: u32 = 1412;
+pub const CMD_TERMINAL_WT_PROFILE_AUTO: u32 = 1415;
+pub const CMD_TERMINAL_WT_PROFILE_BASE: u32 = 1420; // 1420..1435 -> discovered WT profiles
+pub const CMD_TERMINAL_NAMED_PROFILE_BASE: u32 = 1440; // 1440..1455 -> terminal.json named profiles
+pub const MAX_TERMINAL_MENU_PROFILES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct QuickSessionMenuItem {
@@ -922,10 +928,9 @@ pub fn show_context_menu(
     current_monitor: usize,
     pill_items: u32,
     quick_sessions: &[QuickSessionMenuItem],
-    terminal_preset: TerminalPreset,
-    terminal_new_window: bool,
-    terminal_keep_open: bool,
+    terminal_cfg: &TerminalConfig,
     terminal_avail: &TerminalAvailability,
+    wt_profiles: &[WtProfileEntry],
 ) -> Option<u32> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
@@ -960,24 +965,50 @@ pub fn show_context_menu(
         }
 
         let mut term_menu = None;
+        let mut wt_prof_menu = None;
         if let Ok(tm) = CreatePopupMenu() {
+            let active_named = terminal_cfg.active_profile.as_deref();
+            if !terminal_cfg.profiles.is_empty() {
+                for (idx, prof) in terminal_cfg
+                    .profiles
+                    .iter()
+                    .take(MAX_TERMINAL_MENU_PROFILES)
+                    .enumerate()
+                {
+                    let checked = active_named == Some(prof.name.as_str());
+                    let label = format!("[配置] {}", prof.name);
+                    let wide = to_wide_null(&label);
+                    let flag = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
+                    let _ = AppendMenuW(
+                        tm,
+                        flag,
+                        (CMD_TERMINAL_NAMED_PROFILE_BASE as usize) + idx,
+                        wide_pcwstr(&wide),
+                    );
+                }
+                let _ = AppendMenuW(tm, MF_SEPARATOR, 0, None);
+            }
             for (idx, &preset) in TerminalPreset::ALL.iter().enumerate() {
-                let checked = preset == terminal_preset;
-                let optional_third_party = matches!(
+                let checked = active_named.is_none() && preset == terminal_cfg.preset;
+                let optional_external = matches!(
                     preset,
-                    TerminalPreset::WezTerm | TerminalPreset::Alacritty | TerminalPreset::GitBash
+                    TerminalPreset::WtPwsh
+                        | TerminalPreset::WtDirect
+                        | TerminalPreset::WezTerm
+                        | TerminalPreset::Alacritty
+                        | TerminalPreset::GitBash
                 );
                 let detected = terminal_avail.is_available(preset);
-                let label = if optional_third_party && !detected {
+                if optional_external && !detected && !checked {
+                    continue;
+                }
+                let label = if optional_external && !detected {
                     format!("{} (未检测到)", preset.menu_label())
                 } else {
                     preset.menu_label().to_string()
                 };
                 let wide = to_wide_null(&label);
-                let mut flag = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
-                if optional_third_party && !detected && !checked {
-                    flag |= MF_GRAYED;
-                }
+                let flag = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
                 let _ = AppendMenuW(
                     tm,
                     flag,
@@ -985,16 +1016,79 @@ pub fn show_context_menu(
                     wide_pcwstr(&wide),
                 );
             }
+            if terminal_avail.wt {
+                let _ = AppendMenuW(tm, MF_SEPARATOR, 0, None);
+                if let Ok(wm) = CreatePopupMenu() {
+                    let cur_wt = terminal_cfg.wt_profile.as_deref();
+                    let auto_checked = cur_wt.is_none();
+                    let _ = AppendMenuW(
+                        wm,
+                        MF_STRING | if auto_checked { MF_CHECKED } else { MF_UNCHECKED },
+                        CMD_TERMINAL_WT_PROFILE_AUTO as usize,
+                        w!("自动匹配 (跟随默认)"),
+                    );
+                    let matched_in_list = cur_wt.is_some_and(|cur| {
+                        wt_profiles
+                            .iter()
+                            .take(MAX_TERMINAL_MENU_PROFILES)
+                            .any(|p| p.name.eq_ignore_ascii_case(cur))
+                    });
+                    if let Some(cur) = cur_wt {
+                        if !matched_in_list {
+                            let label = format!("当前指定: {cur}");
+                            let wide = to_wide_null(&label);
+                            let _ = AppendMenuW(
+                                wm,
+                                MF_STRING | MF_CHECKED | MF_GRAYED,
+                                0,
+                                wide_pcwstr(&wide),
+                            );
+                        }
+                    }
+                    if !wt_profiles.is_empty() {
+                        let _ = AppendMenuW(wm, MF_SEPARATOR, 0, None);
+                        for (idx, wp) in wt_profiles
+                            .iter()
+                            .take(MAX_TERMINAL_MENU_PROFILES)
+                            .enumerate()
+                        {
+                            let checked = cur_wt.is_some_and(|c| wp.name.eq_ignore_ascii_case(c));
+                            let mut label = wp.name.clone();
+                            if wp.is_default {
+                                label.push_str(" (默认)");
+                            }
+                            if wp.elevate {
+                                label.push_str(" (管理员)");
+                            }
+                            if terminal_cfg.preset == TerminalPreset::WtPwsh
+                                && wp.kind != WtProfileKind::PowerShell
+                            {
+                                label.push_str(" (仅外观/环境)");
+                            }
+                            let wide = to_wide_null(&label);
+                            let flag = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
+                            let _ = AppendMenuW(
+                                wm,
+                                flag,
+                                (CMD_TERMINAL_WT_PROFILE_BASE as usize) + idx,
+                                wide_pcwstr(&wide),
+                            );
+                        }
+                    }
+                    let _ = AppendMenuW(tm, MF_POPUP, wm.0 as usize, w!("Windows Terminal Profile"));
+                    wt_prof_menu = Some(wm);
+                }
+            }
             let _ = AppendMenuW(tm, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(
                 tm,
-                MF_STRING | if terminal_new_window { MF_CHECKED } else { MF_UNCHECKED },
+                MF_STRING | if terminal_cfg.wt_new_window { MF_CHECKED } else { MF_UNCHECKED },
                 CMD_TERMINAL_TOGGLE_NEW_WIN as usize,
                 w!("Windows Terminal 开新窗口"),
             );
             let _ = AppendMenuW(
                 tm,
-                MF_STRING | if terminal_keep_open { MF_CHECKED } else { MF_UNCHECKED },
+                MF_STRING | if terminal_cfg.keep_shell_open { MF_CHECKED } else { MF_UNCHECKED },
                 CMD_TERMINAL_TOGGLE_KEEP_OPEN as usize,
                 w!("退出会话后保留 Shell"),
             );
@@ -1137,6 +1231,9 @@ pub fn show_context_menu(
         }
         if let Some(qm) = quick_menu {
             let _ = DestroyMenu(qm);
+        }
+        if let Some(wm) = wt_prof_menu {
+            let _ = DestroyMenu(wm);
         }
         if let Some(tm) = term_menu {
             let _ = DestroyMenu(tm);

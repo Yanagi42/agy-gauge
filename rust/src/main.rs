@@ -111,10 +111,12 @@ use dashboard::{
 use pill::{
     show_context_menu, PillRenderer, QuickSessionMenuItem, CMD_MONITOR_BASE, CMD_OPEN_DETAIL,
     CMD_OPEN_SESSIONS_TAB, CMD_PILL_ITEMS_RESET, CMD_PILL_ITEM_BASE, CMD_QUICK_RESUME_BASE,
-    CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TERMINAL_OPEN_CONFIG, CMD_TERMINAL_PRESET_BASE,
-    CMD_TERMINAL_TOGGLE_KEEP_OPEN, CMD_TERMINAL_TOGGLE_NEW_WIN, CMD_TOGGLE_AUTOSTART,
+    CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TERMINAL_NAMED_PROFILE_BASE, CMD_TERMINAL_OPEN_CONFIG,
+    CMD_TERMINAL_PRESET_BASE, CMD_TERMINAL_TOGGLE_KEEP_OPEN, CMD_TERMINAL_TOGGLE_NEW_WIN,
+    CMD_TERMINAL_WT_PROFILE_AUTO, CMD_TERMINAL_WT_PROFILE_BASE, CMD_TOGGLE_AUTOSTART,
     CMD_TOGGLE_HIDE_FULLSCREEN, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_NOTIFICATIONS,
     CMD_TOGGLE_PILL_VISIBLE, CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST, CMD_TOGGLE_TRAY_HOVER,
+    MAX_TERMINAL_MENU_PROFILES,
 };
 use pricing::ModelRate;
 use stats::{DateScope, IncrementalScanner, ScanDelta, ScanHints, ScanSnapshot};
@@ -1120,6 +1122,7 @@ struct AppState {
     terminal_preset: launcher::TerminalPreset,
     terminal_new_window: bool,
     terminal_keep_open: bool,
+    terminal_wt_profile: String,
     last_total_tokens: u64,
     recent_activity_until: Option<Instant>,
     tray: Option<TrayIcon>,
@@ -1577,6 +1580,7 @@ impl AppState {
             terminal_preset: self.terminal_preset.to_u8(),
             terminal_new_window: self.terminal_new_window,
             terminal_keep_open: self.terminal_keep_open,
+            terminal_wt_profile: self.terminal_wt_profile.clone(),
         }
     }
 
@@ -1621,6 +1625,7 @@ impl AppState {
         self.terminal_preset = launcher::TerminalPreset::from_u8(p.terminal_preset);
         self.terminal_new_window = p.terminal_new_window;
         self.terminal_keep_open = p.terminal_keep_open;
+        self.terminal_wt_profile = p.terminal_wt_profile;
         if let Some(view) = &mut self.dash_view {
             view.cost_mode = p.cost_mode;
             view.group_subagents = p.group_subagents;
@@ -2506,23 +2511,41 @@ impl AppState {
     }
 
     fn effective_terminal_config(&self) -> launcher::TerminalConfig {
+        let wt_profile = {
+            let trimmed = self.terminal_wt_profile.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
         let base = launcher::TerminalConfig {
             preset: self.terminal_preset,
-            wt_profile: None,
+            wt_profile,
+            wt_settings_path: None,
             wt_new_window: self.terminal_new_window,
             keep_shell_open: self.terminal_keep_open,
+            shell_exe: None,
             custom: None,
+            active_profile: None,
+            profiles: Vec::new(),
         };
         launcher::load_effective_terminal_config(base)
     }
 
-    fn sync_terminal_prefs_to_file_if_exists(&self) {
+    fn sync_terminal_prefs_to_file_if_exists(&self, active_profile: Option<&str>) {
         if let Some(path) = launcher::default_terminal_config_path() {
+            let wt_prof = {
+                let trimmed = self.terminal_wt_profile.trim();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            };
             let _ = launcher::sync_ui_prefs_to_terminal_json_if_exists(
                 &path,
                 self.terminal_preset,
+                wt_prof,
                 self.terminal_new_window,
                 self.terminal_keep_open,
+                active_profile,
             );
         }
     }
@@ -3464,6 +3487,11 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
     {
         let autostart = is_autostart_enabled();
         let term_avail = launcher::probe_terminal_availability();
+        let wt_profiles = if term_avail.wt {
+            launcher::discover_wt_profiles_with_override(eff_term.wt_settings_path.as_deref())
+        } else {
+            Vec::new()
+        };
         let dash_open = local_vis
             || unsafe {
                 FindWindowW(w!("GaugeDashboardClass"), None)
@@ -3485,10 +3513,9 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             mon,
             items,
             &quick_sessions,
-            eff_term.preset,
-            eff_term.wt_new_window,
-            eff_term.keep_shell_open,
+            &eff_term,
             &term_avail,
+            &wt_profiles,
         );
         with_app(|app| app.pill_menu_open = false);
         let mut handled_topmost = false;
@@ -3504,14 +3531,70 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                         });
                     }
                 }
+                c if (CMD_TERMINAL_NAMED_PROFILE_BASE
+                    ..CMD_TERMINAL_NAMED_PROFILE_BASE + MAX_TERMINAL_MENU_PROFILES as u32)
+                    .contains(&c) =>
+                {
+                    let idx = (c - CMD_TERMINAL_NAMED_PROFILE_BASE) as usize;
+                    if let Some(prof) = eff_term.profiles.get(idx) {
+                        if let Some(path) = launcher::default_terminal_config_path() {
+                            if let Err(err) =
+                                launcher::set_active_profile_in_terminal_json(&path, Some(&prof.name))
+                            {
+                                with_app(|app| {
+                                    if app.notifications_enabled {
+                                        if let Some(tray) = &app.tray {
+                                            tray.show_balloon("Gauge", &err, false, true);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
                 c if (CMD_TERMINAL_PRESET_BASE..CMD_TERMINAL_PRESET_BASE + 8).contains(&c) => {
                     let idx = (c - CMD_TERMINAL_PRESET_BASE) as usize;
                     if let Some(&preset) = launcher::TerminalPreset::ALL.get(idx) {
                         with_app(|app| {
                             app.terminal_preset = preset;
+                            app.terminal_wt_profile = eff_term.wt_profile.clone().unwrap_or_default();
                             app.terminal_new_window = eff_term.wt_new_window;
                             app.terminal_keep_open = eff_term.keep_shell_open;
-                            app.sync_terminal_prefs_to_file_if_exists();
+                            app.sync_terminal_prefs_to_file_if_exists(None);
+                            app.persist_and_sync(hwnd);
+                        });
+                    }
+                }
+                CMD_TERMINAL_WT_PROFILE_AUTO => {
+                    with_app(|app| {
+                        app.terminal_preset = eff_term.preset;
+                        app.terminal_wt_profile.clear();
+                        app.terminal_new_window = eff_term.wt_new_window;
+                        app.terminal_keep_open = eff_term.keep_shell_open;
+                        app.sync_terminal_prefs_to_file_if_exists(None);
+                        app.persist_and_sync(hwnd);
+                    });
+                }
+                c if (CMD_TERMINAL_WT_PROFILE_BASE
+                    ..CMD_TERMINAL_WT_PROFILE_BASE + MAX_TERMINAL_MENU_PROFILES as u32)
+                    .contains(&c) =>
+                {
+                    let idx = (c - CMD_TERMINAL_WT_PROFILE_BASE) as usize;
+                    if let Some(wp) = wt_profiles.get(idx) {
+                        with_app(|app| {
+                            let next_preset = if matches!(
+                                eff_term.preset,
+                                launcher::TerminalPreset::WtPwsh | launcher::TerminalPreset::WtDirect
+                            ) {
+                                eff_term.preset
+                            } else {
+                                launcher::TerminalPreset::WtPwsh
+                            };
+                            app.terminal_preset = next_preset;
+                            app.terminal_wt_profile = wp.name.clone();
+                            app.terminal_new_window = eff_term.wt_new_window;
+                            app.terminal_keep_open = eff_term.keep_shell_open;
+                            app.sync_terminal_prefs_to_file_if_exists(None);
                             app.persist_and_sync(hwnd);
                         });
                     }
@@ -3519,18 +3602,20 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                 CMD_TERMINAL_TOGGLE_NEW_WIN => {
                     with_app(|app| {
                         app.terminal_preset = eff_term.preset;
+                        app.terminal_wt_profile = eff_term.wt_profile.clone().unwrap_or_default();
                         app.terminal_new_window = !eff_term.wt_new_window;
                         app.terminal_keep_open = eff_term.keep_shell_open;
-                        app.sync_terminal_prefs_to_file_if_exists();
+                        app.sync_terminal_prefs_to_file_if_exists(eff_term.active_profile.as_deref());
                         app.persist_and_sync(hwnd);
                     });
                 }
                 CMD_TERMINAL_TOGGLE_KEEP_OPEN => {
                     with_app(|app| {
                         app.terminal_preset = eff_term.preset;
+                        app.terminal_wt_profile = eff_term.wt_profile.clone().unwrap_or_default();
                         app.terminal_new_window = eff_term.wt_new_window;
                         app.terminal_keep_open = !eff_term.keep_shell_open;
-                        app.sync_terminal_prefs_to_file_if_exists();
+                        app.sync_terminal_prefs_to_file_if_exists(eff_term.active_profile.as_deref());
                         app.persist_and_sync(hwnd);
                     });
                 }
@@ -5244,6 +5329,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             terminal_preset: launcher::TerminalPreset::from_u8(prefs.terminal_preset),
             terminal_new_window: prefs.terminal_new_window,
             terminal_keep_open: prefs.terminal_keep_open,
+            terminal_wt_profile: prefs.terminal_wt_profile,
             last_total_tokens: initial_total,
             recent_activity_until: None,
             tray,

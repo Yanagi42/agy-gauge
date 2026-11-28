@@ -19,7 +19,7 @@
     - OpenAI Codex CLI：`codex resume <id>`
     - Gemini CLI：`gemini --resume <id>`
   - 自动解析 `.exe` / `.cmd` / `.bat`（兼容 Windows npm `.cmd` shim）并校验会话 ID 白名单；子会话自动按同 Agent 家族关联父会话，支持跳转或直接恢复父会话；桌面 App / IDE 与归档会话清晰给出原因提示。
-  - **可配置恢复终端**：默认通过 **Windows Terminal (PowerShell)** 打开并加载用户 `$PROFILE` 且退出会话后保留交互 Shell；右键胶囊/托盘菜单「恢复终端」可一键切换内置预设（Windows Terminal PowerShell / 直连 CLI / 独立 PowerShell / WezTerm / Alacritty / Git Bash / cmd / 自定义）、新窗口与保留 Shell 开关，或生成编辑同目录 `terminal.json` 指定 `wt_profile` 与自定义终端命令模板。
+  - **可配置恢复终端**：默认通过 **Windows Terminal (PowerShell 7 `pwsh.exe`，未安装时自动回退 Windows PowerShell)** 打开并加载用户 `$PROFILE` 且退出会话后保留交互 Shell；右键胶囊/托盘菜单「恢复终端」仅展示本机已检测到的终端预设（自动隐藏未安装的第三方终端），支持直接选择本机只读发现的兼容 **Windows Terminal Profile**（自动过滤 WSL / Azure Cloud Shell，标注默认/管理员/仅外观环境）、切换新窗口与保留 Shell 开关，或生成编辑同目录 `terminal.json` 指定 `wt_settings_path`、`shell_exe`、多套可一键切换的命名 `profiles` 与自定义终端模板。
   - 支持跨时间范围置顶会话（持久化于程序同目录 `session_meta.json`，不污染统计汇总与导出）。
 - **双编辑级主题**：内置 **暖炭黑（Obsidian）** 与 **浅色纸感（Warm Paper）** 两套克制配色（零霓虹高亮），自动调用 `Segoe UI Variable` / `Maple Mono` / `JetBrains Mono`，支持一键切换并同步 Win11 标题栏。
 - **Antigravity 官方 `/statusline` 桥接 + 全源预算预警（`budget.json`）**：
@@ -84,13 +84,20 @@
 - `statusline_state.json`：由 `agy-statusline.exe` 写入的 Antigravity 官方配额脱敏缓存。
 - `archive.json`：本地历史轮次轻量归档（可用 `--no-archive` 禁用）。
 - `session_meta.json`：用户置顶会话标记（与 Agent 原始日志目录完全隔离）。
-- `terminal.json`（可选）：恢复会话终端高级配置（仅在右键「恢复终端 → 打开 / 生成 terminal.json...」或手动创建时使用；支持指定 Windows Terminal Profile `wt_profile` 与 `custom` 模板占位符 `{dir}`、`{exe}`、`{arg}`、`{cid}`、`{title}`、`{cmd}`、`{pwsh}`）：
+- `terminal.json`（可选）：恢复会话终端高级配置（仅在右键「恢复终端 → 打开 / 生成 terminal.json...」或手动创建时使用；支持指定 `wt_profile`、自定义 WT 配置文件路径 `wt_settings_path`（适配便携版 / Canary）、显式覆写 `shell_exe`、定义多套可在右键菜单一键切换的命名 `profiles`（`active_profile`）以及 `custom` 模板占位符 `{dir}`、`{exe}`、`{arg}`、`{cid}`、`{title}`、`{cmd}`、`{pwsh}`）：
   ```json
   {
     "preset": "wt_pwsh",
-    "wt_profile": "PowerShell",
+    "wt_profile": "",
+    "wt_settings_path": "",
+    "shell_exe": "",
     "wt_new_window": false,
     "keep_shell_open": true,
+    "active_profile": "",
+    "profiles": [
+      { "name": "PowerShell (proxy)", "preset": "wt_pwsh", "wt_profile": "PowerShell (proxy)" },
+      { "name": "WezTerm", "preset": "wezterm", "keep_shell_open": true }
+    ],
     "custom": {
       "exe": "",
       "args": ["--working-directory", "{dir}", "-e", "{pwsh}", "-NoLogo", "-NoExit", "-Command", "{cmd}"]

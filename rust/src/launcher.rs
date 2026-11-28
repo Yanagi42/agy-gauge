@@ -245,14 +245,49 @@ pub struct CustomTerminalConfig {
     pub args: Vec<String>,
 }
 
+/// Coarse shell classification for a discovered Windows Terminal profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WtProfileKind {
+    PowerShell,
+    Cmd,
+    Other,
+}
+
+/// Discovered Windows Terminal profile entry from local `settings.json` (read-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WtProfileEntry {
+    pub name: String,
+    pub is_default: bool,
+    pub elevate: bool,
+    pub kind: WtProfileKind,
+}
+
+/// A named terminal profile defined inside `terminal.json`'s `profiles` array.
+/// Any `None` field inherits from top-level `terminal.json` / Registry defaults;
+/// `Some("")` on `wt_profile` or `shell_exe` explicitly clears the inherited value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NamedTerminalProfile {
+    pub name: String,
+    pub preset: Option<TerminalPreset>,
+    pub wt_profile: Option<String>,
+    pub wt_new_window: Option<bool>,
+    pub keep_shell_open: Option<bool>,
+    pub shell_exe: Option<String>,
+    pub custom: Option<CustomTerminalConfig>,
+}
+
 /// Effective terminal launch configuration (merged from Registry `UserPrefs` + optional `terminal.json`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
     pub preset: TerminalPreset,
     pub wt_profile: Option<String>,
+    pub wt_settings_path: Option<String>,
     pub wt_new_window: bool,
     pub keep_shell_open: bool,
+    pub shell_exe: Option<String>,
     pub custom: Option<CustomTerminalConfig>,
+    pub active_profile: Option<String>,
+    pub profiles: Vec<NamedTerminalProfile>,
 }
 
 impl Default for TerminalConfig {
@@ -260,9 +295,13 @@ impl Default for TerminalConfig {
         Self {
             preset: TerminalPreset::WtPwsh,
             wt_profile: None,
+            wt_settings_path: None,
             wt_new_window: false,
             keep_shell_open: true,
+            shell_exe: None,
             custom: None,
+            active_profile: None,
+            profiles: Vec::new(),
         }
     }
 }
@@ -480,10 +519,11 @@ fn resolve_cached_exe(key: &'static str, probe: impl FnOnce() -> Option<PathBuf>
     found
 }
 
-fn find_exe_in_path(names: &[&str]) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        for name in names {
+/// Searches `dirs` for the first matching executable in `names`, prioritizing `names` order
+/// across all directories (e.g., `pwsh.exe` later in `PATH` beats `powershell.exe` earlier in `PATH`).
+fn find_exe_in_dirs(names: &[&str], dirs: &[PathBuf]) -> Option<PathBuf> {
+    for name in names {
+        for dir in dirs {
             let candidate = dir.join(name);
             if is_existing_executable_entry(&candidate) {
                 return Some(candidate);
@@ -491,6 +531,12 @@ fn find_exe_in_path(names: &[&str]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_exe_in_path(names: &[&str]) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    find_exe_in_dirs(names, &dirs)
 }
 
 /// Searches `dirs` in order for `<command_name>.exe`, `<command_name>.cmd`, then `<command_name>.bat`.
@@ -625,27 +671,112 @@ fn resolve_wt_exe() -> Option<PathBuf> {
     })
 }
 
-fn resolve_pwsh_exe() -> Option<PathBuf> {
-    resolve_cached_exe("pwsh", || {
-        if let Some(found) = find_exe_in_path(&["pwsh.exe", "powershell.exe"]) {
-            return Some(found);
-        }
-        let pwsh7 = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
-        if is_existing_executable_entry(&pwsh7) {
-            return Some(pwsh7);
-        }
-        if let Some(sys_root) = std::env::var_os("SystemRoot") {
-            let win_ps = PathBuf::from(sys_root)
+fn resolve_pwsh_from(
+    path_dirs: &[PathBuf],
+    pwsh_fallbacks: &[PathBuf],
+    winps_fallbacks: &[PathBuf],
+) -> Option<PathBuf> {
+    // Always prefer PowerShell 7+ (`pwsh.exe`) over legacy Windows PowerShell 5.1 (`powershell.exe`),
+    // even when System32\WindowsPowerShell\v1.0 precedes PowerShell\7 in Explorer's inherited PATH
+    // or when Explorer's PATH has not yet picked up a PowerShell 7 installation.
+    if let Some(found) = find_exe_in_dirs(&["pwsh.exe"], path_dirs) {
+        return Some(found);
+    }
+    if let Some(found) = first_existing_file(pwsh_fallbacks) {
+        return Some(found);
+    }
+    if let Some(found) = find_exe_in_dirs(&["powershell.exe"], path_dirs) {
+        return Some(found);
+    }
+    first_existing_file(winps_fallbacks)
+}
+
+fn pwsh_fallback_candidates() -> Vec<PathBuf> {
+    let mut pwsh_fallbacks = Vec::new();
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        let base = PathBuf::from(pf).join("PowerShell");
+        pwsh_fallbacks.push(base.join("7").join("pwsh.exe"));
+        pwsh_fallbacks.push(base.join("7-preview").join("pwsh.exe"));
+    }
+    pwsh_fallbacks.push(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        pwsh_fallbacks.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("pwsh.exe"),
+        );
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        pwsh_fallbacks.push(PathBuf::from(home).join("scoop").join("shims").join("pwsh.exe"));
+    }
+    pwsh_fallbacks
+}
+
+fn winps_fallback_candidates() -> Vec<PathBuf> {
+    let mut winps_fallbacks = Vec::new();
+    if let Some(sys_root) = std::env::var_os("SystemRoot") {
+        winps_fallbacks.push(
+            PathBuf::from(sys_root)
                 .join("System32")
                 .join("WindowsPowerShell")
                 .join("v1.0")
-                .join("powershell.exe");
-            if is_existing_executable_entry(&win_ps) {
-                return Some(win_ps);
-            }
-        }
-        None
+                .join("powershell.exe"),
+        );
+    }
+    winps_fallbacks
+}
+
+fn resolve_pwsh_exe() -> Option<PathBuf> {
+    resolve_cached_exe("pwsh", || {
+        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        let pwsh_fallbacks = pwsh_fallback_candidates();
+        let winps_fallbacks = winps_fallback_candidates();
+        resolve_pwsh_from(&path_dirs, &pwsh_fallbacks, &winps_fallbacks)
     })
+}
+
+/// Resolves an optional user-configured `shell_exe` override; falls back to auto-detected
+/// `resolve_pwsh_exe()` only when `shell_exe` is `None` or blank.
+pub fn resolve_configured_shell_exe(shell_exe: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = shell_exe.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(resolve_pwsh_exe());
+    };
+    if raw.chars().any(char::is_control) {
+        return Err("terminal.json 中 shell_exe 包含控制字符".to_string());
+    }
+    let direct = PathBuf::from(raw);
+    if direct.components().count() > 1 || direct.is_absolute() {
+        if is_existing_executable_entry(&direct) {
+            return Ok(Some(direct));
+        }
+        return Err(format!("配置的 shell_exe 不存在或为目录: {raw}"));
+    }
+    if let Some(in_path) = find_exe_in_path(&[raw]) {
+        return Ok(Some(in_path));
+    }
+    if !raw.to_ascii_lowercase().ends_with(".exe") {
+        let with_exe = format!("{raw}.exe");
+        if let Some(in_path) = find_exe_in_path(&[&with_exe]) {
+            return Ok(Some(in_path));
+        }
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower == "pwsh" || lower == "pwsh.exe" {
+        if let Some(fb) = first_existing_file(&pwsh_fallback_candidates()) {
+            return Ok(Some(fb));
+        }
+    } else if lower == "powershell" || lower == "powershell.exe" {
+        if let Some(fb) = first_existing_file(&winps_fallback_candidates()) {
+            return Ok(Some(fb));
+        }
+    }
+    if is_existing_executable_entry(&direct) {
+        return Ok(Some(direct));
+    }
+    Err(format!("未找到配置的 shell_exe: {raw}"))
 }
 
 fn resolve_wezterm_exe() -> Option<PathBuf> {
@@ -725,12 +856,366 @@ pub fn probe_terminal_availability() -> TerminalAvailability {
     }
 }
 
+const MAX_TERMINAL_PROFILES: usize = 16;
+const MAX_WT_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Strips `//` line comments, `/* ... */` block comments, and trailing commas outside string
+/// literals so Windows Terminal's JSONC `settings.json` can be parsed safely with `serde_json`.
+pub(crate) fn strip_jsonc(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut no_comments = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            no_comments.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            no_comments.push(b);
+            i += 1;
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                i += 1;
+            }
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            no_comments.push(b);
+            i += 1;
+        }
+    }
+
+    // Second pass: drop trailing commas before `}` or `]` outside strings.
+    let mut out = Vec::with_capacity(no_comments.len());
+    let mut j = 0;
+    in_str = false;
+    escaped = false;
+    while j < no_comments.len() {
+        let b = no_comments[j];
+        if in_str {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            j += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push(b);
+            j += 1;
+        } else if b == b',' {
+            let mut k = j + 1;
+            while k < no_comments.len() && no_comments[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < no_comments.len() && (no_comments[k] == b'}' || no_comments[k] == b']') {
+                j += 1;
+            } else {
+                out.push(b);
+                j += 1;
+            }
+        } else {
+            out.push(b);
+            j += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
+}
+
+fn extract_cmdline_exe_name(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else {
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+    let leaf = first.rsplit(['\\', '/']).next().unwrap_or("").trim();
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(leaf.to_ascii_lowercase())
+    }
+}
+
+/// Classifies a WT profile for Windows CLI resume compatibility.
+/// Returns `None` for non-Windows-CLI targets (WSL distros, Azure Cloud Shell, VS Debug Console).
+fn classify_wt_profile(
+    source: Option<&str>,
+    commandline: Option<&str>,
+    defaults_commandline: Option<&str>,
+) -> Option<WtProfileKind> {
+    if let Some(src) = source.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = src.to_ascii_lowercase();
+        if lower.contains("microsoft.wsl")
+            || lower.contains("windows.terminal.wsl")
+            || lower.contains("windows.terminal.azure")
+            || lower.contains("vsdebugconsole")
+        {
+            return None;
+        }
+        if lower.contains("powershellcore") {
+            return Some(WtProfileKind::PowerShell);
+        }
+    }
+    let eff_cmd = commandline
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| defaults_commandline.map(str::trim).filter(|s| !s.is_empty()));
+    if let Some(exe) = eff_cmd.and_then(extract_cmdline_exe_name) {
+        match exe.as_str() {
+            "wsl" | "wsl.exe" => return None,
+            "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => {
+                return Some(WtProfileKind::PowerShell);
+            }
+            "cmd" | "cmd.exe" => return Some(WtProfileKind::Cmd),
+            _ => return Some(WtProfileKind::Other),
+        }
+    }
+    Some(WtProfileKind::Other)
+}
+
+/// Parses compatible non-hidden Windows Terminal profiles from a `settings.json` (JSON or JSONC)
+/// body, excluding non-Windows-CLI profiles (WSL, Azure Cloud Shell, VS Debug Console).
+pub fn parse_wt_profiles_json(raw: &str) -> Vec<WtProfileEntry> {
+    let trimmed = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
+    let val: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => {
+            let cleaned = strip_jsonc(trimmed);
+            match serde_json::from_str(&cleaned) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            }
+        }
+    };
+    let Some(root) = val.as_object() else {
+        return Vec::new();
+    };
+    let default_guid = root
+        .get("defaultProfile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (list, defaults_elevate, defaults_cmdline) = match root.get("profiles") {
+        Some(Value::Object(pobj)) => {
+            let defaults_obj = pobj.get("defaults").and_then(Value::as_object);
+            let def_el = defaults_obj
+                .and_then(|d| d.get("elevate"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let def_cmd = defaults_obj
+                .and_then(|d| d.get("commandline"))
+                .and_then(Value::as_str);
+            let list = pobj.get("list").and_then(Value::as_array);
+            (list, def_el, def_cmd)
+        }
+        Some(Value::Array(arr)) => (Some(arr), false, None),
+        _ => (None, false, None),
+    };
+    let Some(items) = list else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<WtProfileEntry> = Vec::new();
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if obj.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+        else {
+            continue;
+        };
+        let source = obj.get("source").and_then(Value::as_str);
+        let commandline = obj.get("commandline").and_then(Value::as_str);
+        let Some(kind) = classify_wt_profile(source, commandline, defaults_cmdline) else {
+            continue;
+        };
+        if out.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let guid = obj.get("guid").and_then(Value::as_str).map(str::trim);
+        let is_default = match (default_guid, guid) {
+            (Some(dg), Some(g)) => dg.eq_ignore_ascii_case(g),
+            _ => false,
+        };
+        let elevate = obj
+            .get("elevate")
+            .and_then(Value::as_bool)
+            .unwrap_or(defaults_elevate);
+        out.push(WtProfileEntry {
+            name: name.to_string(),
+            is_default,
+            elevate,
+            kind,
+        });
+        if out.len() >= MAX_TERMINAL_PROFILES {
+            break;
+        }
+    }
+    // Pin default profile first while preserving user's relative order for the rest.
+    if let Some(pos) = out.iter().position(|e| e.is_default) {
+        if pos > 0 {
+            let def = out.remove(pos);
+            out.insert(0, def);
+        }
+    }
+    out
+}
+
+fn read_wt_profiles_file(path: &Path) -> Option<Vec<WtProfileEntry>> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_WT_SETTINGS_BYTES {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let parsed = parse_wt_profiles_json(&raw);
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+/// Strictly read-only, on-demand discovery of local Windows Terminal profiles (`settings.json`),
+/// honoring an optional explicit `wt_settings_path` override (e.g. portable or Canary WT).
+/// Rejects symlinks and oversized files; only call on menu open.
+pub fn discover_wt_profiles_with_override(override_path: Option<&str>) -> Vec<WtProfileEntry> {
+    if let Some(raw) = override_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+    {
+        if let Some(parsed) = read_wt_profiles_file(Path::new(raw)) {
+            return parsed;
+        }
+    }
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(local_app_data);
+    let candidates = [
+        base.join("Packages")
+            .join("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
+            .join("LocalState")
+            .join("settings.json"),
+        base.join("Packages")
+            .join("Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe")
+            .join("LocalState")
+            .join("settings.json"),
+        base.join("Packages")
+            .join("Microsoft.WindowsTerminalCanary_8wekyb3d8bbwe")
+            .join("LocalState")
+            .join("settings.json"),
+        base.join("Microsoft")
+            .join("Windows Terminal")
+            .join("settings.json"),
+    ];
+    for path in candidates {
+        if let Some(parsed) = read_wt_profiles_file(&path) {
+            return parsed;
+        }
+    }
+    Vec::new()
+}
+
+/// Strictly read-only, on-demand discovery of local Windows Terminal profiles (`settings.json`).
+pub fn discover_wt_profiles() -> Vec<WtProfileEntry> {
+    discover_wt_profiles_with_override(None)
+}
+
 /// Default path for optional companion `terminal.json` beside `gauge.exe`.
 pub fn default_terminal_config_path() -> Option<PathBuf> {
     default_companion_path("terminal.json")
 }
 
-/// Parses optional `terminal.json` content and overlays present fields onto `base`.
+fn parse_custom_terminal_obj(obj: &Map<String, Value>) -> Option<CustomTerminalConfig> {
+    let exe = obj
+        .get("exe")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let args: Vec<String> = obj
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !exe.trim().is_empty() {
+        Some(CustomTerminalConfig { exe, args })
+    } else {
+        None
+    }
+}
+
+fn parse_named_profile_obj(obj: &Map<String, Value>) -> Option<NamedTerminalProfile> {
+    let name = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))?
+        .to_string();
+    let preset = obj
+        .get("preset")
+        .and_then(Value::as_str)
+        .and_then(TerminalPreset::parse_str);
+    let wt_profile = obj
+        .get("wt_profile")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string());
+    let wt_new_window = obj.get("wt_new_window").and_then(Value::as_bool);
+    let keep_shell_open = obj.get("keep_shell_open").and_then(Value::as_bool);
+    let shell_exe = obj
+        .get("shell_exe")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string());
+    let custom = obj
+        .get("custom")
+        .and_then(Value::as_object)
+        .and_then(parse_custom_terminal_obj);
+    Some(NamedTerminalProfile {
+        name,
+        preset,
+        wt_profile,
+        wt_new_window,
+        keep_shell_open,
+        shell_exe,
+        custom,
+    })
+}
+
+/// Parses optional `terminal.json` content and overlays present fields (and any matching
+/// `active_profile` from `profiles`) onto `base`.
 pub fn parse_terminal_json(raw: &str, base: &TerminalConfig) -> Result<TerminalConfig, String> {
     let val: Value =
         serde_json::from_str(raw).map_err(|e| format!("terminal.json 解析失败: {e}"))?;
@@ -751,31 +1236,79 @@ pub fn parse_terminal_json(raw: &str, base: &TerminalConfig) -> Result<TerminalC
             Some(trimmed.to_string())
         };
     }
+    if let Some(wt_sp) = obj.get("wt_settings_path").and_then(Value::as_str) {
+        let trimmed = wt_sp.trim();
+        cfg.wt_settings_path = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
     if let Some(nw) = obj.get("wt_new_window").and_then(Value::as_bool) {
         cfg.wt_new_window = nw;
     }
     if let Some(ko) = obj.get("keep_shell_open").and_then(Value::as_bool) {
         cfg.keep_shell_open = ko;
     }
-    if let Some(custom_obj) = obj.get("custom").and_then(Value::as_object) {
-        let exe = custom_obj
-            .get("exe")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let args: Vec<String> = custom_obj
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !exe.trim().is_empty() {
-            cfg.custom = Some(CustomTerminalConfig { exe, args });
+    if let Some(sh) = obj.get("shell_exe").and_then(Value::as_str) {
+        let trimmed = sh.trim();
+        cfg.shell_exe = if trimmed.is_empty() {
+            None
         } else {
-            cfg.custom = None;
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(custom_obj) = obj.get("custom").and_then(Value::as_object) {
+        cfg.custom = parse_custom_terminal_obj(custom_obj);
+    }
+
+    let mut profiles: Vec<NamedTerminalProfile> = Vec::new();
+    if let Some(arr) = obj.get("profiles").and_then(Value::as_array) {
+        for item in arr {
+            let Some(pobj) = item.as_object() else {
+                continue;
+            };
+            let Some(prof) = parse_named_profile_obj(pobj) else {
+                continue;
+            };
+            if profiles.iter().any(|existing| existing.name == prof.name) {
+                continue;
+            }
+            profiles.push(prof);
+            if profiles.len() >= MAX_TERMINAL_PROFILES {
+                break;
+            }
+        }
+    }
+    cfg.profiles = profiles;
+
+    let active_req = obj
+        .get("active_profile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    cfg.active_profile = None;
+    if let Some(active_name) = active_req {
+        if let Some(prof) = cfg.profiles.iter().find(|p| p.name == active_name).cloned() {
+            cfg.active_profile = Some(prof.name);
+            if let Some(p) = prof.preset {
+                cfg.preset = p;
+            }
+            if let Some(wp) = prof.wt_profile {
+                cfg.wt_profile = if wp.is_empty() { None } else { Some(wp) };
+            }
+            if let Some(nw) = prof.wt_new_window {
+                cfg.wt_new_window = nw;
+            }
+            if let Some(ko) = prof.keep_shell_open {
+                cfg.keep_shell_open = ko;
+            }
+            if let Some(sh) = prof.shell_exe {
+                cfg.shell_exe = if sh.is_empty() { None } else { Some(sh) };
+            }
+            if let Some(c) = prof.custom {
+                cfg.custom = Some(c);
+            }
         }
     }
     Ok(cfg)
@@ -803,14 +1336,19 @@ pub fn load_effective_terminal_config(base: TerminalConfig) -> TerminalConfig {
     }
 }
 
-/// When `terminal.json` already exists beside `gauge.exe`, updates its `preset`, `wt_new_window`,
-/// and `keep_shell_open` keys atomically while preserving `wt_profile`, `custom`, and any unknown keys.
+/// When `terminal.json` already exists beside `gauge.exe`, updates its UI-managed keys atomically
+/// while preserving `shell_exe`, `custom`, `profiles`, and any unknown keys.
+/// If `active_profile` is `Some(name)`, keeps that named profile active and updates its toggle
+/// overrides (`wt_new_window` / `keep_shell_open`) when present; if `None`, clears `active_profile`
+/// and writes `preset` + `wt_profile` at the top level.
 /// Does nothing if `terminal.json` does not exist.
 pub fn sync_ui_prefs_to_terminal_json_if_exists(
     path: &Path,
     preset: TerminalPreset,
+    wt_profile: Option<&str>,
     wt_new_window: bool,
     keep_shell_open: bool,
+    active_profile: Option<&str>,
 ) -> Result<(), String> {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return Ok(());
@@ -823,9 +1361,74 @@ pub fn sync_ui_prefs_to_terminal_json_if_exists(
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    map.insert("preset".to_string(), Value::String(preset.as_str().to_string()));
-    map.insert("wt_new_window".to_string(), Value::Bool(wt_new_window));
-    map.insert("keep_shell_open".to_string(), Value::Bool(keep_shell_open));
+    if let Some(active_name) = active_profile.map(str::trim).filter(|s| !s.is_empty()) {
+        map.insert(
+            "active_profile".to_string(),
+            Value::String(active_name.to_string()),
+        );
+        let mut updated_profile_toggles = false;
+        if let Some(Value::Array(arr)) = map.get_mut("profiles") {
+            for item in arr.iter_mut() {
+                let Some(pobj) = item.as_object_mut() else {
+                    continue;
+                };
+                if pobj.get("name").and_then(Value::as_str).map(str::trim) == Some(active_name) {
+                    if pobj.contains_key("wt_new_window") {
+                        pobj.insert("wt_new_window".to_string(), Value::Bool(wt_new_window));
+                    }
+                    if pobj.contains_key("keep_shell_open") {
+                        pobj.insert("keep_shell_open".to_string(), Value::Bool(keep_shell_open));
+                    }
+                    updated_profile_toggles = true;
+                    break;
+                }
+            }
+        }
+        if !updated_profile_toggles {
+            map.insert("wt_new_window".to_string(), Value::Bool(wt_new_window));
+            map.insert("keep_shell_open".to_string(), Value::Bool(keep_shell_open));
+        } else {
+            // Also keep top-level toggles in sync for fields inherited by the active profile.
+            map.insert("wt_new_window".to_string(), Value::Bool(wt_new_window));
+            map.insert("keep_shell_open".to_string(), Value::Bool(keep_shell_open));
+        }
+    } else {
+        map.insert("preset".to_string(), Value::String(preset.as_str().to_string()));
+        map.insert(
+            "wt_profile".to_string(),
+            Value::String(wt_profile.unwrap_or("").trim().to_string()),
+        );
+        map.insert("wt_new_window".to_string(), Value::Bool(wt_new_window));
+        map.insert("keep_shell_open".to_string(), Value::Bool(keep_shell_open));
+        if map.contains_key("active_profile") {
+            map.insert("active_profile".to_string(), Value::String(String::new()));
+        }
+    }
+    let body = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|e| format!("序列化 terminal.json 失败: {e}"))?;
+    atomic_write_json(path, &format!("{body}\n"))
+}
+
+/// Switches `active_profile` inside an existing `terminal.json` without mutating top-level base fields.
+pub fn set_active_profile_in_terminal_json(
+    path: &Path,
+    active_profile: Option<&str>,
+) -> Result<(), String> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Ok(());
+    }
+    let mut map: Map<String, Value> = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    map.insert(
+        "active_profile".to_string(),
+        Value::String(active_profile.unwrap_or("").trim().to_string()),
+    );
     let body = serde_json::to_string_pretty(&Value::Object(map))
         .map_err(|e| format!("序列化 terminal.json 失败: {e}"))?;
     atomic_write_json(path, &format!("{body}\n"))
@@ -868,8 +1471,12 @@ pub fn ensure_default_terminal_json(dir: &Path, current: &TerminalConfig) -> Res
     let doc = json!({
         "preset": current.preset.as_str(),
         "wt_profile": current.wt_profile.as_deref().unwrap_or(""),
+        "wt_settings_path": current.wt_settings_path.as_deref().unwrap_or(""),
+        "shell_exe": current.shell_exe.as_deref().unwrap_or(""),
         "wt_new_window": current.wt_new_window,
         "keep_shell_open": current.keep_shell_open,
+        "active_profile": current.active_profile.as_deref().unwrap_or(""),
+        "profiles": [],
         "custom": {
             "exe": custom_exe,
             "args": custom_args,
@@ -1569,15 +2176,18 @@ pub fn launch_resume_session_with_config(
         )
     })?;
     let exe_str = validate_exe_path_for_shell(&cli_exe, false, spec.command_name)?;
-    fn get_pwsh<'a>(slot: &'a mut Option<Option<PathBuf>>) -> Option<&'a Path> {
-        slot.get_or_insert_with(resolve_pwsh_exe).as_deref()
-    }
     let (used_dir, workspace_fallback) = resolve_launch_dir(ws);
-    let mut pwsh_exe_slot: Option<Option<PathBuf>> = None;
+    let mut pwsh_exe_slot: Option<Result<Option<PathBuf>, String>> = None;
+    let get_shell = |slot: &mut Option<Result<Option<PathBuf>, String>>| -> Result<Option<PathBuf>, String> {
+        match slot.get_or_insert_with(|| resolve_configured_shell_exe(config.shell_exe.as_deref())) {
+            Ok(p) => Ok(p.clone()),
+            Err(e) => Err(e.clone()),
+        }
+    };
 
     match config.preset {
         TerminalPreset::WtPwsh => {
-            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let pwsh_opt = get_shell(&mut pwsh_exe_slot)?;
             let wt_args = build_wt_args_inner(
                 spec,
                 &cli_exe,
@@ -1585,7 +2195,7 @@ pub fn launch_resume_session_with_config(
                 cid,
                 &used_dir,
                 tab_title,
-                pwsh_opt,
+                pwsh_opt.as_deref(),
                 true,
                 config.wt_profile.as_deref(),
                 config.wt_new_window,
@@ -1598,7 +2208,7 @@ pub fn launch_resume_session_with_config(
                     workspace_fallback,
                 });
             }
-            if let Some(pwsh) = get_pwsh(&mut pwsh_exe_slot) {
+            if let Some(pwsh) = pwsh_opt.as_deref() {
                 let pwsh_args = build_pwsh_args_inner(spec, &exe_str, cid, config.keep_shell_open);
                 if spawn_pwsh_console(pwsh, &used_dir, &pwsh_args) {
                     return Ok(LaunchOutcome {
@@ -1617,7 +2227,7 @@ pub fn launch_resume_session_with_config(
         }
         TerminalPreset::WtDirect => {
             let shim_shell = if is_batch_shim(&cli_exe) {
-                get_pwsh(&mut pwsh_exe_slot)
+                get_shell(&mut pwsh_exe_slot)?
             } else {
                 None
             };
@@ -1628,7 +2238,7 @@ pub fn launch_resume_session_with_config(
                 cid,
                 &used_dir,
                 tab_title,
-                shim_shell,
+                shim_shell.as_deref(),
                 false,
                 config.wt_profile.as_deref(),
                 config.wt_new_window,
@@ -1641,9 +2251,9 @@ pub fn launch_resume_session_with_config(
                     workspace_fallback,
                 });
             }
-            if let Some(pwsh) = get_pwsh(&mut pwsh_exe_slot) {
+            if let Some(pwsh) = get_shell(&mut pwsh_exe_slot)? {
                 let pwsh_args = build_pwsh_args_inner(spec, &exe_str, cid, config.keep_shell_open);
-                if spawn_pwsh_console(pwsh, &used_dir, &pwsh_args) {
+                if spawn_pwsh_console(&pwsh, &used_dir, &pwsh_args) {
                     return Ok(LaunchOutcome {
                         backend: LaunchBackend::Pwsh,
                         used_dir,
@@ -1660,8 +2270,8 @@ pub fn launch_resume_session_with_config(
         }
         TerminalPreset::Pwsh => {
             let pwsh_args = build_pwsh_args_inner(spec, &exe_str, cid, config.keep_shell_open);
-            if let Some(pwsh) = get_pwsh(&mut pwsh_exe_slot) {
-                if spawn_pwsh_console(pwsh, &used_dir, &pwsh_args) {
+            if let Some(pwsh) = get_shell(&mut pwsh_exe_slot)? {
+                if spawn_pwsh_console(&pwsh, &used_dir, &pwsh_args) {
                     return Ok(LaunchOutcome {
                         backend: LaunchBackend::Pwsh,
                         used_dir,
@@ -1687,13 +2297,17 @@ pub fn launch_resume_session_with_config(
             let wez = resolve_wezterm_exe().ok_or_else(|| {
                 "未检测到 WezTerm，请安装或在右键「恢复终端」中切换其他终端".to_string()
             })?;
-            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let pwsh_opt = if config.keep_shell_open || is_batch_shim(&cli_exe) {
+                get_shell(&mut pwsh_exe_slot)?
+            } else {
+                None
+            };
             let args = build_wezterm_args_for_source(
                 source,
                 &cli_exe,
                 cid,
                 &used_dir,
-                pwsh_opt,
+                pwsh_opt.as_deref(),
                 config.keep_shell_open,
             )?;
             Command::new(&wez)
@@ -1713,13 +2327,17 @@ pub fn launch_resume_session_with_config(
             let ala = resolve_alacritty_exe().ok_or_else(|| {
                 "未检测到 Alacritty，请安装或在右键「恢复终端」中切换其他终端".to_string()
             })?;
-            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let pwsh_opt = if config.keep_shell_open || is_batch_shim(&cli_exe) {
+                get_shell(&mut pwsh_exe_slot)?
+            } else {
+                None
+            };
             let args = build_alacritty_args_for_source(
                 source,
                 &cli_exe,
                 cid,
                 &used_dir,
-                pwsh_opt,
+                pwsh_opt.as_deref(),
                 config.keep_shell_open,
             )?;
             Command::new(&ala)
@@ -1773,7 +2391,11 @@ pub fn launch_resume_session_with_config(
                 "请先在 terminal.json 中配置 custom.exe（右键托盘 -> 恢复终端 -> 打开 / 生成 terminal.json）"
                     .to_string()
             })?;
-            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let pwsh_opt = if custom.args.iter().any(|a| a.contains("{pwsh}")) {
+                get_shell(&mut pwsh_exe_slot)?
+            } else {
+                None
+            };
             let (custom_exe, args) = build_custom_terminal_launch(
                 custom,
                 source,
@@ -1781,7 +2403,7 @@ pub fn launch_resume_session_with_config(
                 cid,
                 &used_dir,
                 tab_title,
-                pwsh_opt,
+                pwsh_opt.as_deref(),
             )?;
             Command::new(&custom_exe)
                 .current_dir(&used_dir)
@@ -2210,6 +2832,58 @@ mod tests {
         // A directory named `codex.exe` must not be returned as an executable
         fs::create_dir_all(dir1.join("codex.exe")).unwrap();
         assert_eq!(find_cli_in_dirs("codex", &[dir1.clone(), dir2.clone()]), None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_resolve_pwsh_prefers_pwsh7_over_earlier_winps_in_path() {
+        let base = std::env::temp_dir().join(format!("agy_gauge_pwsh_prio_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let sys_winps = base.join("System32_WinPS");
+        let ps7_dir = base.join("PowerShell7");
+        let fb_ps7_dir = base.join("FallbackPS7");
+        fs::create_dir_all(&sys_winps).unwrap();
+        fs::create_dir_all(&ps7_dir).unwrap();
+        fs::create_dir_all(&fb_ps7_dir).unwrap();
+
+        let winps_exe = sys_winps.join("powershell.exe");
+        let ps7_exe = ps7_dir.join("pwsh.exe");
+        let fb_ps7_exe = fb_ps7_dir.join("pwsh.exe");
+        fs::write(&winps_exe, "MZ").unwrap();
+        fs::write(&ps7_exe, "MZ").unwrap();
+        fs::write(&fb_ps7_exe, "MZ").unwrap();
+
+        // 1) Explorer PATH order: System32\WindowsPowerShell\v1.0 precedes PowerShell\7 -> MUST pick pwsh.exe!
+        assert_eq!(
+            resolve_pwsh_from(&[sys_winps.clone(), ps7_dir.clone()], &[], &[]),
+            Some(ps7_exe.clone())
+        );
+
+        // 2) Stale Explorer PATH has WindowsPowerShell\v1.0 but not PowerShell\7 -> fallback pwsh.exe still wins!
+        assert_eq!(
+            resolve_pwsh_from(&[sys_winps.clone()], &[fb_ps7_exe.clone()], &[]),
+            Some(fb_ps7_exe.clone())
+        );
+
+        // 3) No pwsh.exe anywhere -> cleanly falls back to Windows PowerShell in PATH, then fallback list
+        let missing_ps7 = base.join("missing").join("pwsh.exe");
+        assert_eq!(
+            resolve_pwsh_from(&[sys_winps.clone()], &[missing_ps7.clone()], &[]),
+            Some(winps_exe.clone())
+        );
+        assert_eq!(
+            resolve_pwsh_from(&[], &[missing_ps7], &[winps_exe.clone()]),
+            Some(winps_exe.clone())
+        );
+
+        // 4) Generic `find_exe_in_dirs` also prioritizes executable name order across all PATH dirs
+        fs::write(sys_winps.join("wezterm-gui.exe"), "MZ").unwrap();
+        fs::write(ps7_dir.join("wezterm.exe"), "MZ").unwrap();
+        assert_eq!(
+            find_exe_in_dirs(&["wezterm.exe", "wezterm-gui.exe"], &[sys_winps, ps7_dir.clone()]),
+            Some(ps7_dir.join("wezterm.exe"))
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2651,7 +3325,15 @@ mod tests {
         assert!(!parsed.keep_shell_open);
         assert_eq!(parsed.custom.as_ref().map(|c| c.args.len()), Some(5));
 
-        sync_ui_prefs_to_terminal_json_if_exists(&cfg_path, TerminalPreset::WtPwsh, false, true).unwrap();
+        sync_ui_prefs_to_terminal_json_if_exists(
+            &cfg_path,
+            TerminalPreset::WtPwsh,
+            Some("PowerShell (proxy)"),
+            false,
+            true,
+            None,
+        )
+        .unwrap();
         let synced = load_terminal_config_from(&cfg_path, TerminalConfig::default());
         assert_eq!(synced.preset, TerminalPreset::WtPwsh);
         assert!(!synced.wt_new_window);
@@ -2666,8 +3348,75 @@ mod tests {
 
         // `sync_ui_prefs_to_terminal_json_if_exists` does NOT create file when absent
         let absent = base.join("sub").join("terminal.json");
-        sync_ui_prefs_to_terminal_json_if_exists(&absent, TerminalPreset::WezTerm, true, false).unwrap();
+        sync_ui_prefs_to_terminal_json_if_exists(&absent, TerminalPreset::WezTerm, None, true, false, None).unwrap();
         assert!(!absent.exists());
+
+        // Named multi-profiles + `shell_exe` override + `active_profile` overlay & clearing
+        let fake_shell = base.join("pwsh-custom.exe");
+        fs::write(&fake_shell, "MZ").unwrap();
+        assert_eq!(
+            resolve_configured_shell_exe(Some(&fake_shell.to_string_lossy())).unwrap(),
+            Some(fake_shell.clone())
+        );
+        assert!(resolve_configured_shell_exe(Some(&base.join("missing-shell.exe").to_string_lossy())).is_err());
+        assert!(resolve_configured_shell_exe(Some("bad\nshell.exe")).is_err());
+
+        let multi_json = json!({
+            "preset": "wt_pwsh",
+            "wt_profile": "PowerShell",
+            "shell_exe": fake_shell.to_string_lossy(),
+            "wt_new_window": false,
+            "keep_shell_open": true,
+            "active_profile": "代理终端",
+            "profiles": [
+                {
+                    "name": "代理终端",
+                    "wt_profile": "PowerShell (proxy)",
+                    "wt_new_window": true
+                },
+                {
+                    "name": "WezTerm 极简",
+                    "preset": "wezterm",
+                    "wt_profile": "",
+                    "shell_exe": "",
+                    "keep_shell_open": false
+                }
+            ]
+        });
+        fs::write(&cfg_path, serde_json::to_string_pretty(&multi_json).unwrap()).unwrap();
+        let p_proxy = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(p_proxy.active_profile.as_deref(), Some("代理终端"));
+        assert_eq!(p_proxy.preset, TerminalPreset::WtPwsh);
+        assert_eq!(p_proxy.wt_profile.as_deref(), Some("PowerShell (proxy)"));
+        assert!(p_proxy.wt_new_window);
+        assert!(p_proxy.keep_shell_open);
+        assert_eq!(p_proxy.shell_exe.as_deref(), Some(fake_shell.to_string_lossy().as_ref()));
+        assert_eq!(p_proxy.profiles.len(), 2);
+
+        // Switching active profile via helper preserves top-level fields and applies explicit clears
+        set_active_profile_in_terminal_json(&cfg_path, Some("WezTerm 极简")).unwrap();
+        let p_wez = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(p_wez.active_profile.as_deref(), Some("WezTerm 极简"));
+        assert_eq!(p_wez.preset, TerminalPreset::WezTerm);
+        assert_eq!(p_wez.wt_profile, None);
+        assert_eq!(p_wez.shell_exe, None);
+        assert!(!p_wez.keep_shell_open);
+
+        // Selecting a built-in preset clears `active_profile` cleanly
+        sync_ui_prefs_to_terminal_json_if_exists(
+            &cfg_path,
+            TerminalPreset::WtDirect,
+            Some("PowerShell"),
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let p_direct = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(p_direct.active_profile, None);
+        assert_eq!(p_direct.preset, TerminalPreset::WtDirect);
+        assert_eq!(p_direct.wt_profile.as_deref(), Some("PowerShell"));
+        assert_eq!(p_direct.profiles.len(), 2);
 
         // Preset u8 & string roundtrip
         for p in TerminalPreset::ALL {
@@ -2675,6 +3424,74 @@ mod tests {
             assert_eq!(TerminalPreset::parse_str(p.as_str()), Some(p));
         }
         assert_eq!(TerminalPreset::from_u8(255), TerminalPreset::WtPwsh);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_parse_wt_profiles_jsonc_defaults_and_hidden_filter() {
+        let jsonc = r#"{
+            // Windows Terminal comment with "quotes" and /* nested */
+            "defaultProfile": "{574e775e-4f2a-5b96-ac1e-a2962a402336}",
+            "profiles": {
+                "defaults": {
+                    "elevate": false,
+                    "font": { "face": "Maple Mono" },
+                },
+                "list": [
+                    { "guid": "{61c54bbd-c2c6-5271-96e7-009a87ff44bf}", "name": "Windows PowerShell", "commandline": "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "elevate": true, "hidden": false },
+                    { "guid": "{hidden-1}", "name": "Azure Cloud Shell", "source": "Windows.Terminal.Azure", "hidden": true },
+                    { "guid": "{azure-vis}", "name": "Azure Visible", "source": "Windows.Terminal.Azure", "hidden": false },
+                    { "guid": "{wsl-1}", "name": "Ubuntu", "source": "Microsoft.WSL", "hidden": false },
+                    { "guid": "{wsl-2}", "name": "WSL Direct", "commandline": "wsl.exe -d Debian" },
+                    { "guid": "{cmd-1}", "name": "命令提示符", "commandline": "%SystemRoot%\\System32\\cmd.exe" },
+                    /* block comment */
+                    { "guid": "{574e775e-4f2a-5b96-ac1e-a2962a402336}", "name": "PowerShell", "source": "Windows.Terminal.PowershellCore", "commandline": "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo" },
+                    { "guid": "{ef66d8ae-d4d3-4370-aa8a-28a64c3b451b}", "name": "PowerShell (proxy)", "commandline": "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo", "elevate": false },
+                    { "guid": "{nu-1}", "name": "Nushell", "commandline": "C:\\Tools\\nu.exe" },
+                    { "guid": "{dup}", "name": "powershell" },
+                ],
+            },
+        }"#;
+        let profiles = parse_wt_profiles_json(jsonc);
+        assert_eq!(profiles.len(), 5);
+        // Default profile is pinned first
+        assert_eq!(profiles[0].name, "PowerShell");
+        assert!(profiles[0].is_default);
+        assert!(!profiles[0].elevate);
+        assert_eq!(profiles[0].kind, WtProfileKind::PowerShell);
+        // WSL & Azure profiles filtered out; Cmd & Other classified accurately
+        assert_eq!(profiles[1].name, "Windows PowerShell");
+        assert!(profiles[1].elevate);
+        assert_eq!(profiles[1].kind, WtProfileKind::PowerShell);
+        assert_eq!(profiles[2].name, "命令提示符");
+        assert_eq!(profiles[2].kind, WtProfileKind::Cmd);
+        assert_eq!(profiles[3].name, "PowerShell (proxy)");
+        assert_eq!(profiles[3].kind, WtProfileKind::PowerShell);
+        assert_eq!(profiles[4].name, "Nushell");
+        assert_eq!(profiles[4].kind, WtProfileKind::Other);
+
+        // `discover_wt_profiles_with_override` reads an explicit custom settings.json path
+        let base = std::env::temp_dir().join(format!("gauge_wt_override_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let custom_wt = base.join("settings.json");
+        fs::write(&custom_wt, jsonc).unwrap();
+        let discovered = discover_wt_profiles_with_override(Some(&custom_wt.to_string_lossy()));
+        assert_eq!(discovered.len(), 5);
+        assert_eq!(discovered[0].name, "PowerShell");
+
+        // `wt_settings_path` round-trips through `terminal.json`
+        let cfg_raw = json!({
+            "preset": "wt_pwsh",
+            "wt_settings_path": custom_wt.to_string_lossy(),
+        })
+        .to_string();
+        let parsed_cfg = parse_terminal_json(&cfg_raw, &TerminalConfig::default()).unwrap();
+        assert_eq!(
+            parsed_cfg.wt_settings_path.as_deref(),
+            Some(custom_wt.to_string_lossy().as_ref())
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

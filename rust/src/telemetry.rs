@@ -111,7 +111,7 @@ pub fn migrate_legacy_pill_items(mini: bool, pill_metric: u8) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct UserPrefs {
     pub light_theme: bool,
     pub mini: bool,
@@ -133,6 +133,7 @@ pub struct UserPrefs {
     pub terminal_preset: u8,
     pub terminal_new_window: bool,
     pub terminal_keep_open: bool,
+    pub terminal_wt_profile: String,
 }
 
 impl Default for UserPrefs {
@@ -158,6 +159,7 @@ impl Default for UserPrefs {
             terminal_preset: 0, // Default to TerminalPreset::WtPwsh
             terminal_new_window: false,
             terminal_keep_open: true,
+            terminal_wt_profile: String::new(),
         }
     }
 }
@@ -192,6 +194,30 @@ fn reg_read_u32_from(subkey: PCWSTR, name: PCWSTR) -> Option<u32> {
         );
         if status.is_ok() {
             Some(val)
+        } else {
+            None
+        }
+    }
+}
+
+fn reg_read_string_from(subkey: PCWSTR, name: PCWSTR) -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 512];
+        let mut sz: u32 = (buf.len() * size_of::<u16>()) as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey,
+            name,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut sz),
+        );
+        if status.is_ok() {
+            let units = (sz as usize / size_of::<u16>()).min(buf.len());
+            let end = buf[..units].iter().position(|&c| c == 0).unwrap_or(units);
+            let s = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+            Some(s)
         } else {
             None
         }
@@ -269,6 +295,11 @@ fn load_user_prefs_from(subkey: PCWSTR) -> UserPrefs {
     if let Some(v) = reg_read_u32_from(subkey, w!("terminal_keep_open")) {
         p.terminal_keep_open = v != 0;
     }
+    if let Some(s) = reg_read_string_from(subkey, w!("terminal_wt_profile")) {
+        if !s.chars().any(char::is_control) {
+            p.terminal_wt_profile = s;
+        }
+    }
     p
 }
 
@@ -338,6 +369,15 @@ pub fn save_user_prefs(p: &UserPrefs) {
         for (name, val) in entries {
             let bytes = val.to_le_bytes();
             let _ = RegSetValueExW(hkey, name, 0, REG_DWORD, Some(&bytes));
+        }
+        let wt_prof = p.terminal_wt_profile.trim();
+        if wt_prof.is_empty() || wt_prof.chars().any(char::is_control) {
+            let _ = RegDeleteValueW(hkey, w!("terminal_wt_profile"));
+        } else {
+            let wide: Vec<u16> = wt_prof.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes: &[u8] =
+                std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * size_of::<u16>());
+            let _ = RegSetValueExW(hkey, w!("terminal_wt_profile"), 0, REG_SZ, Some(bytes));
         }
         let _ = RegCloseKey(hkey);
     }
