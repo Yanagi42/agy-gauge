@@ -9,7 +9,8 @@
 
 use chrono::NaiveDate;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -613,11 +614,33 @@ struct FileSig {
     len: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedRule {
+    CustomExact(usize),
+    CustomPrefix(usize),
+    Builtin(usize),
+    Unpriced,
+}
+
+const RATE_CACHE_MAX: usize = 512;
+
+#[derive(Debug)]
 pub struct PricingCatalog {
     override_path: Option<PathBuf>,
     override_sig: Option<FileSig>,
     custom_rules: Vec<CustomRateRule>,
+    rate_cache: RefCell<HashMap<String, ResolvedRule>>,
+}
+
+impl Clone for PricingCatalog {
+    fn clone(&self) -> Self {
+        Self {
+            override_path: self.override_path.clone(),
+            override_sig: self.override_sig,
+            custom_rules: self.custom_rules.clone(),
+            rate_cache: RefCell::new(HashMap::new()),
+        }
+    }
 }
 
 impl Default for PricingCatalog {
@@ -632,6 +655,7 @@ impl PricingCatalog {
             override_path,
             override_sig: None,
             custom_rules: Vec::new(),
+            rate_cache: RefCell::new(HashMap::new()),
         };
         cat.refresh();
         cat
@@ -657,14 +681,15 @@ impl PricingCatalog {
     /// Re-checks `pricing.json` mtime/size and reloads strictly read-only if changed.
     /// Returns `true` if effective pricing rules changed.
     pub fn refresh(&mut self) -> bool {
-        let Some(path) = self.override_path.clone() else {
+        let Some(path) = self.override_path.as_deref() else {
             return false;
         };
-        let sig = regular_file_sig(&path);
+        let sig = regular_file_sig(path);
         if sig == self.override_sig {
             return false;
         }
         self.override_sig = sig;
+        self.rate_cache.borrow_mut().clear();
         match sig {
             None => {
                 let had = !self.custom_rules.is_empty();
@@ -672,7 +697,7 @@ impl PricingCatalog {
                 had
             }
             Some(_) => {
-                self.custom_rules = load_custom_rules(&path);
+                self.custom_rules = load_custom_rules(path);
                 true
             }
         }
@@ -760,68 +785,112 @@ impl PricingCatalog {
         Ok(true)
     }
 
+    fn resolve_target(&self, model: &str) -> ResolvedRule {
+        if let Some(&hit) = self.rate_cache.borrow().get(model) {
+            return hit;
+        }
+        let target = self.resolve_target_uncached(model);
+        let mut cache = self.rate_cache.borrow_mut();
+        if cache.len() < RATE_CACHE_MAX {
+            cache.insert(model.to_string(), target);
+        }
+        target
+    }
+
+    fn resolve_target_uncached(&self, model: &str) -> ResolvedRule {
+        if model.is_empty() || model == "unknown" || model == "compaction" || model == "(上下文压缩)" {
+            return ResolvedRule::Unpriced;
+        }
+        let exact = canonical_exact_key(model);
+        let norm = strip_effort_suffix_slice(&exact);
+        if norm.is_empty() || norm == "unknown" || norm == "compaction" {
+            return ResolvedRule::Unpriced;
+        }
+
+        // 1. Exact custom key match (preserves effort suffix like `gemini-4-neon-xhigh`).
+        if let Some((idx, _)) = self
+            .custom_rules
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.exact_key == exact)
+        {
+            return ResolvedRule::CustomExact(idx);
+        }
+
+        // 2. Prefix/family custom match (longest matching prefix wins; skip rules explicitly scoped to an effort suffix).
+        let mut best_custom: Option<(usize, usize)> = None;
+        for (idx, rule) in self.custom_rules.iter().enumerate() {
+            if rule.has_effort_suffix {
+                continue;
+            }
+            if matches_model_prefix(norm, &rule.prefix) {
+                let take = match best_custom {
+                    None => true,
+                    Some((_, prev_len)) => rule.prefix.len() > prev_len,
+                };
+                if take {
+                    best_custom = Some((idx, rule.prefix.len()));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_custom {
+            return ResolvedRule::CustomPrefix(idx);
+        }
+
+        // 3. Built-in public API catalog.
+        for (idx, spec) in BUILTIN_SPECS.iter().enumerate() {
+            for &p in spec.prefixes {
+                if matches_model_prefix(norm, p) {
+                    return ResolvedRule::Builtin(idx);
+                }
+            }
+        }
+        ResolvedRule::Unpriced
+    }
+
     pub fn resolve_detail(
         &self,
         model: &str,
         total_input_tokens: u64,
         date: Option<NaiveDate>,
     ) -> Option<(ModelRate, PriceSource, String)> {
-        let exact = canonical_exact_key(model);
-        let norm = normalize_model_key(model);
-        if norm.is_empty() || norm == "unknown" || norm == "compaction" || model == "(上下文压缩)" {
-            return None;
-        }
-
-        // 1. Exact custom key match (preserves effort suffix like `gemini-4-neon-xhigh`).
-        if let Some(rule) = self.custom_rules.iter().find(|r| r.exact_key == exact) {
-            return Some((
-                rule.resolve(total_input_tokens),
-                PriceSource::CustomExact,
-                rule.raw_key.clone(),
-            ));
-        }
-
-        // 2. Prefix/family custom match (longest matching prefix wins; skip rules explicitly scoped to an effort suffix).
-        let mut best_custom: Option<&CustomRateRule> = None;
-        for rule in &self.custom_rules {
-            if rule.has_effort_suffix {
-                continue;
+        match self.resolve_target(model) {
+            ResolvedRule::CustomExact(idx) => {
+                let rule = &self.custom_rules[idx];
+                Some((
+                    rule.resolve(total_input_tokens),
+                    PriceSource::CustomExact,
+                    rule.raw_key.clone(),
+                ))
             }
-            if matches_model_prefix(&norm, &rule.prefix) {
-                let take = match best_custom {
-                    None => true,
-                    Some(prev) => rule.prefix.len() > prev.prefix.len(),
-                };
-                if take {
-                    best_custom = Some(rule);
-                }
+            ResolvedRule::CustomPrefix(idx) => {
+                let rule = &self.custom_rules[idx];
+                Some((
+                    rule.resolve(total_input_tokens),
+                    PriceSource::CustomPrefix,
+                    rule.raw_key.clone(),
+                ))
             }
-        }
-        if let Some(rule) = best_custom {
-            return Some((
-                rule.resolve(total_input_tokens),
-                PriceSource::CustomPrefix,
-                rule.raw_key.clone(),
-            ));
-        }
-
-        // 3. Built-in public API catalog.
-        for spec in BUILTIN_SPECS {
-            for &p in spec.prefixes {
-                if matches_model_prefix(&norm, p) {
-                    return Some((
-                        spec.resolve(total_input_tokens, date),
-                        PriceSource::Builtin,
-                        spec.display.to_string(),
-                    ));
-                }
+            ResolvedRule::Builtin(idx) => {
+                let spec = &BUILTIN_SPECS[idx];
+                Some((
+                    spec.resolve(total_input_tokens, date),
+                    PriceSource::Builtin,
+                    spec.display.to_string(),
+                ))
             }
+            ResolvedRule::Unpriced => None,
         }
-        None
     }
 
     pub fn resolve_rate(&self, model: &str, total_input_tokens: u64, date: Option<NaiveDate>) -> Option<ModelRate> {
-        self.resolve_detail(model, total_input_tokens, date).map(|(r, _, _)| r)
+        match self.resolve_target(model) {
+            ResolvedRule::CustomExact(idx) | ResolvedRule::CustomPrefix(idx) => {
+                Some(self.custom_rules[idx].resolve(total_input_tokens))
+            }
+            ResolvedRule::Builtin(idx) => Some(BUILTIN_SPECS[idx].resolve(total_input_tokens, date)),
+            ResolvedRule::Unpriced => None,
+        }
     }
 
     pub fn price_turn(
@@ -1017,18 +1086,26 @@ pub fn canonical_exact_key(raw: &str) -> String {
     s.replace(['@', '.', '_'], "-")
 }
 
-/// Normalize model names to lowercase hyphen-separated base tokens for family/prefix matching.
-pub fn normalize_model_key(raw: &str) -> String {
-    let mut s = canonical_exact_key(raw);
+fn strip_effort_suffix_slice(exact: &str) -> &str {
     for suffix in EFFORT_SUFFIXES {
-        if let Some(stripped) = s.strip_suffix(suffix) {
+        if let Some(stripped) = exact.strip_suffix(suffix) {
             if !stripped.is_empty() {
-                s = stripped.to_string();
-                break;
+                return stripped;
             }
         }
     }
-    s
+    exact
+}
+
+/// Normalize model names to lowercase hyphen-separated base tokens for family/prefix matching.
+pub fn normalize_model_key(raw: &str) -> String {
+    let exact = canonical_exact_key(raw);
+    let stripped = strip_effort_suffix_slice(&exact);
+    if stripped.len() == exact.len() {
+        exact
+    } else {
+        stripped.to_string()
+    }
 }
 
 fn matches_model_prefix(norm: &str, prefix: &str) -> bool {
@@ -1351,6 +1428,7 @@ mod tests {
             override_path: None,
             override_sig: None,
             custom_rules: rules,
+            rate_cache: RefCell::new(HashMap::new()),
         };
         let r1 = cat.resolve_rate("gemini-4-neon-xhigh", 10_000, None).unwrap();
         assert_eq!(r1.input, 1.0);

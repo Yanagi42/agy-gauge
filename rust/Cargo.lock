@@ -91,6 +91,8 @@ name = "gauge"
 version = "1.2.0"
 dependencies = [
  "chrono",
+ "memchr",
+ "serde",
  "serde_json",
  "windows",
 ]

@@ -1,12 +1,22 @@
 //! Zero-subprocess Win32 system telemetry, multi-monitor geometry, DWM & clipboard helpers.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::mem::{size_of, zeroed};
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::core::{PCWSTR, PWSTR, w};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, GlobalFree, HANDLE, HWND, LPARAM, POINT, RECT};
+use windows::core::{s, w, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_IO_PENDING, ERROR_NOTIFY_ENUM_DIR,
+    ERROR_OPERATION_ABORTED, FILETIME, GetLastError, GlobalFree, HANDLE, HWND, LPARAM, POINT,
+    RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_CLOAKED,
     DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -16,8 +26,18 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Memory::{
+    GetProcessHeap, GlobalAlloc, GlobalLock, GlobalUnlock, HeapCompact, GMEM_MOVEABLE, HEAP_FLAGS,
+};
 use windows::Win32::System::ProcessStatus::{
     K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
@@ -26,8 +46,14 @@ use windows::Win32::System::Registry::{
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_READ, KEY_SET_VALUE,
     KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows::Win32::System::SystemInformation::{GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO};
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetSystemTimes};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, GetCurrentProcess, GetSystemTimes, ResetEvent, SetEvent,
+    WaitForMultipleObjects, INFINITE,
+};
 use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
@@ -42,11 +68,12 @@ use windows::Win32::UI::Shell::{
     QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, RegisterWindowMessageW, SetWindowPos, SystemParametersInfoW,
-    GWL_EXSTYLE, GW_HWNDPREV, HICON, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOWPOS, WM_APP, WS_EX_TOPMOST,
+    FindWindowW, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    IsIconic, IsWindow, IsWindowVisible, PostMessageW, RegisterWindowMessageW,
+    SetCoalescableTimer, SetWindowPos, SystemParametersInfoW, GWL_EXSTYLE, GW_HWNDPREV, HICON,
+    HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SPI_GETWORKAREA, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    TIMERV_DEFAULT_COALESCING, WINDOWPOS, WM_APP, WS_EX_TOPMOST,
 };
 
 pub const WM_APP_SYNC_PREFS: u32 = WM_APP + 1;
@@ -103,6 +130,9 @@ pub struct UserPrefs {
     pub pill_metric: u8,
     pub pill_items: u32,
     pub custom_pos: Option<(i32, i32)>,
+    pub terminal_preset: u8,
+    pub terminal_new_window: bool,
+    pub terminal_keep_open: bool,
 }
 
 impl Default for UserPrefs {
@@ -125,6 +155,9 @@ impl Default for UserPrefs {
             pill_metric: 0,
             pill_items: PILL_ITEMS_DEFAULT,
             custom_pos: None,
+            terminal_preset: 0, // Default to TerminalPreset::WtPwsh
+            terminal_new_window: false,
+            terminal_keep_open: true,
         }
     }
 }
@@ -227,6 +260,15 @@ fn load_user_prefs_from(subkey: PCWSTR) -> UserPrefs {
             p.custom_pos = Some((x as i32, y as i32));
         }
     }
+    if let Some(v) = reg_read_u32_from(subkey, w!("terminal_preset")) {
+        p.terminal_preset = v.min(7) as u8;
+    }
+    if let Some(v) = reg_read_u32_from(subkey, w!("terminal_new_window")) {
+        p.terminal_new_window = v != 0;
+    }
+    if let Some(v) = reg_read_u32_from(subkey, w!("terminal_keep_open")) {
+        p.terminal_keep_open = v != 0;
+    }
     p
 }
 
@@ -269,7 +311,7 @@ pub fn save_user_prefs(p: &UserPrefs) {
             if m != 0 { m } else { PILL_ITEMS_DEFAULT }
         };
         let derived_mini = (pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) == 0;
-        let entries: [(PCWSTR, u32); 19] = [
+        let entries: [(PCWSTR, u32); 22] = [
             (w!("light_theme"), u32::from(p.light_theme)),
             (w!("mini"), u32::from(derived_mini)),
             (w!("topmost"), u32::from(p.topmost)),
@@ -289,6 +331,9 @@ pub fn save_user_prefs(p: &UserPrefs) {
             (w!("has_custom_pos"), has_pos),
             (w!("pos_x"), px),
             (w!("pos_y"), py),
+            (w!("terminal_preset"), p.terminal_preset.min(7) as u32),
+            (w!("terminal_new_window"), u32::from(p.terminal_new_window)),
+            (w!("terminal_keep_open"), u32::from(p.terminal_keep_open)),
         ];
         for (name, val) in entries {
             let bytes = val.to_le_bytes();
@@ -300,13 +345,14 @@ pub fn save_user_prefs(p: &UserPrefs) {
 
 /// Find which monitor contains point (cx, cy) (checking full monitor bounds, fallback nearest).
 pub fn monitor_index_for_point(cx: i32, cy: i32) -> Option<usize> {
-    let mons = get_monitors();
-    for (idx, m) in mons.iter().enumerate() {
-        if cx >= m.monitor.left && cx <= m.monitor.right && cy >= m.monitor.top && cy <= m.monitor.bottom {
-            return Some(idx);
+    with_cached_monitors(|mons| {
+        for (idx, m) in mons.iter().enumerate() {
+            if cx >= m.monitor.left && cx <= m.monitor.right && cy >= m.monitor.top && cy <= m.monitor.bottom {
+                return Some(idx);
+            }
         }
-    }
-    None
+        None
+    })
 }
 
 fn nearest_monitor_idx(mons: &[MonitorDesc], cx: i32, cy: i32) -> usize {
@@ -406,14 +452,12 @@ pub fn clamp_pos_in_list(
 /// target monitor's work area (never sliding behind the taskbar!), while allowing horizontal
 /// drag smoothly across connected monitors.
 pub fn clamp_pos_to_monitors(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) -> (i32, i32) {
-    let mons = get_monitors();
-    clamp_pos_in_list(&mons, x, y, w, h, shadow_px, false)
+    with_cached_monitors(|mons| clamp_pos_in_list(mons, x, y, w, h, shadow_px, false))
 }
 
 /// Clamp a settled/saved pill position strictly inside its target monitor's work area.
 pub fn clamp_pos_to_work_area(x: i32, y: i32, w: i32, h: i32, shadow_px: i32) -> (i32, i32) {
-    let mons = get_monitors();
-    clamp_pos_in_list(&mons, x, y, w, h, shadow_px, true)
+    with_cached_monitors(|mons| clamp_pos_in_list(mons, x, y, w, h, shadow_px, true))
 }
 
 /// Computes the layered window `(win_x, win_y)` for the tray-hover capsule flyout so that the
@@ -515,8 +559,7 @@ pub fn compute_tray_flyout_pos(
     shadow_px: i32,
     scale: f32,
 ) -> (i32, i32) {
-    let mons = get_monitors();
-    compute_tray_flyout_pos_in_list(&mons, icon, px_w, px_h, shadow_px, scale)
+    with_cached_monitors(|mons| compute_tray_flyout_pos_in_list(mons, icon, px_w, px_h, shadow_px, scale))
 }
 
 /// Returns `true` while the cursor stays on the tray icon, on the popped-up capsule, or inside
@@ -650,12 +693,14 @@ impl Drop for SingleInstanceGuard {
 pub struct SystemTelemetry {
     prev_times: Option<(u64, u64, u64)>,
     cpu_cores: u32,
+    max_samples: usize,
     pub history: VecDeque<TelemetrySample>,
     pub latest: TelemetrySample,
 }
 
 impl SystemTelemetry {
     pub fn new(cap: usize) -> Self {
+        let max_samples = cap.max(1);
         let cpu_cores = unsafe {
             let mut si: SYSTEM_INFO = zeroed();
             GetSystemInfo(&mut si);
@@ -663,7 +708,6 @@ impl SystemTelemetry {
         };
         let prev_times = read_sys_times();
         let (mem_pct, mem_used_gb, mem_total_gb, mem_avail_gb) = read_memory();
-        let self_mb = read_self_private_mb();
         let initial = TelemetrySample {
             timestamp: now_secs(),
             cpu_pct: 0.0,
@@ -671,15 +715,30 @@ impl SystemTelemetry {
             mem_used_gb,
             mem_total_gb,
             mem_avail_gb,
-            self_mb,
+            self_mb: 0.0,
             cpu_cores,
         };
         Self {
             prev_times,
             cpu_cores,
-            history: VecDeque::with_capacity(cap),
+            max_samples,
+            history: VecDeque::with_capacity(max_samples),
             latest: initial,
         }
+    }
+
+    /// Re-primes the CPU baseline after long idle/lock/sleep pauses so the next tick reflects
+    /// fresh load rather than an average across the paused period.
+    pub fn reset_cpu_baseline(&mut self) {
+        self.prev_times = read_sys_times();
+    }
+
+    /// Queries self process private memory (`K32GetProcessMemoryInfo`) on demand
+    /// (called only while Dashboard `Tab::System` is visible or during `--self-test`).
+    pub fn refresh_self_private_mb(&mut self) -> f32 {
+        let mb = read_self_private_mb();
+        self.latest.self_mb = mb;
+        mb
     }
 
     pub fn sample(&mut self) -> TelemetrySample {
@@ -702,7 +761,6 @@ impl SystemTelemetry {
         }
 
         let (mem_pct, mem_used_gb, mem_total_gb, mem_avail_gb) = read_memory();
-        let self_mb = read_self_private_mb();
 
         let sample = TelemetrySample {
             timestamp: now_secs(),
@@ -711,12 +769,12 @@ impl SystemTelemetry {
             mem_used_gb,
             mem_total_gb,
             mem_avail_gb,
-            self_mb,
+            self_mb: self.latest.self_mb,
             cpu_cores: self.cpu_cores,
         };
         self.latest = sample;
         if has_cpu_delta {
-            if self.history.len() == self.history.capacity() {
+            while self.history.len() >= self.max_samples {
                 self.history.pop_front();
             }
             self.history.push_back(sample);
@@ -804,10 +862,702 @@ pub fn read_self_working_set_mb() -> f32 {
     }
 }
 
+/// Compacts the Win32 default process heap so empty LFH/segment pages are decommitted back to
+/// the OS (reducing Private Bytes, not just Working Set).
+pub fn compact_self_heap() {
+    unsafe {
+        if let Ok(heap) = GetProcessHeap() {
+            let _ = HeapCompact(heap, HEAP_FLAGS(0));
+        }
+    }
+}
+
 /// Politely return idle dashboard pages (WARP / font cache) of THIS process only to Windows Standby RAM.
 pub fn trim_self_working_set() {
     unsafe {
         let _ = K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+/// Compacts the process heap first so decommitted pages release Private Bytes, then trims idle
+/// Working Set pages to Standby RAM. Call only on discrete lifecycle transitions (startup settle,
+/// dashboard hide, pill surface release) — NEVER inside a periodic timer loop.
+pub fn compact_heap_and_trim_working_set() {
+    compact_self_heap();
+    trim_self_working_set();
+}
+
+/// Schedules a Windows 8+ coalescable Win32 timer so idle wakeups align with OS timer coalescing
+/// for better CPU package C-state residency.
+pub fn set_coalesced_timer(hwnd: HWND, id: usize, elapse_ms: u32, tolerance_ms: u32) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    let tol = if tolerance_ms == 0 {
+        TIMERV_DEFAULT_COALESCING
+    } else {
+        tolerance_ms
+    };
+    unsafe {
+        let _ = SetCoalescableTimer(hwnd, id, elapse_ms.max(10), None, tol);
+    }
+}
+
+pub fn register_session_notifications(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_ok() }
+}
+
+pub fn unregister_session_notifications(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = WTSUnRegisterSessionNotification(hwnd);
+    }
+}
+
+/// Dynamically registers `GUID_CONSOLE_DISPLAY_STATE` (`WM_POWERBROADCAST` / `PBT_POWERSETTINGCHANGE`)
+/// via `user32.dll` so Gauge pauses telemetry when the monitor turns off without extra crate features.
+pub struct ConsoleDisplayPowerGuard {
+    handle: *mut core::ffi::c_void,
+}
+
+#[repr(C)]
+struct GuidRaw {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+#[repr(C)]
+struct PowerBroadcastSettingHeader {
+    power_setting: GuidRaw,
+    data_length: u32,
+    data: [u8; 4],
+}
+
+// {6FE69556-704A-47A0-8F24-C28D936FDA47} = GUID_CONSOLE_DISPLAY_STATE
+const GUID_CONSOLE_DISPLAY_STATE_RAW: GuidRaw = GuidRaw {
+    data1: 0x6FE6_9556,
+    data2: 0x704A,
+    data3: 0x47A0,
+    data4: [0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47],
+};
+
+impl ConsoleDisplayPowerGuard {
+    pub fn register(hwnd: HWND) -> Option<Self> {
+        if hwnd.0.is_null() {
+            return None;
+        }
+        unsafe {
+            let user32 = GetModuleHandleW(w!("user32.dll")).ok()?;
+            let func = GetProcAddress(user32, s!("RegisterPowerSettingNotification"))?;
+            let register_fn: unsafe extern "system" fn(
+                HANDLE,
+                *const GuidRaw,
+                u32,
+            ) -> *mut core::ffi::c_void = std::mem::transmute(func);
+            // DEVICE_NOTIFY_WINDOW_HANDLE = 0
+            let h = register_fn(HANDLE(hwnd.0), &GUID_CONSOLE_DISPLAY_STATE_RAW, 0);
+            if h.is_null() {
+                None
+            } else {
+                Some(Self { handle: h })
+            }
+        }
+    }
+}
+
+impl Drop for ConsoleDisplayPowerGuard {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        unsafe {
+            if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
+                if let Some(func) = GetProcAddress(user32, s!("UnregisterPowerSettingNotification")) {
+                    let unregister_fn: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32 =
+                        std::mem::transmute(func);
+                    let _ = unregister_fn(self.handle);
+                }
+            }
+        }
+        self.handle = ptr::null_mut();
+    }
+}
+
+/// Parses `PBT_POWERSETTINGCHANGE` `lparam` for `GUID_CONSOLE_DISPLAY_STATE`.
+/// Returns `Some(0)` when display is OFF, `Some(1)` when ON, `Some(2)` when dimmed.
+pub fn parse_console_display_state(lparam: LPARAM) -> Option<u32> {
+    if lparam.0 == 0 {
+        return None;
+    }
+    unsafe {
+        let hdr = &*(lparam.0 as *const PowerBroadcastSettingHeader);
+        let g = &hdr.power_setting;
+        if g.data1 == GUID_CONSOLE_DISPLAY_STATE_RAW.data1
+            && g.data2 == GUID_CONSOLE_DISPLAY_STATE_RAW.data2
+            && g.data3 == GUID_CONSOLE_DISPLAY_STATE_RAW.data3
+            && g.data4 == GUID_CONSOLE_DISPLAY_STATE_RAW.data4
+            && hdr.data_length >= 4
+        {
+            Some(u32::from_le_bytes(hdr.data))
+        } else {
+            None
+        }
+    }
+}
+
+fn u16_eq_ascii_icase(units: &[u16], ascii: &[u8]) -> bool {
+    if units.len() != ascii.len() {
+        return false;
+    }
+    units
+        .iter()
+        .zip(ascii.iter())
+        .all(|(&u, &b)| u <= 0x7F && (u as u8).eq_ignore_ascii_case(&b))
+}
+
+fn u16_ends_with_ascii_icase(units: &[u16], suffix: &[u8]) -> bool {
+    if units.len() < suffix.len() {
+        return false;
+    }
+    u16_eq_ascii_icase(&units[units.len() - suffix.len()..], suffix)
+}
+
+fn u16_starts_with_ascii_icase(units: &[u16], prefix: &[u8]) -> bool {
+    if units.len() < prefix.len() {
+        return false;
+    }
+    u16_eq_ascii_icase(&units[..prefix.len()], prefix)
+}
+
+fn u16_file_name(units: &[u16]) -> &[u16] {
+    match units.iter().rposition(|&c| c == b'\\' as u16 || c == b'/' as u16) {
+        Some(pos) => &units[pos + 1..],
+        None => units,
+    }
+}
+
+fn u16_has_rejected_dir_segment(units: &[u16]) -> bool {
+    // Only check directory components (excluding the trailing file name itself).
+    let Some(last_sep) = units.iter().rposition(|&c| c == b'\\' as u16 || c == b'/' as u16) else {
+        return false;
+    };
+    for seg in units[..last_sep].split(|&c| c == b'\\' as u16 || c == b'/' as u16) {
+        if seg.is_empty() {
+            continue;
+        }
+        if u16_eq_ascii_icase(seg, b"steps")
+            || u16_eq_ascii_icase(seg, b"scratch")
+            || u16_eq_ascii_icase(seg, b"tasks")
+            || u16_eq_ascii_icase(seg, b"conversations")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Zero-allocation UTF-16 relative-path filter for `ReadDirectoryChangesW` events.
+/// Rejects noisy agent scratch/step/log/media/SQLite/temp writes and Gauge's own `archive.json`
+/// so the UI thread is woken only for whitelisted token/config inputs.
+pub fn is_watched_rel_path_relevant_u16(rel_units: &[u16], subtree: bool) -> bool {
+    if rel_units.is_empty() {
+        return false;
+    }
+    let name = u16_file_name(rel_units);
+    if name.is_empty() {
+        return false;
+    }
+
+    if !subtree {
+        // Companion / exe directory: ONLY wake on external companion JSON inputs (never archive.json / *.tmp).
+        return u16_eq_ascii_icase(name, b"statusline_state.json")
+            || u16_eq_ascii_icase(name, b"pricing.json")
+            || u16_eq_ascii_icase(name, b"budget.json")
+            || u16_eq_ascii_icase(name, b"session_meta.json");
+    }
+
+    // Agent log subtree (`brain/`, `annotations/`, `cache/`, `projects/`, `sessions/`, `tmp/`, etc.):
+    // 1) Reject high-churn noisy subdirectories (`steps\`, `scratch\`, `tasks\`, `conversations\`).
+    if u16_has_rejected_dir_segment(rel_units) {
+        return false;
+    }
+
+    // 2) Explicitly reject temp, SQLite/DB, image, markdown, text, and non-whitelisted secret/archive files.
+    for bad_ext in [
+        b".tmp".as_slice(),
+        b".part",
+        b".bak",
+        b".swp",
+        b".log",
+        b".sqlite",
+        b".sqlite3",
+        b".sqlite-wal",
+        b".sqlite-shm",
+        b".sqlite-journal",
+        b".db",
+        b".db-wal",
+        b".db-shm",
+        b".db-journal",
+        b".png",
+        b".jpg",
+        b".jpeg",
+        b".webp",
+        b".gif",
+        b".svg",
+        b".ico",
+        b".md",
+        b".txt",
+        b".py",
+        b".lock",
+    ] {
+        if u16_ends_with_ascii_icase(name, bad_ext) {
+            return false;
+        }
+    }
+    for bad_name in [
+        b"archive.json".as_slice(),
+        b"history.jsonl",
+        b"auth.json",
+        b"oauth_creds.json",
+        b"google_accounts.json",
+        b".credentials.json",
+    ] {
+        if u16_eq_ascii_icase(name, bad_name) {
+            return false;
+        }
+    }
+    if u16_starts_with_ascii_icase(name, b"settings") && u16_ends_with_ascii_icase(name, b".json") {
+        return false;
+    }
+
+    // 3) Accept whitelisted filenames and JSON/JSONL/PBTXT log files.
+    u16_eq_ascii_icase(name, b"transcript.jsonl")
+        || u16_eq_ascii_icase(name, b"transcript_full.jsonl")
+        || u16_eq_ascii_icase(name, b"conversation_metadata.json")
+        || u16_eq_ascii_icase(name, b"sessions-index.json")
+        || u16_eq_ascii_icase(name, b"session_index.jsonl")
+        || u16_eq_ascii_icase(name, b"projects.json")
+        || u16_eq_ascii_icase(name, b".project_root")
+        || u16_ends_with_ascii_icase(name, b".pbtxt")
+        || u16_ends_with_ascii_icase(name, b".jsonl")
+        || u16_ends_with_ascii_icase(name, b".json")
+}
+
+const WATCHER_HINT_CAP: usize = 64;
+
+/// Coalesced file-change hints collected by `DirWatcher` between debounce windows.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WatcherHints {
+    pub paths: Vec<PathBuf>,
+    pub overflow: bool,
+    pub has_companion_change: bool,
+}
+
+impl WatcherHints {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && !self.overflow && !self.has_companion_change
+    }
+
+    /// Records a relevant relative path under `watch_dir`.
+    /// Returns `true` ONLY on the empty -> non-empty transition so the watcher thread posts
+    /// at most one `PostMessageW` wakeup per debounce window.
+    pub fn record_rel_u16(&mut self, watch_dir: &Path, rel_units: &[u16], subtree: bool) -> bool {
+        let was_empty = self.is_empty();
+        if !subtree {
+            self.has_companion_change = true;
+            return was_empty;
+        }
+        if self.overflow {
+            return false;
+        }
+        let full = watch_dir.join(OsString::from_wide(rel_units));
+        if !self.paths.iter().any(|p| p == &full) {
+            if self.paths.len() >= WATCHER_HINT_CAP {
+                self.paths.clear();
+                self.overflow = true;
+            } else {
+                self.paths.push(full);
+            }
+        }
+        was_empty
+    }
+
+    /// Marks the hint queue overflowed (triggers full fallback scan).
+    /// Returns `true` ONLY on the empty -> non-empty transition.
+    pub fn mark_overflow(&mut self) -> bool {
+        let was_empty = self.is_empty();
+        self.paths.clear();
+        self.overflow = true;
+        was_empty
+    }
+}
+
+/// Parses a raw `FILE_NOTIFY_INFORMATION` buffer returned by `ReadDirectoryChangesW`,
+/// rejecting noisy files with zero heap allocations and locking `queue` lazily only when
+/// at least one whitelisted path matches. Returns `true` if `queue` transitioned empty -> non-empty.
+fn collect_notify_buffer_into_queue(
+    buf: &[u32],
+    bytes_returned: usize,
+    watch_dir: &Path,
+    subtree: bool,
+    queue: &Mutex<WatcherHints>,
+) -> bool {
+    let raw_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * size_of::<u32>())
+    };
+    let limit = bytes_returned.min(raw_bytes.len());
+    let header_sz = size_of::<FILE_NOTIFY_INFORMATION>();
+    if limit < header_sz {
+        return false;
+    }
+
+    let mut guard: Option<std::sync::MutexGuard<'_, WatcherHints>> = None;
+    let mut should_notify = false;
+    let mut offset = 0usize;
+    while offset + header_sz <= limit {
+        // Every FILE_NOTIFY_INFORMATION entry is DWORD-aligned (4 bytes).
+        if offset % 4 != 0 {
+            break;
+        }
+        let info = unsafe { &*(raw_bytes.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION) };
+        let name_bytes = info.FileNameLength as usize;
+        // FileName begins immediately after NextEntryOffset (4) + Action (4) + FileNameLength (4) = 12 bytes.
+        let name_start = offset + 12;
+        if name_bytes >= 2 && name_start + name_bytes <= limit {
+            let units = unsafe {
+                std::slice::from_raw_parts(
+                    raw_bytes.as_ptr().add(name_start) as *const u16,
+                    name_bytes / 2,
+                )
+            };
+            if is_watched_rel_path_relevant_u16(units, subtree) {
+                if guard.is_none() {
+                    guard = queue.lock().ok();
+                }
+                if let Some(ref mut g) = guard {
+                    if g.record_rel_u16(watch_dir, units, subtree) {
+                        should_notify = true;
+                    }
+                }
+            }
+        }
+        if info.NextEntryOffset == 0 {
+            break;
+        }
+        let next = offset.saturating_add(info.NextEntryOffset as usize);
+        if next <= offset {
+            break;
+        }
+        offset = next;
+    }
+    should_notify
+}
+
+struct WatchSlot {
+    watch_dir: PathBuf,
+    dir_handle: HANDLE,
+    event_handle: HANDLE,
+    subtree: bool,
+    active: bool,
+    // Heap-pinned so kernel overlapped I/O pointers remain valid even if the outer Vec mutates.
+    ov: Box<OVERLAPPED>,
+    // 4 KiB DWORD-aligned buffer for FILE_NOTIFY_INFORMATION records.
+    buf: Box<[u32; 1024]>,
+}
+
+impl WatchSlot {
+    unsafe fn arm(&mut self, filter: FILE_NOTIFY_CHANGE) -> bool {
+        let _ = ResetEvent(self.event_handle);
+        *self.ov = zeroed();
+        self.ov.hEvent = self.event_handle;
+        let res = ReadDirectoryChangesW(
+            self.dir_handle,
+            self.buf.as_mut_ptr().cast(),
+            (self.buf.len() * size_of::<u32>()) as u32,
+            self.subtree,
+            filter,
+            None,
+            Some(&mut *self.ov),
+            None,
+        );
+        match res {
+            Ok(()) => {
+                self.active = true;
+                true
+            }
+            Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
+                self.active = true;
+                true
+            }
+            Err(_) => {
+                self.active = false;
+                false
+            }
+        }
+    }
+
+    unsafe fn cancel_and_close(mut self) {
+        if self.active {
+            let _ = CancelIoEx(self.dir_handle, Some(&*self.ov));
+            let mut dummy = 0u32;
+            // Wait synchronously until kernel cancels the pending overlapped request so `ov` and `buf`
+            // are guaranteed no longer referenced by the OS before being dropped.
+            let _ = GetOverlappedResult(self.dir_handle, &*self.ov, &mut dummy, true);
+            self.active = false;
+        }
+        let _ = CloseHandle(self.event_handle);
+        let _ = CloseHandle(self.dir_handle);
+    }
+}
+
+/// Lightweight sleeping directory-change watcher using overlapped `ReadDirectoryChangesW` +
+/// `WaitForMultipleObjects` with strict UTF-16 filename filtering and targeted path hint queuing.
+/// Consumes 0% CPU while idle and posts at most one UI wakeup per debounce window.
+pub struct DirWatcher {
+    stop_event: HANDLE,
+    hints: Arc<Mutex<WatcherHints>>,
+    healthy: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl DirWatcher {
+    pub fn start(watches: Vec<(PathBuf, bool)>, notify_hwnd: HWND, notify_msg: u32) -> Option<Self> {
+        if notify_hwnd.0.is_null() || watches.is_empty() {
+            return None;
+        }
+        let mut unique: Vec<(PathBuf, bool)> = Vec::new();
+        for (dir, subtree) in watches {
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(existing) = unique.iter_mut().find(|(p, _)| *p == dir) {
+                existing.1 |= subtree;
+                continue;
+            }
+            unique.push((dir, subtree));
+            if unique.len() >= 63 {
+                // MAXIMUM_WAIT_OBJECTS = 64; index 0 is reserved for stop_event.
+                break;
+            }
+        }
+        if unique.is_empty() {
+            return None;
+        }
+
+        let stop_event = unsafe { CreateEventW(None, true, false, None).ok()? };
+        let stop_raw = stop_event.0 as isize;
+        let hwnd_raw = notify_hwnd.0 as isize;
+        let hints = Arc::new(Mutex::new(WatcherHints::default()));
+        let hints_bg = Arc::clone(&hints);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let healthy_bg = Arc::clone(&healthy);
+
+        let builder = thread::Builder::new()
+            .name("gauge-watch".to_string())
+            .stack_size(64 * 1024);
+
+        let join = match builder.spawn(move || {
+            let stop_h = HANDLE(stop_raw as *mut core::ffi::c_void);
+            let target_hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            let filter = FILE_NOTIFY_CHANGE_FILE_NAME
+                | FILE_NOTIFY_CHANGE_DIR_NAME
+                | FILE_NOTIFY_CHANGE_SIZE
+                | FILE_NOTIFY_CHANGE_LAST_WRITE;
+
+            let expected_slots = unique.len();
+            let mut slots: Vec<WatchSlot> = Vec::with_capacity(expected_slots);
+            for (dir, subtree) in unique {
+                let wide = to_wide_null(&dir.to_string_lossy());
+                let dir_h = unsafe {
+                    CreateFileW(
+                        wide_pcwstr(&wide),
+                        FILE_LIST_DIRECTORY.0,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        None,
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                        None,
+                    )
+                };
+                let Ok(dir_handle) = dir_h else {
+                    continue;
+                };
+                if dir_handle.is_invalid() || dir_handle.0.is_null() {
+                    continue;
+                }
+                let Ok(event_handle) = (unsafe { CreateEventW(None, true, false, None) }) else {
+                    unsafe {
+                        let _ = CloseHandle(dir_handle);
+                    }
+                    continue;
+                };
+                let mut slot = WatchSlot {
+                    watch_dir: dir,
+                    dir_handle,
+                    event_handle,
+                    subtree,
+                    active: false,
+                    ov: Box::new(OVERLAPPED::default()),
+                    buf: Box::new([0u32; 1024]),
+                };
+                if unsafe { slot.arm(filter) } {
+                    slots.push(slot);
+                } else {
+                    unsafe { slot.cancel_and_close() };
+                }
+            }
+
+            if slots.len() < expected_slots || slots.is_empty() {
+                healthy_bg.store(false, Ordering::Release);
+            }
+
+            let mut wait_handles: Vec<HANDLE> = Vec::with_capacity(slots.len() + 1);
+            if !slots.is_empty() {
+                loop {
+                    wait_handles.clear();
+                    wait_handles.push(stop_h);
+                    for s in &slots {
+                        wait_handles.push(s.event_handle);
+                    }
+                    let wait = unsafe { WaitForMultipleObjects(&wait_handles, false, INFINITE) };
+                    if wait == WAIT_OBJECT_0 {
+                        break;
+                    }
+                    let base = WAIT_OBJECT_0.0;
+                    if wait.0 < base || (wait.0 - base) as usize >= wait_handles.len() {
+                        healthy_bg.store(false, Ordering::Release);
+                        break;
+                    }
+                    let slot_idx = (wait.0 - base) as usize - 1;
+                    let mut bytes_returned = 0u32;
+                    let ov_res = unsafe {
+                        GetOverlappedResult(
+                            slots[slot_idx].dir_handle,
+                            &*slots[slot_idx].ov,
+                            &mut bytes_returned,
+                            false,
+                        )
+                    };
+                    slots[slot_idx].active = false;
+
+                    let (mut should_post, fatal) = match ov_res {
+                        Ok(()) => {
+                            if bytes_returned == 0 {
+                                // Kernel notify buffer overflowed: force a fallback full scan.
+                                let post = hints_bg
+                                    .lock()
+                                    .map(|mut g| g.mark_overflow())
+                                    .unwrap_or(true);
+                                (post, false)
+                            } else {
+                                let post = collect_notify_buffer_into_queue(
+                                    &*slots[slot_idx].buf,
+                                    bytes_returned as usize,
+                                    &slots[slot_idx].watch_dir,
+                                    slots[slot_idx].subtree,
+                                    &hints_bg,
+                                );
+                                (post, false)
+                            }
+                        }
+                        Err(e) if e.code() == ERROR_NOTIFY_ENUM_DIR.to_hresult() => {
+                            let post = hints_bg
+                                .lock()
+                                .map(|mut g| g.mark_overflow())
+                                .unwrap_or(true);
+                            (post, false)
+                        }
+                        Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => (false, true),
+                        Err(_) => (false, true),
+                    };
+
+                    if fatal || !unsafe { slots[slot_idx].arm(filter) } {
+                        healthy_bg.store(false, Ordering::Release);
+                        if let Ok(mut g) = hints_bg.lock() {
+                            if g.mark_overflow() {
+                                should_post = true;
+                            }
+                        }
+                        let dead = slots.remove(slot_idx);
+                        unsafe { dead.cancel_and_close() };
+                        if slots.is_empty() {
+                            if should_post {
+                                unsafe {
+                                    let _ = PostMessageW(target_hwnd, notify_msg, WPARAM(0), LPARAM(0));
+                                }
+                            }
+                            break;
+                        }
+                    }
+
+                    if should_post {
+                        unsafe {
+                            let _ = PostMessageW(target_hwnd, notify_msg, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+            }
+
+            healthy_bg.store(false, Ordering::Release);
+            for slot in slots {
+                unsafe { slot.cancel_and_close() };
+            }
+        }) {
+            Ok(j) => j,
+            Err(_) => {
+                unsafe {
+                    let _ = CloseHandle(stop_event);
+                }
+                return None;
+            }
+        };
+
+        Some(Self {
+            stop_event,
+            hints,
+            healthy,
+            join: Some(join),
+        })
+    }
+
+    /// Returns `true` when all requested watched directories are actively armed on the OS watcher.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Drains all queued file-change hints since the last scan, resetting the queue to empty
+    /// so the next relevant change posts a fresh UI notification.
+    pub fn drain_hints(&self) -> WatcherHints {
+        match self.hints.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => WatcherHints {
+                paths: Vec::new(),
+                overflow: true,
+                has_companion_change: false,
+            },
+        }
+    }
+}
+
+impl Drop for DirWatcher {
+    fn drop(&mut self) {
+        self.healthy.store(false, Ordering::Release);
+        unsafe {
+            let _ = SetEvent(self.stop_event);
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        unsafe {
+            let _ = CloseHandle(self.stop_event);
+        }
     }
 }
 
@@ -841,7 +1591,29 @@ pub fn dpi_for_point(x: i32, y: i32) -> f32 {
     }
 }
 
-pub fn get_monitors() -> Vec<MonitorDesc> {
+fn monitors_cache() -> &'static Mutex<Option<Vec<MonitorDesc>>> {
+    static CACHE: OnceLock<Mutex<Option<Vec<MonitorDesc>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Invalidates the cached monitor geometry list (call on `WM_DISPLAYCHANGE`,
+/// `WM_DPICHANGED`, and `WM_SETTINGCHANGE(SPI_SETWORKAREA)`).
+pub fn invalidate_monitors_cache() {
+    if let Ok(mut guard) = monitors_cache().lock() {
+        *guard = None;
+    }
+}
+
+fn with_cached_monitors<R>(f: impl FnOnce(&[MonitorDesc]) -> R) -> R {
+    if let Ok(mut guard) = monitors_cache().lock() {
+        let list = guard.get_or_insert_with(enumerate_monitors_uncached);
+        return f(list);
+    }
+    let fresh = enumerate_monitors_uncached();
+    f(&fresh)
+}
+
+fn enumerate_monitors_uncached() -> Vec<MonitorDesc> {
     struct RawMon {
         is_primary: bool,
         monitor: RECT,
@@ -917,20 +1689,25 @@ pub fn get_monitors() -> Vec<MonitorDesc> {
         .collect()
 }
 
+pub fn get_monitors() -> Vec<MonitorDesc> {
+    with_cached_monitors(|mons| mons.to_vec())
+}
+
 pub fn get_work_area(monitor_index: usize) -> RECT {
-    let mons = get_monitors();
-    if let Some(m) = mons.get(monitor_index) {
-        m.work
-    } else if let Some(m) = mons.first() {
-        m.work
-    } else {
-        RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
+    with_cached_monitors(|mons| {
+        if let Some(m) = mons.get(monitor_index) {
+            m.work
+        } else if let Some(m) = mons.first() {
+            m.work
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            }
         }
-    }
+    })
 }
 
 pub fn apply_win11_frame(hwnd: HWND, dark: bool, caption_colorref: u32) {
@@ -1064,6 +1841,51 @@ pub fn is_other_app_fullscreen() -> bool {
             ),
             Err(_) => false,
         }
+    }
+}
+
+/// Gates `SHQueryUserNotificationState()` behind foreground HWND + rect change detection
+/// with a 4-second fallback so idle ticks avoid redundant Explorer/Shell IPC queries.
+#[derive(Default)]
+pub struct FullscreenProbe {
+    last_fg: isize,
+    last_fg_rect: RECT,
+    last_checked: Option<Instant>,
+    last_result: bool,
+}
+
+impl FullscreenProbe {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn invalidate(&mut self) {
+        self.last_checked = None;
+    }
+
+    pub fn check(&mut self, now: Instant) -> bool {
+        let (fg_raw, fg_rect) = unsafe {
+            let fg = GetForegroundWindow();
+            let mut rc = RECT::default();
+            if !fg.0.is_null() {
+                let _ = GetWindowRect(fg, &mut rc);
+            }
+            (fg.0 as isize, rc)
+        };
+        if let Some(prev) = self.last_checked {
+            if fg_raw == self.last_fg
+                && fg_rect == self.last_fg_rect
+                && now.duration_since(prev) < Duration::from_secs(4)
+            {
+                return self.last_result;
+            }
+        }
+        let res = is_other_app_fullscreen();
+        self.last_fg = fg_raw;
+        self.last_fg_rect = fg_rect;
+        self.last_checked = Some(now);
+        self.last_result = res;
+        res
     }
 }
 
@@ -1345,15 +2167,19 @@ pub fn set_self_tray_icon_taskbar_promoted(promoted: bool) -> TrayPinResult {
             let exe_match = reg_read_key_string(sub, w!("ExecutablePath"))
                 .map(|p| normalize_exe_path_for_compare(&p) == target)
                 .unwrap_or(false);
+            if !exe_match {
+                let _ = RegCloseKey(sub);
+                continue;
+            }
             let uid_match = reg_read_key_u32(sub, w!("UID"))
                 .map(|u| u == 1)
                 .unwrap_or(true);
-            let cur_promoted = reg_read_key_u32(sub, w!("IsPromoted"));
-            let _ = RegCloseKey(sub);
-
-            if !exe_match || !uid_match {
+            if !uid_match {
+                let _ = RegCloseKey(sub);
                 continue;
             }
+            let cur_promoted = reg_read_key_u32(sub, w!("IsPromoted"));
+            let _ = RegCloseKey(sub);
             let Some(next_val) = desired_tray_promoted_write(cur_promoted, promoted) else {
                 found_matched = true;
                 continue;
@@ -1435,6 +2261,7 @@ pub enum TopmostHealth {
     NeedHardReset(isize),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct WindowAboveDesc {
     pub hwnd_raw: isize,
@@ -1473,7 +2300,8 @@ pub fn is_system_overlay_class(cls: &str) -> bool {
     )
 }
 
-/// Pure classifier used by both live Win32 inspection and unit tests.
+/// Pure classifier used by unit tests (mirrors live zero-alloc `inspect_pill_topmost_health`).
+#[cfg(test)]
 pub fn classify_topmost_health(
     has_ex_topmost: bool,
     pill_rect: RECT,
@@ -1530,18 +2358,33 @@ fn is_window_cloaked(hwnd: HWND) -> bool {
     }
 }
 
-fn read_window_class(hwnd: HWND) -> String {
-    let mut buf = [0u16; 96];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    if len > 0 {
-        String::from_utf16_lossy(&buf[..len as usize])
-    } else {
-        String::new()
+fn is_system_overlay_class_u16(units: &[u16]) -> bool {
+    if units.is_empty() || units.len() > 64 {
+        return false;
     }
+    let mut ascii = [0u8; 64];
+    for (i, &u) in units.iter().enumerate() {
+        if u > 0x7F {
+            return false;
+        }
+        ascii[i] = u as u8;
+    }
+    // Every byte is <= 0x7F, so valid UTF-8 is guaranteed.
+    let s = unsafe { std::str::from_utf8_unchecked(&ascii[..units.len()]) };
+    is_system_overlay_class(s)
 }
 
-/// Inspects live Win32 Z-order above `pill_hwnd` (read-only, microsecond-level) to detect
-/// lost `WS_EX_TOPMOST`, ghost topmost desync, or overlapping non-system topmost windows.
+fn is_hwnd_system_overlay_noalloc(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 96];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len <= 0 {
+        return false;
+    }
+    is_system_overlay_class_u16(&buf[..len as usize])
+}
+
+/// Inspects live Win32 Z-order above `pill_hwnd` with zero heap allocations and minimal DWM IPC
+/// to detect lost `WS_EX_TOPMOST`, ghost topmost desync, or overlapping non-system topmost windows.
 pub fn inspect_pill_topmost_health(pill_hwnd: HWND) -> TopmostHealth {
     if pill_hwnd.0.is_null() {
         return TopmostHealth::Healthy;
@@ -1558,28 +2401,37 @@ pub fn inspect_pill_topmost_health(pill_hwnd: HWND) -> TopmostHealth {
         if GetWindowRect(pill_hwnd, &mut pill_rc).is_err() {
             return TopmostHealth::Healthy;
         }
-        let mut above = Vec::new();
+        let mut overlapped_by_non_system_topmost: Option<isize> = None;
         let mut cur = GetWindow(pill_hwnd, GW_HWNDPREV).unwrap_or_default();
         let mut steps = 0usize;
         while !cur.0.is_null() && steps < 96 {
             steps += 1;
-            if IsWindowVisible(cur).as_bool()
-                && !IsIconic(cur).as_bool()
-                && !is_window_cloaked(cur)
-            {
+            if IsWindowVisible(cur).as_bool() && !IsIconic(cur).as_bool() {
                 let mut rc = RECT::default();
                 if GetWindowRect(cur, &mut rc).is_ok() && rc.right > rc.left && rc.bottom > rc.top {
-                    above.push(WindowAboveDesc {
-                        hwnd_raw: cur.0 as isize,
-                        class_name: read_window_class(cur),
-                        is_topmost: window_has_topmost_style(cur),
-                        rect: rc,
-                    });
+                    let is_topmost = window_has_topmost_style(cur);
+                    if !is_topmost {
+                        // Cheap class check BEFORE DWM IPC (`is_window_cloaked`): skips system
+                        // overlays immediately without round-tripping to dwm.exe.
+                        if !is_hwnd_system_overlay_noalloc(cur) && !is_window_cloaked(cur) {
+                            return TopmostHealth::NeedHardReset(cur.0 as isize);
+                        }
+                    } else if overlapped_by_non_system_topmost.is_none()
+                        && rects_intersect(&pill_rc, &rc)
+                        && !is_hwnd_system_overlay_noalloc(cur)
+                        && !is_window_cloaked(cur)
+                    {
+                        overlapped_by_non_system_topmost = Some(cur.0 as isize);
+                    }
                 }
             }
             cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
         }
-        classify_topmost_health(has_top, pill_rc, &above)
+        if let Some(blocker) = overlapped_by_non_system_topmost {
+            TopmostHealth::NeedRaise(blocker)
+        } else {
+            TopmostHealth::Healthy
+        }
     }
 }
 
@@ -1961,5 +2813,200 @@ mod tests {
         // New non-null icon updates stored handle (preserved across TaskbarCreated / remove+add)
         tray.update_icon(icon_b);
         assert_eq!(tray.icon, icon_b);
+    }
+
+    #[test]
+    fn test_system_telemetry_exact_max_samples_and_noalloc_overlay_class() {
+        let mut tel = SystemTelemetry::new(5);
+        assert_eq!(tel.latest.self_mb, 0.0);
+        // Push synthetic history samples directly through sample() cap logic
+        let sample = tel.latest;
+        for _ in 0..12 {
+            while tel.history.len() >= tel.max_samples {
+                tel.history.pop_front();
+            }
+            tel.history.push_back(sample);
+        }
+        assert_eq!(tel.history.len(), 5);
+        assert!(tel.refresh_self_private_mb() > 0.0);
+        assert!(tel.latest.self_mb > 0.0);
+
+        // UTF-16 no-alloc system overlay classifier parity
+        let tray_u16: Vec<u16> = "Shell_TrayWnd".encode_utf16().collect();
+        let chrome_u16: Vec<u16> = "Chrome_WidgetWin_1".encode_utf16().collect();
+        let cjk_u16: Vec<u16> = "窗口类名".encode_utf16().collect();
+        assert!(is_system_overlay_class_u16(&tray_u16));
+        assert!(!is_system_overlay_class_u16(&chrome_u16));
+        assert!(!is_system_overlay_class_u16(&cjk_u16));
+        assert!(!is_system_overlay_class_u16(&[]));
+
+        // Console display power setting parser
+        let pbs = PowerBroadcastSettingHeader {
+            power_setting: GUID_CONSOLE_DISPLAY_STATE_RAW,
+            data_length: 4,
+            data: 0u32.to_le_bytes(),
+        };
+        assert_eq!(
+            parse_console_display_state(LPARAM((&pbs as *const PowerBroadcastSettingHeader) as isize)),
+            Some(0)
+        );
+        assert_eq!(parse_console_display_state(LPARAM(0)), None);
+    }
+
+    #[test]
+    fn test_dir_watcher_starts_and_stops_cleanly() {
+        let dir = std::env::temp_dir().join(format!("gauge_dir_watch_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Dummy message-only handle (invalid HWND is fine as long as stop happens cleanly before any file write)
+        let dummy_hwnd = HWND(1 as *mut core::ffi::c_void);
+        let watcher = DirWatcher::start(vec![(dir.clone(), false)], dummy_hwnd, WM_APP + 99);
+        assert!(watcher.is_some());
+        let watcher = watcher.unwrap();
+        assert!(watcher.is_healthy());
+        assert!(watcher.drain_hints().is_empty());
+        drop(watcher);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_watcher_hints_coalescing_dedup_and_overflow() {
+        let root = PathBuf::from(r"C:\fake\brain");
+        let comp = PathBuf::from(r"C:\fake\exe");
+        let mut h = WatcherHints::default();
+        assert!(h.is_empty());
+
+        // First relevant path transitions empty -> non-empty (signals PostMessageW once).
+        let p1: Vec<u16> = r"abc\.system_generated\logs\transcript.jsonl".encode_utf16().collect();
+        assert!(h.record_rel_u16(&root, &p1, true));
+        assert!(!h.is_empty());
+        assert_eq!(h.paths.len(), 1);
+        assert_eq!(h.paths[0], root.join(r"abc\.system_generated\logs\transcript.jsonl"));
+
+        // Duplicate path does NOT trigger a second wakeup or duplicate entry.
+        assert!(!h.record_rel_u16(&root, &p1, true));
+        assert_eq!(h.paths.len(), 1);
+
+        // Second distinct path coalesces into the same wakeup window.
+        let p2: Vec<u16> = r"def\conversation_metadata.json".encode_utf16().collect();
+        assert!(!h.record_rel_u16(&root, &p2, true));
+        assert_eq!(h.paths.len(), 2);
+
+        // Companion file sets has_companion_change without polluting transcript paths.
+        let p_comp: Vec<u16> = "statusline_state.json".encode_utf16().collect();
+        assert!(!h.record_rel_u16(&comp, &p_comp, false));
+        assert!(h.has_companion_change);
+        assert_eq!(h.paths.len(), 2);
+
+        // Draining resets to empty; next companion-only change triggers exactly one wakeup.
+        let drained = std::mem::take(&mut h);
+        assert!(h.is_empty());
+        assert_eq!(drained.paths.len(), 2);
+        assert!(drained.has_companion_change);
+
+        assert!(h.record_rel_u16(&comp, &p_comp, false));
+        assert!(!h.record_rel_u16(&comp, &p_comp, false));
+        assert!(h.has_companion_change && h.paths.is_empty());
+
+        // Exceeding WATCHER_HINT_CAP transitions cleanly to overflow=true and clears paths.
+        h = WatcherHints::default();
+        for i in 0..=WATCHER_HINT_CAP {
+            let rel: Vec<u16> = format!("s{i}\\transcript.jsonl").encode_utf16().collect();
+            let post = h.record_rel_u16(&root, &rel, true);
+            assert_eq!(post, i == 0);
+        }
+        assert!(h.overflow);
+        assert!(h.paths.is_empty());
+
+        // Verify raw FILE_NOTIFY_INFORMATION multi-entry parsing filters noise and collects all relevant paths.
+        fn push_fni(raw: &mut Vec<u8>, name: &str, has_next: bool) {
+            let start = raw.len();
+            let u16s: Vec<u16> = name.encode_utf16().collect();
+            let name_bytes = (u16s.len() * 2) as u32;
+            let entry_len = (12 + name_bytes as usize + 3) & !3;
+            let next_off = if has_next { entry_len as u32 } else { 0u32 };
+            raw.extend_from_slice(&next_off.to_le_bytes());
+            raw.extend_from_slice(&3u32.to_le_bytes()); // FILE_ACTION_MODIFIED
+            raw.extend_from_slice(&name_bytes.to_le_bytes());
+            for u in u16s {
+                raw.extend_from_slice(&u.to_le_bytes());
+            }
+            while raw.len() - start < entry_len {
+                raw.push(0);
+            }
+        }
+        let mut raw = Vec::new();
+        push_fni(&mut raw, r"abc\.system_generated\steps\1\output.txt", true);
+        push_fni(&mut raw, r"abc\.system_generated\logs\transcript.jsonl", true);
+        push_fni(&mut raw, r"abc\scratch\tmp.json", true);
+        push_fni(&mut raw, r"def\.system_generated\logs\transcript.jsonl", false);
+        let mut words = vec![0u32; raw.len().div_ceil(4)];
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), words.as_mut_ptr() as *mut u8, raw.len());
+        }
+        let q = Mutex::new(WatcherHints::default());
+        assert!(collect_notify_buffer_into_queue(&words, raw.len(), &root, true, &q));
+        // Second batch while queue is still non-empty must NOT request another PostMessageW.
+        assert!(!collect_notify_buffer_into_queue(&words, raw.len(), &root, true, &q));
+        let collected = std::mem::take(&mut *q.lock().unwrap());
+        assert!(!collected.overflow);
+        assert_eq!(collected.paths.len(), 2);
+        assert_eq!(collected.paths[0], root.join(r"abc\.system_generated\logs\transcript.jsonl"));
+        assert_eq!(collected.paths[1], root.join(r"def\.system_generated\logs\transcript.jsonl"));
+    }
+
+    #[test]
+    fn test_watcher_rel_path_filter_whitelist_and_rejects() {
+        let matches = |p: &str, subtree: bool| {
+            let u16s: Vec<u16> = p.encode_utf16().collect();
+            is_watched_rel_path_relevant_u16(&u16s, subtree)
+        };
+
+        // Agent log subtree (subtree = true): whitelisted transcripts & metadata match
+        assert!(matches(r"abc-123\.system_generated\logs\transcript.jsonl", true));
+        assert!(matches(r"abc-123\.system_generated\logs\transcript_full.jsonl", true));
+        assert!(matches(r"abc-123.pbtxt", true));
+        assert!(matches(r"conversation_metadata.json", true));
+        assert!(matches(r"proj\sessions-index.json", true));
+        assert!(matches(r"session_index.jsonl", true));
+        assert!(matches(r"2026\11\27\rollout-123.jsonl", true));
+        assert!(matches(r"proj\chats\session-01.json", true));
+        assert!(matches(r"proj\.project_root", true));
+        assert!(matches(r"项目中文\subagents\agent-01.jsonl", true));
+
+        // Agent log subtree: noisy steps, scratch, tasks, temp, media, markdown, archive & sqlite MUST be rejected
+        assert!(!matches(r"abc-123\.system_generated\steps\12\output.txt", true));
+        assert!(!matches(r"abc-123\.system_generated\steps\12\step.json", true));
+        assert!(!matches(r"abc-123\.system_generated\tasks\task-42.log", true));
+        assert!(!matches(r"abc-123\scratch\foo.py", true));
+        assert!(!matches(r"abc-123\scratch\dump.json", true));
+        assert!(!matches(r"abc-123\implementation_plan.md", true));
+        assert!(!matches(r"abc-123\screenshot.png", true));
+        assert!(!matches(r"abc-123\transcript.jsonl.tmp", true));
+        assert!(!matches(r"conversations\state.sqlite-wal", true));
+        assert!(!matches(r"state.db-shm", true));
+        assert!(!matches(r"archive.json", true));
+        assert!(!matches(r"history.jsonl", true));
+        assert!(!matches(r"settings.json", true));
+        assert!(!matches(r"oauth_creds.json", true));
+
+        // Companion/exe dir (subtree = false): ONLY companion configs match; archive.json & *.tmp rejected
+        assert!(matches("statusline_state.json", false));
+        assert!(matches("pricing.json", false));
+        assert!(matches("budget.json", false));
+        assert!(matches("session_meta.json", false));
+        assert!(!matches("archive.json", false));
+        assert!(!matches("archive.json.tmp", false));
+        assert!(!matches("statusline_state.json.tmp", false));
+        assert!(!matches("gauge.exe", false));
+        assert!(!matches("terminal.json", false));
+    }
+
+    #[test]
+    fn test_user_prefs_terminal_defaults() {
+        let p = UserPrefs::default();
+        assert_eq!(p.terminal_preset, crate::launcher::TerminalPreset::WtPwsh.to_u8());
+        assert!(!p.terminal_new_window);
+        assert!(p.terminal_keep_open);
     }
 }

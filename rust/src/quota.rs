@@ -8,9 +8,8 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 const STATUSLINE_STALE_SECS: i64 = 600; // 10 minutes before official statusline snapshot is marked cached/stale
 
@@ -22,15 +21,11 @@ pub(crate) struct FileSig {
 }
 
 pub(crate) fn regular_file_sig(path: &Path) -> Option<FileSig> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return None;
-    }
-    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    let s = crate::sources::stat_regular_file_fast(path)?;
     Some(FileSig {
-        mtime_secs: mtime.as_secs(),
-        mtime_nanos: mtime.subsec_nanos(),
-        len: meta.len(),
+        mtime_secs: s.mtime_secs,
+        mtime_nanos: s.mtime_nanos,
+        len: s.len,
     })
 }
 
@@ -40,8 +35,50 @@ pub fn default_companion_path(filename: &str) -> Option<PathBuf> {
         .and_then(|p| p.parent().map(|dir| dir.join(filename)))
 }
 
-/// Atomic file write in the application's own directory (never touches `~/.gemini`).
-pub fn atomic_write_json(path: &Path, text: &str) -> Result<(), String> {
+#[cfg(windows)]
+fn atomic_replace_file(tmp: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let tmp_w: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            PCWSTR(tmp_w.as_ptr()),
+            PCWSTR(dst_w.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if ok.is_ok() {
+        return Ok(());
+    }
+    // Fallback only if cross-volume or transient lock blocks MoveFileExW.
+    fs::copy(tmp, dst).map_err(|e| {
+        let _ = fs::remove_file(tmp);
+        format!("覆盖保存失败: {e}")
+    })?;
+    let _ = fs::remove_file(tmp);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(tmp: &Path, dst: &Path) -> Result<(), String> {
+    if fs::rename(tmp, dst).is_err() {
+        fs::copy(tmp, dst).map_err(|e| {
+            let _ = fs::remove_file(tmp);
+            format!("覆盖保存失败: {e}")
+        })?;
+        let _ = fs::remove_file(tmp);
+    }
+    Ok(())
+}
+
+/// Streams content into a temp file and atomically replaces `path` (never touches agent dirs).
+pub fn atomic_write_file_with<F>(path: &Path, sync: bool, write_fn: F) -> Result<(), String>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<(), String>,
+{
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             return Err(format!("拒绝写入符号链接: {}", path.display()));
@@ -54,20 +91,32 @@ pub fn atomic_write_json(path: &Path, text: &str) -> Result<(), String> {
     }
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     {
-        let mut f = File::create(&tmp).map_err(|e| format!("无法创建临时文件: {e}"))?;
-        f.write_all(text.as_bytes())
-            .map_err(|e| format!("写入失败: {e}"))?;
-        let _ = f.sync_all();
-    }
-    if fs::rename(&tmp, path).is_err() {
-        // On Windows rename fails if destination already exists; fall back to copy + remove.
-        fs::copy(&tmp, path).map_err(|e| {
+        let f = File::create(&tmp).map_err(|e| format!("无法创建临时文件: {e}"))?;
+        let mut bw = BufWriter::with_capacity(64 * 1024, f);
+        if let Err(err) = write_fn(&mut bw) {
+            drop(bw);
             let _ = fs::remove_file(&tmp);
-            format!("覆盖保存失败: {e}")
+            return Err(err);
+        }
+        bw.flush().map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("写入失败: {e}")
         })?;
-        let _ = fs::remove_file(&tmp);
+        if sync {
+            if let Ok(inner) = bw.into_inner() {
+                let _ = inner.sync_all();
+            }
+        }
     }
-    Ok(())
+    atomic_replace_file(&tmp, path)
+}
+
+/// Atomic file write in the application's own directory (never touches `~/.gemini`).
+pub fn atomic_write_json(path: &Path, text: &str) -> Result<(), String> {
+    atomic_write_file_with(path, true, |w| {
+        w.write_all(text.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))
+    })
 }
 
 pub fn fmt_countdown(secs: i64) -> String {
@@ -258,8 +307,21 @@ impl StatuslineSnapshot {
 /// Parses an official Antigravity CLI `statusLine` JSON payload (as documented at
 /// `https://antigravity.google/docs/cli/statusline`) or our saved wrapper file.
 pub fn parse_statusline_payload(text: &str, fallback_now: DateTime<Utc>) -> Option<StatuslineSnapshot> {
+    parse_statusline_payload_with_width(text, fallback_now).map(|(snap, _)| snap)
+}
+
+/// Parses an official Antigravity CLI `statusLine` JSON payload once, also extracting
+/// optional `terminal_width` so `agy-statusline.exe` never parses stdin JSON twice.
+pub fn parse_statusline_payload_with_width(
+    text: &str,
+    fallback_now: DateTime<Utc>,
+) -> Option<(StatuslineSnapshot, Option<usize>)> {
     let val: Value = serde_json::from_str(text).ok()?;
     let root = val.as_object()?;
+    let terminal_width = root
+        .get("terminal_width")
+        .and_then(Value::as_u64)
+        .map(|tw| (tw as usize).clamp(40, 300));
 
     let captured_at_utc = root
         .get("captured_at")
@@ -354,16 +416,19 @@ pub fn parse_statusline_payload(text: &str, fallback_now: DateTime<Utc>) -> Opti
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    Some(StatuslineSnapshot {
-        captured_at_utc,
-        plan_tier,
-        model_display,
-        agent_state,
-        context_used_pct,
-        context_window_size,
-        official_cost_usd,
-        buckets,
-    })
+    Some((
+        StatuslineSnapshot {
+            captured_at_utc,
+            plan_tier,
+            model_display,
+            agent_state,
+            context_used_pct,
+            context_window_size,
+            official_cost_usd,
+            buckets,
+        },
+        terminal_width,
+    ))
 }
 
 fn parse_bucket_obj(id: &str, obj: &Map<String, Value>) -> Option<QuotaBucket> {
@@ -487,10 +552,10 @@ impl StatuslineReader {
 
     /// Hot-reloads `statusline_state.json` if mtime/size changed. Returns `true` on change.
     pub fn refresh(&mut self) -> bool {
-        let Some(path) = self.path.clone() else {
+        let Some(path) = self.path.as_deref() else {
             return false;
         };
-        let sig = regular_file_sig(&path);
+        let sig = regular_file_sig(path);
         if sig == self.sig {
             return false;
         }
@@ -502,7 +567,7 @@ impl StatuslineReader {
                 had
             }
             Some(_) => {
-                if let Ok(mut f) = File::open(&path) {
+                if let Ok(mut f) = File::open(path) {
                     let mut text = String::new();
                     if f.read_to_string(&mut text).is_ok() {
                         self.cached = parse_statusline_payload(&text, Utc::now());
@@ -700,10 +765,10 @@ impl BudgetStore {
     }
 
     pub fn refresh(&mut self) -> bool {
-        let Some(path) = self.path.clone() else {
+        let Some(path) = self.path.as_deref() else {
             return false;
         };
-        let sig = regular_file_sig(&path);
+        let sig = regular_file_sig(path);
         if sig == self.sig {
             return false;
         }
@@ -715,7 +780,7 @@ impl BudgetStore {
                 changed
             }
             Some(_) => {
-                if let Ok(mut f) = File::open(&path) {
+                if let Ok(mut f) = File::open(path) {
                     let mut text = String::new();
                     if f.read_to_string(&mut text).is_ok() {
                         if let Some(parsed) = parse_budget_json(&text) {

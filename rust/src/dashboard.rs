@@ -8,10 +8,14 @@
 //!     with per-session cache hit rate.
 //!   - Interactive "总计 / 仅增量" toggle and Registry-persisted DateScope (defaults to Today).
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike, Utc};
 use serde_json::{json, Value};
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use windows::core::Result;
@@ -22,10 +26,11 @@ use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::d2d::{
-    brush, draw_activity_heatmap, draw_area_series, draw_brand_dial_icon, draw_editorial_bars,
-    draw_line, draw_pace_bar, draw_ring_gauge, draw_text, fill_circle, fill_round_rect, hit_rect,
-    load_color, rect_f, stroke_circle, stroke_round_rect, theme_for, with_alpha, BarItem, BarUnit,
-    D2DFactories, Fonts, HeatmapDay, Theme, WindowSurface,
+    draw_activity_heatmap, draw_area_series, draw_brand_dial_icon, draw_editorial_bars, draw_line,
+    draw_pace_bar, draw_ring_gauge, draw_text, editorial_bar_label_stride, fill_circle, fill_rect,
+    fill_round_rect, hit_rect, load_color, rect_f, stroke_circle, stroke_round_rect, theme_for,
+    with_alpha, BarItem, BarUnit, D2DFactories, DashFonts, Fonts, HeatmapDay, HeatmapGridGeom,
+    Theme, WindowSurface,
 };
 use crate::launcher::{
     classify_resume_capability, find_resumable_parent, normalize_workspace_path_str,
@@ -37,10 +42,11 @@ use crate::pricing::{
 };
 use crate::quota::{evaluate_alerts, fmt_countdown, AlertSeverity, BudgetConfig, QuotaProvenance};
 use crate::stats::{
-    filter_snapshot_range, fmt_commas, fmt_compact, fmt_duration_short, fmt_gap, fmt_num,
-    is_compaction_model, iso_week_bounds, iso_week_key, iso_week_range_label, weekday_cn,
-    workspace_short_name, AgentFamily, AggregatedStats, DateScope, ModelCacheStats, ScanSnapshot,
-    SessionInfo, SessionSort, SourceKind, TokenCounts, TurnRecord,
+    compute_active_duration_secs, compute_primary_model, filter_snapshot_range, fmt_commas,
+    fmt_compact, fmt_duration_short, fmt_gap, fmt_num, is_compaction_model, iso_week_bounds,
+    iso_week_key, iso_week_range_label, weekday_cn, workspace_short_name, AgentFamily,
+    AggregatedStats, DateScope, ModelCacheStats, ScanSnapshot, SessionInfo, SessionSort,
+    SourceKind, TokenCounts, TurnRecord,
 };
 use crate::telemetry::{apply_win11_frame, copy_text_to_clipboard, SystemTelemetry};
 
@@ -111,6 +117,51 @@ pub enum ModelSort {
     CostDesc,
     HitRateAsc,
     HitRateDesc,
+}
+
+/// Zero-allocation stack formatter for short hot-path labels (`"24%"`, `"12轮"`, `"16.3/32.0 GB"`).
+struct FmtBuf {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl FmtBuf {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Write for FmtBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let avail = self.buf.len().saturating_sub(self.len);
+        if bytes.len() <= avail {
+            self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+        } else {
+            let mut take = avail;
+            while take > 0 && !s.is_char_boundary(take) {
+                take -= 1;
+            }
+            self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+            self.len += take;
+        }
+        Ok(())
+    }
 }
 
 fn is_unknown_workspace(ws: &str) -> bool {
@@ -222,21 +273,41 @@ pub fn format_active_sources_line(
     format!("活跃来源({}): {}", data_dirs.len(), parts.join(" · "))
 }
 
+#[inline]
+fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    let hb = haystack.as_bytes();
+    if nb.len() > hb.len() {
+        return false;
+    }
+    let first = nb[0];
+    for i in 0..=(hb.len() - nb.len()) {
+        if hb[i].to_ascii_lowercase() == first
+            && hb[i + 1..i + nb.len()]
+                .iter()
+                .zip(&nb[1..])
+                .all(|(h, n)| h.to_ascii_lowercase() == *n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn source_matches_query(source: SourceKind, q: &str) -> bool {
-    if source.label_short().to_ascii_lowercase().contains(q)
-        || source.as_str().to_ascii_lowercase().contains(q)
-    {
+    if contains_ascii_icase(source.label_short(), q) || contains_ascii_icase(source.as_str(), q) {
         return true;
     }
     let fam = source.agent_family();
-    if fam.label_short().to_ascii_lowercase().contains(q)
-        || fam.label_full().to_ascii_lowercase().contains(q)
-    {
+    if contains_ascii_icase(fam.label_short(), q) || contains_ascii_icase(fam.label_full(), q) {
         return true;
     }
     fam.search_aliases()
         .iter()
-        .any(|alias| alias.to_ascii_lowercase().contains(q))
+        .any(|alias| contains_ascii_icase(alias, q))
 }
 
 pub fn redact_pricing_path(path: Option<&Path>) -> String {
@@ -258,6 +329,15 @@ pub struct Redactor {
 
 impl Redactor {
     pub fn build(sessions: &[SessionInfo], agg: &AggregatedStats) -> Self {
+        Self::build_slices(sessions, &[], agg)
+    }
+
+    /// Zero-clone builder over primary in-scope sessions + optional out-of-scope pinned sessions.
+    pub fn build_slices(
+        primary: &[SessionInfo],
+        extra: &[SessionInfo],
+        agg: &AggregatedStats,
+    ) -> Self {
         let mut out = Self::default();
 
         // 1) Deterministic workspace aliases ranked by total token volume descending.
@@ -273,8 +353,9 @@ impl Redactor {
                 .insert(ws.to_string(), format!("项目 {}", alpha_label(idx)));
         }
         let mut next_ws = out.workspaces.len();
-        let mut extra_ws: Vec<&str> = sessions
+        let mut extra_ws: Vec<&str> = primary
             .iter()
+            .chain(extra.iter())
             .map(|s| s.workspace.as_str())
             .filter(|ws| !is_unknown_workspace(ws) && !out.workspaces.contains_key(*ws))
             .collect();
@@ -287,10 +368,14 @@ impl Redactor {
         }
 
         // 2) Deterministic session & subagent aliases (preserves parent-child linkage).
-        let present: HashSet<&str> = sessions.iter().map(|s| s.conversation_id.as_str()).collect();
+        let present: HashSet<&str> = primary
+            .iter()
+            .chain(extra.iter())
+            .map(|s| s.conversation_id.as_str())
+            .collect();
         let mut root_nums: HashMap<&str, usize> = HashMap::new();
         let mut root_idx = 0usize;
-        for s in sessions {
+        for s in primary.iter().chain(extra.iter()) {
             let attached_child = s.is_subagent
                 && s.parent_id
                     .as_deref()
@@ -314,7 +399,7 @@ impl Redactor {
 
         let mut sub_counts: HashMap<&str, usize> = HashMap::new();
         let mut orphan_parent_idx = 0usize;
-        for s in sessions {
+        for s in primary.iter().chain(extra.iter()) {
             if let Some(pid) = s.parent_id.as_deref() {
                 if s.is_subagent {
                     if let Some(&p_num) = root_nums.get(pid) {
@@ -398,7 +483,83 @@ pub enum SessionFilter {
     Parent(String, String), // (parent_conversation_id, parent_title)
 }
 
+fn local_date_range_to_utc(
+    start_date: NaiveDate,
+    end_inclusive: NaiveDate,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let next_day = end_inclusive.succ_opt()?;
+    let start_naive = start_date.and_hms_opt(0, 0, 0)?;
+    let end_naive = next_day.and_hms_opt(0, 0, 0)?;
+    let start_utc = Local
+        .from_local_datetime(&start_naive)
+        .earliest()?
+        .with_timezone(&Utc);
+    let end_utc = Local
+        .from_local_datetime(&end_naive)
+        .earliest()?
+        .with_timezone(&Utc);
+    if start_utc <= end_utc {
+        Some((start_utc, end_utc))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompiledTurnFilter<'a> {
+    Model(&'a str),
+    UtcRange(DateTime<Utc>, DateTime<Utc>),
+    DateFallback(NaiveDate),
+    WeekFallback((NaiveDate, NaiveDate)),
+    Never,
+    All,
+}
+
+impl CompiledTurnFilter<'_> {
+    #[inline]
+    fn matches_turn(&self, t: &TurnRecord) -> bool {
+        match *self {
+            CompiledTurnFilter::Model(m) => t.model.as_ref() == m,
+            CompiledTurnFilter::UtcRange(start_utc, end_utc) => t
+                .timestamp_utc
+                .is_some_and(|u| u >= start_utc && u < end_utc),
+            CompiledTurnFilter::DateFallback(target) => t
+                .timestamp_utc
+                .is_some_and(|u| u.with_timezone(&Local).date_naive() == target),
+            CompiledTurnFilter::WeekFallback((mon, sun)) => t.timestamp_utc.is_some_and(|u| {
+                let d = u.with_timezone(&Local).date_naive();
+                d >= mon && d <= sun
+            }),
+            CompiledTurnFilter::Never => false,
+            CompiledTurnFilter::All => true,
+        }
+    }
+}
+
 impl SessionFilter {
+    fn compile(&self) -> CompiledTurnFilter<'_> {
+        match self {
+            SessionFilter::Model(m) => CompiledTurnFilter::Model(m.as_str()),
+            SessionFilter::Date(day) => match NaiveDate::parse_from_str(day, "%Y-%m-%d").ok() {
+                Some(d) => match local_date_range_to_utc(d, d) {
+                    Some((s, e)) => CompiledTurnFilter::UtcRange(s, e),
+                    None => CompiledTurnFilter::DateFallback(d),
+                },
+                None => CompiledTurnFilter::Never,
+            },
+            SessionFilter::Week(wk) => match iso_week_bounds(wk) {
+                Some((mon, sun)) => match local_date_range_to_utc(mon, sun) {
+                    Some((s, e)) => CompiledTurnFilter::UtcRange(s, e),
+                    None => CompiledTurnFilter::WeekFallback((mon, sun)),
+                },
+                None => CompiledTurnFilter::Never,
+            },
+            SessionFilter::Workspace(_) | SessionFilter::Agent(_) | SessionFilter::Parent(..) => {
+                CompiledTurnFilter::All
+            }
+        }
+    }
+
     fn label(&self, redactor: Option<&Redactor>) -> String {
         match self {
             SessionFilter::Model(m) => format!("模型: {}  ×", m),
@@ -430,7 +591,8 @@ impl SessionFilter {
     fn matches(&self, s: &SessionInfo) -> bool {
         match self {
             SessionFilter::Model(_) | SessionFilter::Date(_) | SessionFilter::Week(_) => {
-                s.turns.iter().any(|t| self.turn_matches(t))
+                let compiled = self.compile();
+                s.turns.iter().any(|t| compiled.matches_turn(t))
             }
             SessionFilter::Workspace(ws) => s.workspace == *ws,
             SessionFilter::Agent(fam) => s.source.agent_family() == *fam,
@@ -445,48 +607,64 @@ impl SessionFilter {
     fn slices_turns(&self) -> bool {
         matches!(self, SessionFilter::Model(_) | SessionFilter::Date(_) | SessionFilter::Week(_))
     }
-
-    fn turn_matches(&self, t: &TurnRecord) -> bool {
-        match self {
-            SessionFilter::Model(m) => t.model == *m,
-            SessionFilter::Date(day) => t
-                .timestamp_utc
-                .map(|u| u.with_timezone(&Local).format("%Y-%m-%d").to_string() == *day)
-                .unwrap_or(false),
-            SessionFilter::Week(wk) => t
-                .timestamp_utc
-                .map(|u| iso_week_key(u.with_timezone(&Local).date_naive()) == *wk)
-                .unwrap_or(false),
-            SessionFilter::Workspace(_) | SessionFilter::Agent(_) | SessionFilter::Parent(..) => true,
-        }
-    }
 }
 
-/// Returns a copy of `s` keeping only turns matching a slicing filter (with counts, models and
-/// time range recomputed), or `None` when no turn matches.
+/// Returns a copy of `s` keeping only turns matching a slicing filter (with counts, models,
+/// summary stats, and time range recomputed), or `None` when no turn matches.
 fn slice_session(s: &SessionInfo, f: &SessionFilter) -> Option<SessionInfo> {
-    let turns: Vec<TurnRecord> = s.turns.iter().filter(|t| f.turn_matches(t)).cloned().collect();
-    if turns.is_empty() {
+    let compiled = f.compile();
+    // Fast-path: if all turns match, reuse `Arc<[TurnRecord]>` with zero turn clones!
+    if !s.turns.is_empty() && s.turns.iter().all(|t| compiled.matches_turn(t)) {
+        return Some(s.clone());
+    }
+    let turns_vec: Vec<TurnRecord> = s
+        .turns
+        .iter()
+        .filter(|t| compiled.matches_turn(t))
+        .cloned()
+        .collect();
+    if turns_vec.is_empty() {
         return None;
     }
     let mut counts = TokenCounts::default();
     let mut models = std::collections::BTreeSet::new();
     let mut first_time: Option<chrono::DateTime<Local>> = None;
     let mut last_time: Option<chrono::DateTime<Local>> = None;
-    for t in &turns {
-        counts.add_call_with_cost(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost);
-        models.insert(t.model.clone());
+    let mut compaction_count = 0u32;
+    let mut thinking_turns = 0u32;
+    for t in &turns_vec {
+        counts.add_call_with_cost(
+            t.input_tokens,
+            t.cache_read_tokens,
+            t.cache_write_tokens,
+            t.output_tokens,
+            t.cost,
+        );
+        models.insert(t.model.to_string());
+        if t.is_checkpoint {
+            compaction_count = compaction_count.saturating_add(1);
+        }
+        if t.has_thinking() {
+            thinking_turns = thinking_turns.saturating_add(1);
+        }
         if let Some(ts) = t.timestamp_utc.map(|u| u.with_timezone(&Local)) {
             first_time = Some(first_time.map_or(ts, |p| p.min(ts)));
             last_time = Some(last_time.map_or(ts, |p| p.max(ts)));
         }
     }
+    let primary_model = compute_primary_model(&turns_vec);
+    let active_duration_secs = compute_active_duration_secs(&turns_vec);
+    let turns: Arc<[TurnRecord]> = Arc::from(turns_vec);
     Some(SessionInfo {
         turns,
         counts,
         models,
         first_time,
         last_time,
+        primary_model,
+        active_duration_secs,
+        compaction_count,
+        thinking_turns,
         ..s.clone()
     })
 }
@@ -497,7 +675,7 @@ struct DisplaySessionRow {
     out_of_scope: bool,
     sliced: Option<Box<SessionInfo>>,
     counts: TokenCounts,
-    primary_model: String,
+    primary_model: Arc<str>,
     last_time: Option<chrono::DateTime<Local>>,
     subagent_count: usize,
     is_child_row: bool,
@@ -570,12 +748,212 @@ pub enum ClickAction {
     CopyCallDetail,
 }
 
+/// Minimal repaint mode returned by `DashboardView::on_telemetry_tick`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryRepaintMode {
+    Skip,
+    PartialHero,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeroTelemetrySig {
+    cpu_pct_round: i32,
+    mem_pct_round: i32,
+    mem_used_tenth: i32,
+    mem_total_tenth: i32,
+    cpu_cores: u32,
+}
+
+impl HeroTelemetrySig {
+    fn from_telemetry(telemetry: &SystemTelemetry) -> Self {
+        let t = telemetry.latest;
+        Self {
+            cpu_pct_round: t.cpu_pct.round() as i32,
+            mem_pct_round: t.mem_pct.round() as i32,
+            mem_used_tenth: (t.mem_used_gb * 10.0).round() as i32,
+            mem_total_tenth: (t.mem_total_gb * 10.0).round() as i32,
+            cpu_cores: t.cpu_cores,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeroBlock4Layout {
+    band: D2D_RECT_F,
+    x3: f32,
+    y: f32,
+    h: f32,
+    b4: D2D_RECT_F,
+}
+
+enum DiscretePlot {
+    VerticalBars {
+        plot: D2D_RECT_F,
+        n: usize,
+    },
+    Heatmap(HeatmapGridGeom),
+    RowRects {
+        bounds: D2D_RECT_F,
+        rows: Vec<D2D_RECT_F>,
+    },
+    TimeSeries {
+        x0: f32,
+        pr: f32,
+        pt_y: f32,
+        pb_y: f32,
+        dx: f32,
+        n: usize,
+    },
+}
+
+impl DiscretePlot {
+    fn hit_slot(&self, x: f32, y: f32) -> Option<usize> {
+        match self {
+            DiscretePlot::VerticalBars { plot, n } => {
+                if *n == 0 || x < plot.left || x > plot.right || y < plot.top || y > plot.bottom {
+                    return None;
+                }
+                let w = (plot.right - plot.left).max(1.0);
+                let slot_w = w / *n as f32;
+                let idx = ((x - plot.left) / slot_w).floor() as isize;
+                if idx >= 0 && (idx as usize) < *n {
+                    Some(idx as usize)
+                } else {
+                    None
+                }
+            }
+            DiscretePlot::Heatmap(g) => {
+                if g.n_weeks == 0 {
+                    return None;
+                }
+                let step = g.cell + g.gap;
+                let dx = x - g.gx0;
+                let dy = y - g.gy0;
+                if dx < 0.0 || dy < 0.0 {
+                    return None;
+                }
+                let col = (dx / step).floor() as usize;
+                let row = (dy / step).floor() as usize;
+                if col >= g.n_weeks || row >= 7 {
+                    return None;
+                }
+                let rem_x = dx - col as f32 * step;
+                let rem_y = dy - row as f32 * step;
+                if rem_x <= g.cell && rem_y <= g.cell {
+                    Some(col * 7 + row)
+                } else {
+                    None
+                }
+            }
+            DiscretePlot::RowRects { bounds, rows } => {
+                if !hit_rect(bounds, x, y) {
+                    return None;
+                }
+                rows.iter().position(|r| hit_rect(r, x, y))
+            }
+            DiscretePlot::TimeSeries {
+                x0,
+                pr,
+                pt_y,
+                pb_y,
+                dx,
+                n,
+            } => {
+                if *n < 2 || *dx <= 0.0 || x < *x0 || x > *pr || y < *pt_y || y > *pb_y {
+                    return None;
+                }
+                let idx = (((x - *x0) / *dx).round() as isize).clamp(0, (*n - 1) as isize) as usize;
+                Some(idx)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HoverSig {
+    hit_box: Option<usize>,
+    continuous_plot: bool,
+    discrete_slot: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRowsKey {
+    data_gen: u64,
+    sess_ptr: usize,
+    sess_len: usize,
+    oos_len: usize,
+    pinned_len: usize,
+    apply_filter: bool,
+    include_oos: bool,
+    sort: SessionSort,
+    group_subagents: bool,
+    pinned_only: bool,
+    privacy_mode: bool,
+    session_filter: Option<SessionFilter>,
+    search_query: String,
+}
+
+struct SessionRowsCache {
+    key: SessionRowsKey,
+    rows: Vec<DisplaySessionRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallRowsKey {
+    data_gen: u64,
+    sess_ptr: usize,
+    sess_len: usize,
+    oos_len: usize,
+    call_sort: CallSort,
+    privacy_mode: bool,
+    call_session_filter: Option<String>,
+    search_query: String,
+}
+
+struct CallRowsCache {
+    key: CallRowsKey,
+    rows: Vec<CallRow>,
+    sum: TokenCounts,
+    speed_out: u64,
+    speed_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionDetailKey {
+    data_gen: u64,
+    sess_ptr: usize,
+    sess_len: usize,
+    snap_sess_len: usize,
+    selected_cid: String,
+    session_filter: Option<SessionFilter>,
+}
+
+struct SessionDetailCache {
+    key: SessionDetailKey,
+    sliced_override: Option<SessionInfo>,
+    sub_cnt: usize,
+    sub_agg: TokenCounts,
+    direct_ok: bool,
+    blocked_msg: &'static str,
+    resumable_parent_id: Option<String>,
+    has_ws: bool,
+    compaction_count: usize,
+    cache_miss_count: usize,
+    active_duration_secs: u64,
+    thinking_turns: usize,
+    top_tools_str: String,
+}
+
 struct HitBox {
     rect: D2D_RECT_F,
     action: ClickAction,
 }
 
 pub struct DashboardView {
+    /// Isolated dashboard-only Direct2D + DirectWrite factory (lazily created on first show,
+    /// dropped on hide AFTER `surface` so D3D10Warp tile pools are genuinely released).
+    dash_factories: Option<D2DFactories>,
     surface: Option<WindowSurface>,
     pub active_tab: Tab,
     prev_token_tab: Tab,
@@ -624,7 +1002,8 @@ pub struct DashboardView {
     hit_boxes: Vec<HitBox>,
     session_row_rects: Vec<(D2D_RECT_F, String)>,
     plot_rects: Vec<D2D_RECT_F>,
-    last_hover_sig: (Option<usize>, bool),
+    discrete_plots: Vec<DiscretePlot>,
+    last_hover_sig: HoverSig,
     copied_until: Option<Instant>,
     session_copied_until: Option<Instant>,
     pub resume_cmd_copied_until: Option<Instant>,
@@ -635,10 +1014,25 @@ pub struct DashboardView {
     cached_agg: AggregatedStats,
     all_total: TokenCounts,
     all_sessions_count: usize,
+    all_root_sessions: usize,
+    all_sub_sessions: usize,
+    cached_root_sessions: usize,
+    cached_sub_sessions: usize,
     has_non_antigravity: bool,
-    redactor: Redactor,
+    redactor: RefCell<Redactor>,
+    redactor_built: Cell<bool>,
     cached_date: NaiveDate,
     dirty_filter: bool,
+    data_gen: u64,
+    session_rows_cache: RefCell<Option<SessionRowsCache>>,
+    overview_rows_cache: RefCell<Option<SessionRowsCache>>,
+    call_rows_cache: RefCell<Option<CallRowsCache>>,
+    session_detail_cache: RefCell<Option<SessionDetailCache>>,
+    cached_alert_level: Option<(u64, i64, u8)>,
+    last_hero_telemetry_sig: Option<HeroTelemetrySig>,
+    hero_block4_layout: Option<HeroBlock4Layout>,
+    last_full_paint: Option<Instant>,
+    had_active_toast: bool,
 }
 
 /// Compact human-scannable Chinese relative timestamp for session rows (`刚刚`/`3m前`/`2h前`/`昨天`/`04/12`).
@@ -732,7 +1126,7 @@ fn session_metric_columns(rx: f32) -> ([f32; 6], [f32; 6], f32) {
 #[allow(clippy::too_many_arguments)]
 fn draw_session_metric_cells(
     rt: &ID2D1RenderTarget,
-    fonts: &Fonts,
+    fonts: &DashFonts,
     theme: &Theme,
     xs: &[f32; 6],
     ws: &[f32; 6],
@@ -746,8 +1140,10 @@ fn draw_session_metric_cells(
     human: bool,
 ) {
     let r = |i: usize| rect_f(xs[i], ry, ws[i], cell_h);
-    // Tier 4: quiet count
-    draw_text(rt, &format!("{}轮", counts.calls), &fonts.mono_small_right, r(0), theme.muted);
+    // Tier 4: quiet count (stack-formatted, 0 heap allocs)
+    let mut fbuf = FmtBuf::new();
+    let _ = write!(fbuf, "{}轮", counts.calls);
+    draw_text(rt, fbuf.as_str(), &fonts.mono_small_right, r(0), theme.muted);
     // Tier 1 (Tok mode) / Tier 3 ($ mode): 总Token
     draw_text(
         rt,
@@ -787,6 +1183,7 @@ impl DashboardView {
         privacy_mode: bool,
     ) -> Self {
         Self {
+            dash_factories: None,
             surface: None,
             active_tab: Tab::Overview,
             prev_token_tab: Tab::Overview,
@@ -833,7 +1230,8 @@ impl DashboardView {
             hit_boxes: Vec::new(),
             session_row_rects: Vec::new(),
             plot_rects: Vec::new(),
-            last_hover_sig: (None, false),
+            discrete_plots: Vec::new(),
+            last_hover_sig: HoverSig::default(),
             copied_until: None,
             session_copied_until: None,
             resume_cmd_copied_until: None,
@@ -844,28 +1242,57 @@ impl DashboardView {
             cached_agg: AggregatedStats::default(),
             all_total: TokenCounts::default(),
             all_sessions_count: 0,
+            all_root_sessions: 0,
+            all_sub_sessions: 0,
+            cached_root_sessions: 0,
+            cached_sub_sessions: 0,
             has_non_antigravity: false,
-            redactor: Redactor::default(),
+            redactor: RefCell::new(Redactor::default()),
+            redactor_built: Cell::new(false),
             cached_date: Local::now().date_naive(),
             dirty_filter: true,
+            data_gen: 0,
+            session_rows_cache: RefCell::new(None),
+            overview_rows_cache: RefCell::new(None),
+            call_rows_cache: RefCell::new(None),
+            session_detail_cache: RefCell::new(None),
+            cached_alert_level: None,
+            last_hero_telemetry_sig: None,
+            hero_block4_layout: None,
+            last_full_paint: None,
+            had_active_toast: false,
         }
     }
 
-    fn is_multi_agent(&self) -> bool {
-        self.has_non_antigravity
-            || self
-                .cached_sessions
-                .iter()
-                .any(|s| s.source.agent_family() != AgentFamily::Antigravity)
-            || self
-                .pinned_out_of_scope
-                .iter()
-                .any(|s| s.source.agent_family() != AgentFamily::Antigravity)
+    fn with_redactor<R>(&self, f: impl FnOnce(&Redactor) -> R) -> R {
+        if !self.redactor_built.get() {
+            let built = Redactor::build_slices(
+                &self.cached_sessions,
+                &self.pinned_out_of_scope,
+                &self.cached_agg,
+            );
+            *self.redactor.borrow_mut() = built;
+            self.redactor_built.set(true);
+        }
+        f(&self.redactor.borrow())
+    }
+
+    #[cfg(test)]
+    fn set_redactor_for_test(&mut self, redactor: Redactor) {
+        *self.redactor.get_mut() = redactor;
+        self.redactor_built.set(true);
+    }
+
+    fn clear_view_caches(&self) {
+        *self.session_rows_cache.borrow_mut() = None;
+        *self.overview_rows_cache.borrow_mut() = None;
+        *self.call_rows_cache.borrow_mut() = None;
+        *self.session_detail_cache.borrow_mut() = None;
     }
 
     fn format_session_id(&self, cid: &str) -> String {
         if self.privacy_mode {
-            self.redactor.session_id(cid)
+            self.with_redactor(|r| r.session_id(cid))
         } else {
             cid.chars().take(8).collect()
         }
@@ -873,7 +1300,7 @@ impl DashboardView {
 
     fn format_session_title(&self, s: &SessionInfo) -> String {
         if self.privacy_mode {
-            self.redactor.session_title(s)
+            self.with_redactor(|r| r.session_title(s))
         } else {
             s.title.clone()
         }
@@ -881,7 +1308,7 @@ impl DashboardView {
 
     fn format_parent_title(&self, pid: &str, raw_title: &str) -> String {
         if self.privacy_mode {
-            self.redactor.parent_title(pid)
+            self.with_redactor(|r| r.parent_title(pid))
         } else {
             raw_title.to_string()
         }
@@ -889,7 +1316,7 @@ impl DashboardView {
 
     fn format_workspace_label(&self, ws: &str) -> String {
         if self.privacy_mode {
-            self.redactor.workspace_label(ws)
+            self.with_redactor(|r| r.workspace_label(ws))
         } else {
             let short = workspace_short_name(ws);
             if short.is_empty() {
@@ -902,7 +1329,7 @@ impl DashboardView {
 
     fn format_workspace_short(&self, ws: &str) -> String {
         if self.privacy_mode {
-            self.redactor.workspace_short(ws)
+            self.with_redactor(|r| r.workspace_short(ws))
         } else {
             workspace_short_name(ws)
         }
@@ -912,7 +1339,7 @@ impl DashboardView {
         let ws = self.format_workspace_short(&s.workspace);
         let title = self.format_session_title(s);
         let sid = self.format_session_id(&s.conversation_id);
-        let cp = s.compaction_count();
+        let cp = s.compaction_count as usize;
         let (misses, miss_tok) = s.cache_miss_stats();
         let range = match (s.first_time, s.last_time) {
             (Some(a), Some(b)) => format!("{} -> {}", a.format("%m/%d %H:%M"), b.format("%H:%M")),
@@ -965,7 +1392,8 @@ impl DashboardView {
         }
     }
 
-    fn make_bar(&self, label: String, c: &TokenCounts, marker: bool, tooltip: Vec<String>) -> BarItem {
+    fn make_bar(&self, label: impl Into<Cow<'static, str>>, c: &TokenCounts, marker: bool) -> BarItem {
+        let label = label.into();
         if self.cost_mode {
             BarItem {
                 label,
@@ -973,7 +1401,6 @@ impl DashboardView {
                 input: c.cost.input_plus_write_usd(),
                 output: c.cost.output_usd,
                 marker,
-                tooltip,
             }
         } else {
             BarItem {
@@ -982,12 +1409,12 @@ impl DashboardView {
                 input: (c.input_tokens + c.cache_write_tokens) as f64,
                 output: c.output_tokens as f64,
                 marker,
-                tooltip,
             }
         }
     }
 
-    fn make_turn_bar(&self, label: String, t: &TurnRecord, tooltip: Vec<String>) -> BarItem {
+    fn make_turn_bar(&self, label: impl Into<Cow<'static, str>>, t: &TurnRecord) -> BarItem {
+        let label = label.into();
         if self.cost_mode {
             BarItem {
                 label,
@@ -995,7 +1422,6 @@ impl DashboardView {
                 input: t.cost.input_plus_write_usd(),
                 output: t.cost.output_usd,
                 marker: t.is_checkpoint,
-                tooltip,
             }
         } else {
             BarItem {
@@ -1004,7 +1430,6 @@ impl DashboardView {
                 input: (t.input_tokens + t.cache_write_tokens) as f64,
                 output: t.output_tokens as f64,
                 marker: t.is_checkpoint,
-                tooltip,
             }
         }
     }
@@ -1016,20 +1441,25 @@ impl DashboardView {
         if self.active_tab != Tab::Sessions {
             return false;
         }
-        let sorted = self.display_sessions_for_tab();
-        if sorted.is_empty() {
+        let next_sel = self.with_display_sessions_for_tab(|sorted| {
+            if sorted.is_empty() {
+                return None;
+            }
+            let cur_idx = self
+                .selected_session
+                .as_deref()
+                .and_then(|id| sorted.iter().position(|r| self.row_session(r).conversation_id == id))
+                .unwrap_or(0);
+            let next_idx = (cur_idx as isize + delta).clamp(0, (sorted.len() - 1) as isize) as usize;
+            if next_idx == cur_idx && self.selected_session.is_some() {
+                return None;
+            }
+            Some((next_idx, self.row_session(&sorted[next_idx]).conversation_id.clone()))
+        });
+        let Some((next_idx, cid)) = next_sel else {
             return false;
-        }
-        let cur_idx = self
-            .selected_session
-            .as_deref()
-            .and_then(|id| sorted.iter().position(|r| self.row_session(r).conversation_id == id))
-            .unwrap_or(0);
-        let next_idx = (cur_idx as isize + delta).clamp(0, (sorted.len() - 1) as isize) as usize;
-        if next_idx == cur_idx && self.selected_session.is_some() {
-            return false;
-        }
-        self.selected_session = Some(self.row_session(&sorted[next_idx]).conversation_id.clone());
+        };
+        self.selected_session = Some(cid);
         let vis = self.sessions_vis_rows.max(1);
         if next_idx < self.scroll_rows {
             self.scroll_rows = next_idx;
@@ -1044,19 +1474,28 @@ impl DashboardView {
         self.session_filter.as_ref().filter(|f| f.slices_turns())
     }
 
-    /// Looks up a session by id (including out-of-scope pinned sessions), sliced to the active
-    /// model / day / week filter when applicable so the detail card and clipboard match the row.
-    pub fn session_for_detail(&self, cid: &str) -> Option<SessionInfo> {
+    fn session_ref_for_detail<'a>(&'a self, cid: &str) -> Option<Cow<'a, SessionInfo>> {
         if let Some(s) = self.cached_sessions.iter().find(|s| s.conversation_id == cid) {
             return match self.slicing_filter() {
-                Some(f) => Some(slice_session(s, f).unwrap_or_else(|| s.clone())),
-                None => Some(s.clone()),
+                Some(f) => Some(
+                    slice_session(s, f)
+                        .map(Cow::Owned)
+                        .unwrap_or(Cow::Borrowed(s)),
+                ),
+                None => Some(Cow::Borrowed(s)),
             };
         }
         self.pinned_out_of_scope
             .iter()
             .find(|s| s.conversation_id == cid)
-            .cloned()
+            .map(Cow::Borrowed)
+    }
+
+    /// Looks up a session by id (including out-of-scope pinned sessions), sliced to the active
+    /// model / day / week filter when applicable so the detail card and clipboard match the row.
+    #[allow(dead_code)]
+    pub fn session_for_detail(&self, cid: &str) -> Option<SessionInfo> {
+        self.session_ref_for_detail(cid).map(Cow::into_owned)
     }
 
     pub fn count_subagents_of(&self, parent_id: &str) -> (usize, TokenCounts) {
@@ -1088,7 +1527,11 @@ impl DashboardView {
     }
 
     fn session_split_counts(&self) -> (usize, usize) {
-        Self::session_split_counts_of(&self.cached_sessions)
+        if self.cached_root_sessions + self.cached_sub_sessions == self.cached_sessions.len() {
+            (self.cached_root_sessions, self.cached_sub_sessions)
+        } else {
+            Self::session_split_counts_of(&self.cached_sessions)
+        }
     }
 
     fn row_session<'a>(&'a self, r: &'a DisplaySessionRow) -> &'a SessionInfo {
@@ -1101,9 +1544,14 @@ impl DashboardView {
         }
     }
 
-    fn sort_display_rows(&self, rows: &mut [DisplaySessionRow], keep_parent_first: Option<&str>) {
+    fn sort_display_rows_by(
+        &self,
+        rows: &mut [DisplaySessionRow],
+        sort: SessionSort,
+        keep_parent_first: Option<&str>,
+    ) {
         let ord_row = |a: &DisplaySessionRow, b: &DisplaySessionRow| -> std::cmp::Ordering {
-            match self.sort {
+            match sort {
                 SessionSort::Recent => b.last_time.cmp(&a.last_time),
                 SessionSort::Cost => b
                     .counts
@@ -1145,40 +1593,110 @@ impl DashboardView {
         }
     }
 
-    fn session_matches_search(&self, s: &SessionInfo) -> bool {
-        let q = self.search_query.trim().to_ascii_lowercase();
+    fn session_matches_search_lower(&self, s: &SessionInfo, q: &str) -> bool {
         if q.is_empty() {
             return true;
         }
-        let title = self.format_session_title(s).to_ascii_lowercase();
-        let sid = self.format_session_id(&s.conversation_id).to_ascii_lowercase();
-        let ws = self.format_workspace_label(&s.workspace).to_ascii_lowercase();
-        if title.contains(&q) || sid.contains(&q) || ws.contains(&q) {
+        let title = self.format_session_title(s);
+        if contains_ascii_icase(&title, q) {
             return true;
         }
-        if source_matches_query(s.source, &q) {
+        let sid = self.format_session_id(&s.conversation_id);
+        if contains_ascii_icase(&sid, q) {
             return true;
         }
-        if s.models.iter().any(|m| m.to_ascii_lowercase().contains(&q)) {
+        let ws = self.format_workspace_label(&s.workspace);
+        if contains_ascii_icase(&ws, q) {
+            return true;
+        }
+        if source_matches_query(s.source, q) {
+            return true;
+        }
+        if s.models.iter().any(|m| contains_ascii_icase(m, q)) {
             return true;
         }
         if s.turns
             .iter()
-            .any(|t| t.tool_names.iter().any(|tn| tn.to_ascii_lowercase().contains(&q)))
+            .any(|t| t.tool_names.iter().any(|tn| contains_ascii_icase(tn, q)))
         {
             return true;
         }
         false
     }
 
+    fn make_session_rows_key(
+        &self,
+        apply_filter: bool,
+        include_oos: bool,
+        sort: SessionSort,
+    ) -> SessionRowsKey {
+        SessionRowsKey {
+            data_gen: self.data_gen,
+            sess_ptr: self.cached_sessions.as_ptr() as usize,
+            sess_len: self.cached_sessions.len(),
+            oos_len: self.pinned_out_of_scope.len(),
+            pinned_len: self.pinned_ids.len(),
+            apply_filter,
+            include_oos,
+            sort,
+            group_subagents: self.group_subagents,
+            pinned_only: apply_filter && include_oos && self.pinned_only,
+            privacy_mode: self.privacy_mode,
+            session_filter: if apply_filter {
+                self.session_filter.clone()
+            } else {
+                None
+            },
+            search_query: if apply_filter {
+                self.search_query.clone()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    /// Borrows cached rows for the `会话` tab (zero rebuild/sort on hover, scroll, or 1s ticks).
+    fn with_display_sessions_for_tab<R>(&self, f: impl FnOnce(&[DisplaySessionRow]) -> R) -> R {
+        let key = self.make_session_rows_key(true, true, self.sort);
+        let hit = self
+            .session_rows_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.key == key);
+        if !hit {
+            let rows = self.display_sessions_inner(true, true, self.sort, true);
+            *self.session_rows_cache.borrow_mut() = Some(SessionRowsCache { key, rows });
+        }
+        let borrow = self.session_rows_cache.borrow();
+        f(&borrow.as_ref().expect("session_rows_cache populated").rows)
+    }
+
+    /// Borrows cached recent-sorted rows for the Overview tab (zero rebuild/sort on hover/ticks).
+    fn with_overview_recent_sessions<R>(&self, f: impl FnOnce(&[DisplaySessionRow]) -> R) -> R {
+        let key = self.make_session_rows_key(false, false, SessionSort::Recent);
+        let hit = self
+            .overview_rows_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.key == key);
+        if !hit {
+            // Overview sorts strictly by recency (not pin-first) matching original behavior.
+            let rows = self.display_sessions_inner(false, false, SessionSort::Recent, false);
+            *self.overview_rows_cache.borrow_mut() = Some(SessionRowsCache { key, rows });
+        }
+        let borrow = self.overview_rows_cache.borrow();
+        f(&borrow.as_ref().expect("overview_rows_cache populated").rows)
+    }
+
     /// Sessions list for the `会话` tab (includes cross-`DateScope` pinned sessions and honors `pinned_only`).
+    #[cfg(test)]
     fn display_sessions_for_tab(&self) -> Vec<DisplaySessionRow> {
-        self.display_sessions_inner(true, true)
+        self.with_display_sessions_for_tab(|r| r.to_vec())
     }
 
     /// Sessions list strictly inside the active `DateScope` (for CSV/JSON exports & overview fidelity).
     fn display_sessions(&self, apply_filter: bool) -> Vec<DisplaySessionRow> {
-        self.display_sessions_inner(apply_filter, false)
+        self.display_sessions_inner(apply_filter, false, self.sort, true)
     }
 
     /// Builds session list rows, rolling up subagents into their parent session when `group_subagents`
@@ -1187,9 +1705,16 @@ impl DashboardView {
         &self,
         apply_filter: bool,
         include_out_of_scope_pins: bool,
+        sort: SessionSort,
+        pin_first: bool,
     ) -> Vec<DisplaySessionRow> {
         let filter = if apply_filter { self.session_filter.as_ref() } else { None };
-        let apply_search = apply_filter && !self.search_query.trim().is_empty();
+        let q = if apply_filter {
+            self.search_query.trim().to_ascii_lowercase()
+        } else {
+            String::new()
+        };
+        let apply_search = !q.is_empty();
         let apply_pinned_only = apply_filter && include_out_of_scope_pins && self.pinned_only;
 
         // Parent drill-down always expands parent + all its subagents flat for inspection.
@@ -1199,23 +1724,23 @@ impl DashboardView {
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
-                .filter(|(_, s)| !apply_search || self.session_matches_search(s))
+                .filter(|(_, s)| !apply_search || self.session_matches_search_lower(s, &q))
                 .map(|(idx, s)| DisplaySessionRow {
                     sess_idx: idx,
                     out_of_scope: false,
                     sliced: None,
                     counts: s.counts,
-                    primary_model: s.primary_model(),
+                    primary_model: s.primary_model.clone(),
                     last_time: s.last_time,
                     subagent_count: 0,
                     is_child_row: s.parent_id.as_deref() == Some(pid.as_str()),
                     is_pinned: self.pinned_ids.contains(&s.conversation_id),
                 })
                 .collect();
-            if include_out_of_scope_pins {
+            if include_out_of_scope_pins && !self.pinned_out_of_scope.is_empty() {
                 for (idx, s) in self.pinned_out_of_scope.iter().enumerate() {
                     if (s.conversation_id == *pid || s.parent_id.as_deref() == Some(pid.as_str()))
-                        && (!apply_search || self.session_matches_search(s))
+                        && (!apply_search || self.session_matches_search_lower(s, &q))
                         && !rows
                             .iter()
                             .any(|r| self.row_session(r).conversation_id == s.conversation_id)
@@ -1225,7 +1750,7 @@ impl DashboardView {
                             out_of_scope: true,
                             sliced: None,
                             counts: s.counts,
-                            primary_model: s.primary_model(),
+                            primary_model: s.primary_model.clone(),
                             last_time: s.last_time,
                             subagent_count: 0,
                             is_child_row: s.parent_id.as_deref() == Some(pid.as_str()),
@@ -1237,7 +1762,7 @@ impl DashboardView {
             if apply_pinned_only {
                 rows.retain(|r| r.is_pinned);
             }
-            self.sort_display_rows(&mut rows, Some(pid.as_str()));
+            self.sort_display_rows_by(&mut rows, sort, Some(pid.as_str()));
             return rows;
         }
 
@@ -1247,109 +1772,173 @@ impl DashboardView {
 
         // Model / day / week filters: rows count only the matching turns of each session.
         let slicer = filter.filter(|f| f.slices_turns());
-        let sliced_storage: Vec<(usize, SessionInfo)>;
-        let filtered: Vec<(usize, &SessionInfo, bool)> = match slicer {
+        let mut sliced_storage: Vec<(usize, Option<SessionInfo>)> = Vec::new();
+        // Each item is `(storage_or_cached_idx, is_sliced)`
+        let matched_indices: Vec<(usize, bool)> = match slicer {
             Some(f) => {
-                sliced_storage = self
-                    .cached_sessions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, s)| slice_session(s, f).map(|sl| (idx, sl)))
-                    .collect();
-                sliced_storage
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, s))| filter.map(|flt| flt.matches(s)).unwrap_or(true))
-                    .filter(|(_, (_, s))| !apply_search || self.session_matches_search(s))
-                    .map(|(sl_idx, (_, s))| (sl_idx, s, true))
-                    .collect()
+                for (idx, s) in self.cached_sessions.iter().enumerate() {
+                    if let Some(sl) = slice_session(s, f) {
+                        if !apply_search || self.session_matches_search_lower(&sl, &q) {
+                            sliced_storage.push((idx, Some(sl)));
+                        }
+                    }
+                }
+                (0..sliced_storage.len()).map(|i| (i, true)).collect()
             }
-            None => {
-                sliced_storage = Vec::new();
-                self.cached_sessions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| filter.map(|f| f.matches(s)).unwrap_or(true))
-                    .filter(|(_, s)| !apply_search || self.session_matches_search(s))
-                    .map(|(idx, s)| (idx, s, false))
-                    .collect()
-            }
+            None => self
+                .cached_sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| filter.map(|f| f.matches(s)).unwrap_or(true))
+                .filter(|(_, s)| !apply_search || self.session_matches_search_lower(s, &q))
+                .map(|(idx, _)| (idx, false))
+                .collect(),
         };
 
         let mut rows = if !use_grouping {
-            filtered
+            matched_indices
                 .into_iter()
-                .map(|(idx, s, is_sliced)| {
-                    let (sess_idx, sliced) = if is_sliced {
-                        (sliced_storage[idx].0, Some(Box::new(s.clone())))
+                .map(|(idx, is_sliced)| {
+                    if is_sliced {
+                        let (sess_idx, sl_opt) = &mut sliced_storage[idx];
+                        let sl = sl_opt.take().expect("sliced item taken once");
+                        let counts = sl.counts;
+                        let primary_model = sl.primary_model.clone();
+                        let last_time = sl.last_time;
+                        let is_child_row = sl.is_subagent;
+                        let is_pinned = self.pinned_ids.contains(&sl.conversation_id);
+                        DisplaySessionRow {
+                            sess_idx: *sess_idx,
+                            out_of_scope: false,
+                            sliced: Some(Box::new(sl)),
+                            counts,
+                            primary_model,
+                            last_time,
+                            subagent_count: 0,
+                            is_child_row,
+                            is_pinned,
+                        }
                     } else {
-                        (idx, None)
-                    };
-                    DisplaySessionRow {
-                        sess_idx,
-                        out_of_scope: false,
-                        sliced,
-                        counts: s.counts,
-                        primary_model: s.primary_model(),
-                        last_time: s.last_time,
-                        subagent_count: 0,
-                        is_child_row: s.is_subagent,
-                        is_pinned: self.pinned_ids.contains(&s.conversation_id),
+                        let s = &self.cached_sessions[idx];
+                        DisplaySessionRow {
+                            sess_idx: idx,
+                            out_of_scope: false,
+                            sliced: None,
+                            counts: s.counts,
+                            primary_model: s.primary_model.clone(),
+                            last_time: s.last_time,
+                            subagent_count: 0,
+                            is_child_row: s.is_subagent,
+                            is_pinned: self.pinned_ids.contains(&s.conversation_id),
+                        }
                     }
                 })
                 .collect()
         } else {
-            let present_ids: std::collections::HashSet<&str> = filtered
-                .iter()
-                .map(|(_, s, _)| s.conversation_id.as_str())
-                .collect();
-            let mut children_by_parent: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
-            for (_, s, _) in &filtered {
-                if let Some(pid) = s.parent_id.as_deref() {
+            // Borrow `conversation_id` / `parent_id` directly from `self.cached_sessions` (unchanged by slicing)
+            // so grouping allocates ZERO UUID `String` clones.
+            let orig_idx_of = |idx: usize, is_sliced: bool| -> usize {
+                if is_sliced {
+                    sliced_storage[idx].0
+                } else {
+                    idx
+                }
+            };
+            let mut present_ids: HashSet<&str> = HashSet::with_capacity(matched_indices.len());
+            for &(idx, is_sliced) in &matched_indices {
+                present_ids.insert(self.cached_sessions[orig_idx_of(idx, is_sliced)].conversation_id.as_str());
+            }
+            let mut rollup: HashMap<&str, (usize, TokenCounts, Option<DateTime<Local>>)> =
+                HashMap::new();
+            for &(idx, is_sliced) in &matched_indices {
+                let base = &self.cached_sessions[orig_idx_of(idx, is_sliced)];
+                if let Some(pid) = base.parent_id.as_deref() {
                     if present_ids.contains(pid) {
-                        children_by_parent.entry(pid).or_default().push(*s);
+                        let (counts, last_time) = if is_sliced {
+                            let sl = sliced_storage[idx].1.as_ref().expect("sliced present");
+                            (&sl.counts, sl.last_time)
+                        } else {
+                            (&base.counts, base.last_time)
+                        };
+                        let e = rollup
+                            .entry(pid)
+                            .or_insert((0, TokenCounts::default(), None));
+                        e.0 += 1;
+                        e.1.merge(counts);
+                        if let Some(kt) = last_time {
+                            if e.2.map(|pt| kt > pt).unwrap_or(true) {
+                                e.2 = Some(kt);
+                            }
+                        }
                     }
                 }
             }
 
-            let mut out = Vec::with_capacity(filtered.len());
-            for &(idx, s, is_sliced) in &filtered {
-                // Skip subagents whose parent is already shown in this view (they roll up into parent).
-                if let Some(pid) = s.parent_id.as_deref() {
-                    if present_ids.contains(pid) {
-                        continue;
-                    }
+            let mut out = Vec::with_capacity(matched_indices.len());
+            for (idx, is_sliced) in matched_indices {
+                let orig_idx = if is_sliced { sliced_storage[idx].0 } else { idx };
+                let base = &self.cached_sessions[orig_idx];
+                if base
+                    .parent_id
+                    .as_deref()
+                    .is_some_and(|pid| present_ids.contains(pid))
+                {
+                    continue;
                 }
-                let mut counts = s.counts;
-                let mut last_time = s.last_time;
-                let mut sub_cnt = 0usize;
-                if let Some(kids) = children_by_parent.get(s.conversation_id.as_str()) {
-                    sub_cnt = kids.len();
-                    for k in kids {
-                        counts.merge(&k.counts);
-                        if let Some(kt) = k.last_time {
+                if is_sliced {
+                    let (sess_idx, sl_opt) = &mut sliced_storage[idx];
+                    let sl = sl_opt.take().expect("sliced item taken once");
+                    let mut counts = sl.counts;
+                    let mut last_time = sl.last_time;
+                    let mut sub_cnt = 0usize;
+                    if let Some((sc, rc, rlt)) = rollup.get(base.conversation_id.as_str()) {
+                        sub_cnt = *sc;
+                        counts.merge(rc);
+                        if let Some(kt) = *rlt {
                             if last_time.map(|pt| kt > pt).unwrap_or(true) {
                                 last_time = Some(kt);
                             }
                         }
                     }
-                }
-                let (sess_idx, sliced) = if is_sliced {
-                    (sliced_storage[idx].0, Some(Box::new(s.clone())))
+                    let primary_model = sl.primary_model.clone();
+                    let is_child_row = sl.is_subagent;
+                    let is_pinned = self.pinned_ids.contains(&sl.conversation_id);
+                    out.push(DisplaySessionRow {
+                        sess_idx: *sess_idx,
+                        out_of_scope: false,
+                        sliced: Some(Box::new(sl)),
+                        counts,
+                        primary_model,
+                        last_time,
+                        subagent_count: sub_cnt,
+                        is_child_row,
+                        is_pinned,
+                    });
                 } else {
-                    (idx, None)
-                };
-                out.push(DisplaySessionRow {
-                    sess_idx,
-                    out_of_scope: false,
-                    sliced,
-                    counts,
-                    primary_model: s.primary_model(),
-                    last_time,
-                    subagent_count: sub_cnt,
-                    is_child_row: s.is_subagent,
-                    is_pinned: self.pinned_ids.contains(&s.conversation_id),
-                });
+                    let mut counts = base.counts;
+                    let mut last_time = base.last_time;
+                    let mut sub_cnt = 0usize;
+                    if let Some((sc, rc, rlt)) = rollup.get(base.conversation_id.as_str()) {
+                        sub_cnt = *sc;
+                        counts.merge(rc);
+                        if let Some(kt) = *rlt {
+                            if last_time.map(|pt| kt > pt).unwrap_or(true) {
+                                last_time = Some(kt);
+                            }
+                        }
+                    }
+                    out.push(DisplaySessionRow {
+                        sess_idx: idx,
+                        out_of_scope: false,
+                        sliced: None,
+                        counts,
+                        primary_model: base.primary_model.clone(),
+                        last_time,
+                        subagent_count: sub_cnt,
+                        is_child_row: base.is_subagent,
+                        is_pinned: self.pinned_ids.contains(&base.conversation_id),
+                    });
+                }
             }
             out
         };
@@ -1358,14 +1947,24 @@ impl DashboardView {
         // without polluting DateScope aggregates / Hero stats / exports). Skip when user explicitly
         // drilled into a specific Date or Week bar/cell.
         let allow_oos = include_out_of_scope_pins
+            && !self.pinned_out_of_scope.is_empty()
             && !matches!(filter, Some(SessionFilter::Date(_) | SessionFilter::Week(_)));
         if allow_oos {
-            let existing: HashSet<String> = rows
+            let existing: HashSet<&str> = rows
                 .iter()
-                .map(|r| self.row_session(r).conversation_id.clone())
+                .map(|r| {
+                    if let Some(ref s) = r.sliced {
+                        s.conversation_id.as_str()
+                    } else if r.out_of_scope {
+                        self.pinned_out_of_scope[r.sess_idx].conversation_id.as_str()
+                    } else {
+                        self.cached_sessions[r.sess_idx].conversation_id.as_str()
+                    }
+                })
                 .collect();
+            let mut oos_to_push = Vec::new();
             for (idx, s) in self.pinned_out_of_scope.iter().enumerate() {
-                if existing.contains(&s.conversation_id) {
+                if existing.contains(s.conversation_id.as_str()) {
                     continue;
                 }
                 if let Some(f) = filter {
@@ -1373,16 +1972,16 @@ impl DashboardView {
                         continue;
                     }
                 }
-                if apply_search && !self.session_matches_search(s) {
+                if apply_search && !self.session_matches_search_lower(s, &q) {
                     continue;
                 }
                 let sliced = slicer.and_then(|f| slice_session(s, f)).map(Box::new);
                 let eff = sliced.as_deref().unwrap_or(s);
-                rows.push(DisplaySessionRow {
+                oos_to_push.push(DisplaySessionRow {
                     sess_idx: idx,
                     out_of_scope: true,
                     counts: eff.counts,
-                    primary_model: eff.primary_model(),
+                    primary_model: eff.primary_model.clone(),
                     last_time: eff.last_time,
                     subagent_count: 0,
                     is_child_row: eff.is_subagent,
@@ -1390,12 +1989,18 @@ impl DashboardView {
                     sliced,
                 });
             }
+            drop(existing);
+            rows.extend(oos_to_push);
         }
 
         if apply_pinned_only {
             rows.retain(|r| r.is_pinned);
         }
-        self.sort_display_rows(&mut rows, None);
+        if pin_first {
+            self.sort_display_rows_by(&mut rows, sort, None);
+        } else {
+            rows.sort_by(|a, b| b.last_time.cmp(&a.last_time));
+        }
         rows
     }
 
@@ -1409,21 +2014,62 @@ impl DashboardView {
         }
     }
 
+    fn make_call_rows_key(&self) -> CallRowsKey {
+        CallRowsKey {
+            data_gen: self.data_gen,
+            sess_ptr: self.cached_sessions.as_ptr() as usize,
+            sess_len: self.cached_sessions.len(),
+            oos_len: self.pinned_out_of_scope.len(),
+            call_sort: self.call_sort,
+            privacy_mode: self.privacy_mode,
+            call_session_filter: self.call_session_filter.clone(),
+            search_query: self.search_query.clone(),
+        }
+    }
+
+    /// Borrows cached sorted call rows + precomputed totals/speed summary.
+    fn with_call_rows<R>(
+        &self,
+        f: impl FnOnce(&[CallRow], TokenCounts, u64, u64) -> R,
+    ) -> R {
+        let key = self.make_call_rows_key();
+        let hit = self
+            .call_rows_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.key == key);
+        if !hit {
+            let (rows, sum, speed_out, speed_secs) = self.build_call_rows_and_summary();
+            *self.call_rows_cache.borrow_mut() = Some(CallRowsCache {
+                key,
+                rows,
+                sum,
+                speed_out,
+                speed_secs,
+            });
+        }
+        let borrow = self.call_rows_cache.borrow();
+        let c = borrow.as_ref().expect("call_rows_cache populated");
+        f(&c.rows, c.sum, c.speed_out, c.speed_secs)
+    }
+
     /// Builds the call log for the current date scope, honoring the shared search box and the
     /// optional single-session drill-down (falling back to `pinned_out_of_scope` when inspecting
     /// an out-of-scope pinned session's calls). Search matches redacted session labels under
     /// privacy mode (same no-oracle rule as the Sessions tab), plus model and tool names.
-    fn call_rows(&self) -> Vec<CallRow> {
+    fn build_call_rows_and_summary(&self) -> (Vec<CallRow>, TokenCounts, u64, u64) {
         let q = self.search_query.trim().to_ascii_lowercase();
         let mut rows = Vec::new();
+        let mut sum = TokenCounts::default();
+        let mut speed_out = 0u64;
+        let mut speed_secs = 0u64;
+
         let mut push_session_calls = |out_of_scope: bool, si: usize, s: &SessionInfo| {
             let session_hit = q.is_empty() || {
-                let title = self.format_session_title(s).to_ascii_lowercase();
-                let sid = self.format_session_id(&s.conversation_id).to_ascii_lowercase();
-                let ws = self.format_workspace_label(&s.workspace).to_ascii_lowercase();
-                title.contains(&q)
-                    || sid.contains(&q)
-                    || ws.contains(&q)
+                let title = self.format_session_title(s);
+                contains_ascii_icase(&title, &q)
+                    || contains_ascii_icase(&self.format_session_id(&s.conversation_id), &q)
+                    || contains_ascii_icase(&self.format_workspace_label(&s.workspace), &q)
                     || source_matches_query(s.source, &q)
             };
             let mut prev_ts: Option<chrono::DateTime<Utc>> = None;
@@ -1436,8 +2082,8 @@ impl DashboardView {
                     prev_ts = t.timestamp_utc;
                 }
                 let hit = session_hit
-                    || t.model.to_ascii_lowercase().contains(&q)
-                    || t.tool_names.iter().any(|n| n.to_ascii_lowercase().contains(&q));
+                    || contains_ascii_icase(&t.model, &q)
+                    || t.tool_names.iter().any(|n| contains_ascii_icase(n, &q));
                 if hit {
                     rows.push(CallRow {
                         out_of_scope,
@@ -1445,6 +2091,17 @@ impl DashboardView {
                         turn_idx: ti,
                         gap_secs,
                     });
+                    sum.add_call_with_cost(
+                        t.input_tokens,
+                        t.cache_read_tokens,
+                        t.cache_write_tokens,
+                        t.output_tokens,
+                        t.cost,
+                    );
+                    if t.output_tps().is_some() {
+                        speed_out += t.output_tokens;
+                        speed_secs += t.gen_secs.unwrap_or(0) as u64;
+                    }
                 }
             }
         };
@@ -1503,7 +2160,12 @@ impl DashboardView {
                 turn(b).output_tokens.cmp(&turn(a).output_tokens).then_with(|| recent(a, b))
             }),
         }
-        rows
+        (rows, sum, speed_out, speed_secs)
+    }
+
+    #[cfg(test)]
+    fn call_rows(&self) -> Vec<CallRow> {
+        self.with_call_rows(|rows, _, _, _| rows.to_vec())
     }
 
     fn call_key(&self, r: &CallRow) -> (String, i64) {
@@ -1520,17 +2182,22 @@ impl DashboardView {
     }
 
     fn step_call(&mut self, delta: isize) -> bool {
-        let rows = self.call_rows();
-        if rows.is_empty() {
+        let next_sel = self.with_call_rows(|rows, _, _, _| {
+            if rows.is_empty() {
+                return None;
+            }
+            let cur_idx = self.selected_call_index(rows);
+            let cur = cur_idx.unwrap_or(0);
+            let next = (cur as isize + delta).clamp(0, (rows.len() - 1) as isize) as usize;
+            if next == cur && cur_idx.is_some() {
+                return None;
+            }
+            Some((next, self.call_key(&rows[next])))
+        });
+        let Some((next, key)) = next_sel else {
             return false;
-        }
-        let cur_idx = self.selected_call_index(&rows);
-        let cur = cur_idx.unwrap_or(0);
-        let next = (cur as isize + delta).clamp(0, (rows.len() - 1) as isize) as usize;
-        if next == cur && cur_idx.is_some() {
-            return false;
-        }
-        self.selected_call = Some(self.call_key(&rows[next]));
+        };
+        self.selected_call = Some(key);
         let vis = self.sessions_vis_rows.max(1);
         if next < self.scroll_rows {
             self.scroll_rows = next;
@@ -1549,10 +2216,10 @@ impl DashboardView {
         }
         // Collapse repeats (parallel calls of the same tool) into `name×N`, keeping first-seen order.
         let mut groups: Vec<(&str, usize)> = Vec::new();
-        for name in &t.tool_names {
-            match groups.iter_mut().find(|g| g.0 == name.as_str()) {
+        for name in t.tool_names.iter() {
+            match groups.iter_mut().find(|g| g.0 == name.as_ref()) {
                 Some(g) => g.1 += 1,
-                None => groups.push((name.as_str(), 1)),
+                None => groups.push((name.as_ref(), 1)),
             }
         }
         let shown: Vec<String> = groups
@@ -1634,63 +2301,68 @@ impl DashboardView {
     /// prompts, tool arguments, or outputs; session labels follow privacy mode.
     pub fn export_calls_csv(&self) -> String {
         let mut out = String::from("\u{FEFF}time,session_id,source,step,model,kind,tools,tool_count,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens,context_tokens,cache_hit_pct,thinking_chars,gen_secs,output_tps,gap_secs,cost_usd,workspace,session_title\n");
-        for r in self.call_rows() {
-            let s = self.call_session(&r);
-            let t = &s.turns[r.turn_idx];
-            let time = t
-                .timestamp_utc
-                .map(|u| u.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_default();
-            let kind = if t.is_checkpoint {
-                "compaction"
-            } else if t.tool_names.is_empty() {
-                "reply"
-            } else {
-                "tool_call"
-            };
-            let cost = if t.cost.is_fully_unpriced(1) {
-                String::new()
-            } else {
-                format!("{:.6}", t.cost.total_usd())
-            };
-            out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{},{}\n",
-                time,
-                csv_escape(&self.format_session_id(&s.conversation_id)),
-                s.source.as_str(),
-                t.step_index,
-                csv_escape(&t.model),
-                kind,
-                csv_escape(&t.tool_names.join(";")),
-                t.tool_names.len(),
-                t.input_tokens,
-                t.cache_read_tokens,
-                t.cache_write_tokens,
-                t.output_tokens,
-                t.reasoning_tokens,
-                t.total_tokens(),
-                t.total_input(),
-                t.cache_hit_rate(),
-                t.thinking_chars,
-                t.gen_secs.map(|g| g.to_string()).unwrap_or_default(),
-                t.output_tps().map(|v| format!("{v:.1}")).unwrap_or_default(),
-                r.gap_secs.map(|g| g.to_string()).unwrap_or_default(),
-                cost,
-                csv_escape(&self.format_workspace_label(&s.workspace)),
-                csv_escape(&self.format_session_title(s)),
-            ));
-        }
+        self.with_call_rows(|rows, _, _, _| {
+            for r in rows {
+                let s = self.call_session(r);
+                let t = &s.turns[r.turn_idx];
+                let time = t
+                    .timestamp_utc
+                    .map(|u| u.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_default();
+                let kind = if t.is_checkpoint {
+                    "compaction"
+                } else if t.tool_names.is_empty() {
+                    "reply"
+                } else {
+                    "tool_call"
+                };
+                let cost = if t.cost.is_fully_unpriced(1) {
+                    String::new()
+                } else {
+                    format!("{:.6}", t.cost.total_usd())
+                };
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{},{}\n",
+                    time,
+                    csv_escape(&self.format_session_id(&s.conversation_id)),
+                    s.source.as_str(),
+                    t.step_index,
+                    csv_escape(&t.model),
+                    kind,
+                    csv_escape(&t.tool_names.join(";")),
+                    t.tool_names.len(),
+                    t.input_tokens,
+                    t.cache_read_tokens,
+                    t.cache_write_tokens,
+                    t.output_tokens,
+                    t.reasoning_tokens,
+                    t.total_tokens(),
+                    t.total_input(),
+                    t.cache_hit_rate(),
+                    t.thinking_chars,
+                    t.gen_secs.map(|g| g.to_string()).unwrap_or_default(),
+                    t.output_tps().map(|v| format!("{v:.1}")).unwrap_or_default(),
+                    r.gap_secs.map(|g| g.to_string()).unwrap_or_default(),
+                    cost,
+                    csv_escape(&self.format_workspace_label(&s.workspace)),
+                    csv_escape(&self.format_session_title(s)),
+                ));
+            }
+        });
         out
     }
 
-    fn ordered_models(&self, sort: ModelSort) -> (Vec<(String, TokenCounts)>, Vec<(String, TokenCounts)>) {
-        let mut primary: Vec<(String, TokenCounts)> = Vec::new();
-        let mut secondary: Vec<(String, TokenCounts)> = Vec::new();
-        for (name, c) in &self.cached_agg.by_model {
+    fn ordered_models_of<'a>(
+        by_model: &'a BTreeMap<String, TokenCounts>,
+        sort: ModelSort,
+    ) -> (Vec<(&'a str, TokenCounts)>, Vec<(&'a str, TokenCounts)>) {
+        let mut primary: Vec<(&'a str, TokenCounts)> = Vec::with_capacity(by_model.len());
+        let mut secondary: Vec<(&'a str, TokenCounts)> = Vec::new();
+        for (name, c) in by_model {
             if is_compaction_model(name) {
-                secondary.push((name.clone(), *c));
+                secondary.push((name.as_str(), *c));
             } else {
-                primary.push((name.clone(), *c));
+                primary.push((name.as_str(), *c));
             }
         }
         match sort {
@@ -1725,6 +2397,10 @@ impl DashboardView {
         }
         secondary.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
         (primary, secondary)
+    }
+
+    fn ordered_models(&self, sort: ModelSort) -> (Vec<(&str, TokenCounts)>, Vec<(&str, TokenCounts)>) {
+        Self::ordered_models_of(&self.cached_agg.by_model, sort)
     }
 
     pub fn set_pricing_status(&mut self, msg: impl Into<String>, is_error: bool) {
@@ -1861,7 +2537,7 @@ impl DashboardView {
                 csv_esc(&last),
                 c.calls,
                 s.active_duration_secs(),
-                s.thinking_turns(),
+                s.thinking_turns,
                 csv_esc(&row.primary_model),
                 c.cache_hit_rate(),
                 c.input_tokens,
@@ -1964,7 +2640,7 @@ impl DashboardView {
                         "is_archived": s.is_archived,
                         "primary_model": s.primary_model(),
                         "active_duration_secs": s.active_duration_secs(),
-                        "thinking_turns": s.thinking_turns(),
+                        "thinking_turns": s.thinking_turns,
                         "tools": s.tool_counts(),
                         "stats": tc_json(&s.counts),
                     })
@@ -1981,9 +2657,9 @@ impl DashboardView {
                         "workspace": self.format_workspace_label(&s.workspace),
                         "source": s.source.as_str(),
                         "is_archived": s.is_archived,
-                        "primary_model": r.primary_model,
+                        "primary_model": r.primary_model.as_ref(),
                         "active_duration_secs": s.active_duration_secs(),
-                        "thinking_turns": s.thinking_turns(),
+                        "thinking_turns": s.thinking_turns,
                         "tools": s.tool_counts(),
                         "stats": tc_json(&r.counts),
                     })
@@ -2052,6 +2728,205 @@ impl DashboardView {
 
     pub fn invalidate_surface(&mut self) {
         self.surface = None;
+        self.last_hero_telemetry_sig = None;
+    }
+
+    /// Releases ALL heavy rendering & view-state resources when the dashboard hides:
+    ///   - Drops `WindowSurface` (DIB + `ID2D1DCRenderTarget` + brushes) FIRST
+    ///   - Drops isolated `dash_factories` (`ID2D1Factory` + `IDWriteFactory` + D3D10Warp pools + measure cache)
+    ///   - Frees cloned `cached_sessions`, `pinned_out_of_scope`, `cached_agg`, `redactor`,
+    ///     hit-test vectors, and derived row/detail caches
+    /// Preserves user navigation/filter/theme preferences for instant reopen fidelity.
+    pub fn on_hide(&mut self) {
+        self.mouse_dip = None;
+        self.pricing_focused_field = None;
+        self.search_focused = false;
+        self.custom_date_focused = None;
+        self.pricing_field_rects = None;
+        self.budget_field_rects = None;
+        self.search_field_rect = None;
+        self.custom_date_rects = None;
+        self.export_btn_rect = None;
+        self.detail_more_btn_rect = None;
+        self.last_hover_sig = HoverSig::default();
+        self.last_hero_telemetry_sig = None;
+        self.hero_block4_layout = None;
+        self.last_full_paint = None;
+        self.had_active_toast = false;
+
+        // Clear transient banners/toast timers and shrink empty search buffer capacity.
+        self.banner_status = None;
+        self.pricing_status = None;
+        self.copied_until = None;
+        self.session_copied_until = None;
+        self.resume_cmd_copied_until = None;
+        self.call_copied_until = None;
+        if self.search_query.is_empty() {
+            self.search_query.shrink_to_fit();
+        }
+
+        // Release surface strictly BEFORE dropping the isolated dashboard D2D factory.
+        self.surface = None;
+        self.dash_factories = None;
+
+        self.cached_sessions.clear();
+        self.cached_sessions.shrink_to_fit();
+        self.pinned_out_of_scope.clear();
+        self.pinned_out_of_scope.shrink_to_fit();
+        self.pinned_ids.clear();
+        self.pinned_ids.shrink_to_fit();
+        self.cached_agg = AggregatedStats::default();
+        *self.redactor.get_mut() = Redactor::default();
+        self.redactor_built.set(false);
+        self.cached_root_sessions = 0;
+        self.cached_sub_sessions = 0;
+
+        self.hit_boxes.clear();
+        self.hit_boxes.shrink_to_fit();
+        self.session_row_rects.clear();
+        self.session_row_rects.shrink_to_fit();
+        self.plot_rects.clear();
+        self.plot_rects.shrink_to_fit();
+        self.discrete_plots.clear();
+        self.discrete_plots.shrink_to_fit();
+
+        self.clear_view_caches();
+        self.cached_alert_level = None;
+        self.data_gen = self.data_gen.wrapping_add(1);
+        self.dirty_filter = true;
+    }
+
+    fn has_active_toast(&self, now: Instant) -> bool {
+        self.copied_until.is_some_and(|t| now < t)
+            || self.session_copied_until.is_some_and(|t| now < t)
+            || self.resume_cmd_copied_until.is_some_and(|t| now < t)
+            || self.call_copied_until.is_some_and(|t| now < t)
+            || self.banner_status.as_ref().is_some_and(|(_, _, t)| now < *t)
+            || self.pricing_status.as_ref().is_some_and(|(_, _, t)| now < *t)
+    }
+
+    /// Decides the minimal repaint required for a 1s telemetry tick while the dashboard is visible:
+    ///   - `Full` on `Tab::System`, date rollover, dirty data, toast expiry, or periodic countdown refresh
+    ///   - `Skip` when Hero Block 4 displayed CPU%/RAM%/GB values are unchanged
+    ///   - `PartialHero` when only Hero Block 4 changed on non-System tabs (~2.5% of pixels)
+    pub fn on_telemetry_tick(&mut self, telemetry: &SystemTelemetry) -> TelemetryRepaintMode {
+        if self.active_tab == Tab::System || self.dirty_filter {
+            return TelemetryRepaintMode::Full;
+        }
+        let now = Instant::now();
+        if self.cached_date != Local::now().date_naive() {
+            return TelemetryRepaintMode::Full;
+        }
+        let toast_now = self.has_active_toast(now);
+        if self.had_active_toast && !toast_now {
+            return TelemetryRepaintMode::Full;
+        }
+        let has_live_countdown = (self.active_tab == Tab::Overview
+            && self.overview_top == OverviewTopMode::QuotaPace)
+            || (self.active_tab == Tab::Models && self.model_view == ModelViewMode::Budget);
+        if has_live_countdown
+            && self
+                .last_full_paint
+                .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(15))
+                .unwrap_or(true)
+        {
+            return TelemetryRepaintMode::Full;
+        }
+        let sig = HeroTelemetrySig::from_telemetry(telemetry);
+        if self.last_hero_telemetry_sig == Some(sig) {
+            return TelemetryRepaintMode::Skip;
+        }
+        if self.surface.is_some()
+            && self.dash_factories.is_some()
+            && self.hero_block4_layout.is_some()
+        {
+            TelemetryRepaintMode::PartialHero
+        } else {
+            TelemetryRepaintMode::Full
+        }
+    }
+
+    /// Repaints ONLY Hero Strip Block 4 (CPU/RAM rings + GB text) into the retained surface DIB
+    /// and blits only that dirty rectangle to `target_hdc`. Returns `Err` if the retained surface
+    /// or layout is unavailable/stale so the caller falls back to a full `InvalidateRect`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn repaint_hero_telemetry_only(
+        &mut self,
+        _shared_factories: &D2DFactories,
+        fonts: &Fonts,
+        hwnd: HWND,
+        target_hdc: HDC,
+        dpi: f32,
+        telemetry: &SystemTelemetry,
+        light_theme: bool,
+    ) -> Result<()> {
+        let Some(layout) = self.hero_block4_layout else {
+            return Err(windows::core::Error::empty());
+        };
+        if target_hdc.0.is_null() {
+            return Err(windows::core::Error::empty());
+        }
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rc);
+        }
+        let px_w = (rc.right - rc.left).max(1);
+        let px_h = (rc.bottom - rc.top).max(1);
+        let matches = self
+            .surface
+            .as_ref()
+            .is_some_and(|s| s.matches(px_w, px_h, dpi));
+        if !matches || self.dash_factories.is_none() {
+            return Err(windows::core::Error::empty());
+        }
+
+        let theme = theme_for(light_theme);
+        let sys_act = self.active_tab == Tab::System;
+        let sys_hov = self
+            .mouse_dip
+            .map(|(mx, my)| hit_rect(&layout.b4, mx, my))
+            .unwrap_or(false);
+        let clip_dip = rect_f(
+            layout.x3 + 1.0,
+            layout.y + 1.0,
+            (layout.band.right - layout.x3 - 2.0).max(1.0),
+            (layout.h - 2.0).max(1.0),
+        );
+
+        let dash_f = self.dash_factories.take().expect("checked dash_factories");
+        let surface = self.surface.take().expect("checked surface");
+        let res = fonts.with_dash(&dash_f, |df| {
+            surface.render_clip_and_blit(Some(target_hdc), clip_dip, |rt| {
+                fill_rect(rt, clip_dip, theme.surface);
+                Self::draw_hero_block4(
+                    &dash_f,
+                    rt,
+                    df,
+                    theme,
+                    layout,
+                    telemetry,
+                    sys_act,
+                    sys_hov,
+                );
+            })
+        });
+        self.dash_factories = Some(dash_f);
+        match res {
+            Ok(Ok(())) => {
+                self.surface = Some(surface);
+                self.last_hero_telemetry_sig = Some(HeroTelemetrySig::from_telemetry(telemetry));
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                // Surface lost/invalid; drop it so fallback full paint recreates cleanly.
+                self.last_hero_telemetry_sig = None;
+                Err(e)
+            }
+            Err(e) => {
+                self.last_hero_telemetry_sig = None;
+                Err(e)
+            }
+        }
     }
 
     pub fn on_scroll(&mut self, delta: i16) {
@@ -2069,22 +2944,36 @@ impl DashboardView {
         self.hit_boxes.iter().any(|hb| hit_rect(&hb.rect, mx, my))
     }
 
-    /// Updates cursor position and returns `true` only when hover visuals actually change
-    /// (entering/leaving a hitbox or moving inside/leaving an interactive chart plot).
+    /// Updates cursor position and returns `true` only when hover visuals actually change:
+    /// entering/leaving a hitbox, changing discrete chart slot (bar/cell/row/sample),
+    /// or moving inside/leaving a continuous plot rect.
     pub fn on_mouse_move(&mut self, x: f32, y: f32) -> bool {
         self.mouse_dip = Some((x, y));
         let hb_idx = self.hit_boxes.iter().rposition(|hb| hit_rect(&hb.rect, x, y));
-        let in_plot = self.plot_rects.iter().any(|r| hit_rect(r, x, y));
-        let sig = (hb_idx, in_plot);
-        let changed = in_plot || self.last_hover_sig.1 || sig != self.last_hover_sig;
+        let continuous_plot = self.plot_rects.iter().any(|r| hit_rect(r, x, y));
+        let discrete_slot = self
+            .discrete_plots
+            .iter()
+            .enumerate()
+            .find_map(|(pi, dp)| dp.hit_slot(x, y).map(|si| (pi, si)));
+        let sig = HoverSig {
+            hit_box: hb_idx,
+            continuous_plot,
+            discrete_slot,
+        };
+        let changed = continuous_plot
+            || self.last_hover_sig.continuous_plot
+            || sig != self.last_hover_sig;
         self.last_hover_sig = sig;
         changed
     }
 
     pub fn on_mouse_leave(&mut self) -> bool {
         self.mouse_dip = None;
-        let had_hover = self.last_hover_sig.0.is_some() || self.last_hover_sig.1;
-        self.last_hover_sig = (None, false);
+        let had_hover = self.last_hover_sig.hit_box.is_some()
+            || self.last_hover_sig.continuous_plot
+            || self.last_hover_sig.discrete_slot.is_some();
+        self.last_hover_sig = HoverSig::default();
         had_hover
     }
 
@@ -2243,6 +3132,10 @@ impl DashboardView {
             }
             ClickAction::TogglePrivacyMode => {
                 self.privacy_mode = !self.privacy_mode;
+                if !self.privacy_mode {
+                    *self.redactor.get_mut() = Redactor::default();
+                    self.redactor_built.set(false);
+                }
                 (false, true)
             }
             ClickAction::ToggleGroupSubagents => {
@@ -2318,10 +3211,10 @@ impl DashboardView {
                             fmt_compact(c.peak_context),
                         )
                     };
-                    for (name, c) in &primary {
+                    for &(name, ref c) in &primary {
                         lines.push(fmt_row(name, c, self.cached_agg.by_model_cache.get(name), ""));
                     }
-                    for (name, c) in &secondary {
+                    for &(name, ref c) in &secondary {
                         lines.push(fmt_row(name, c, self.cached_agg.by_model_cache.get(name), " [次要]"));
                     }
                     lines.push(format!(
@@ -2361,12 +3254,12 @@ impl DashboardView {
                 (false, false)
             }
             ClickAction::CopySessionDetail => {
-                let sel = self
+                let text = self
                     .selected_session
                     .as_deref()
-                    .and_then(|id| self.session_for_detail(id));
-                if let Some(s) = sel {
-                    let text = self.format_session_detail_clipboard(&s);
+                    .and_then(|id| self.session_ref_for_detail(id))
+                    .map(|s| self.format_session_detail_clipboard(s.as_ref()));
+                if let Some(text) = text {
                     if copy_text_to_clipboard(hwnd, &text) {
                         self.session_copied_until =
                             Some(Instant::now() + std::time::Duration::from_millis(1600));
@@ -2417,14 +3310,20 @@ impl DashboardView {
                 self.prev_token_tab = Tab::Sessions;
                 self.scroll_rows = 0;
                 if !expanded_scope {
-                    let matches = self.display_sessions_for_tab();
-                    let keep = self
-                        .selected_session
-                        .as_deref()
-                        .map(|id| matches.iter().any(|r| self.row_session(r).conversation_id == id))
-                        .unwrap_or(false);
-                    if !keep {
-                        self.selected_session = matches.first().map(|r| self.row_session(r).conversation_id.clone());
+                    let replacement = self.with_display_sessions_for_tab(|matches| {
+                        let keep = self
+                            .selected_session
+                            .as_deref()
+                            .map(|id| matches.iter().any(|r| self.row_session(r).conversation_id == id))
+                            .unwrap_or(false);
+                        if keep {
+                            None
+                        } else {
+                            Some(matches.first().map(|r| self.row_session(r).conversation_id.clone()))
+                        }
+                    });
+                    if let Some(new_sel) = replacement {
+                        self.selected_session = new_sel;
                     }
                 }
                 (false, false)
@@ -2463,10 +3362,14 @@ impl DashboardView {
                 (false, false)
             }
             ClickAction::CopyCallDetail => {
-                let rows = self.call_rows();
-                if let Some(r) = self.selected_call_index(&rows).map(|i| rows[i]) {
-                    let s = self.call_session(&r);
-                    let text = self.format_call_detail_clipboard(s, &s.turns[r.turn_idx], r.gap_secs);
+                let text = self.with_call_rows(|rows, _, _, _| {
+                    self.selected_call_index(rows).map(|i| {
+                        let r = rows[i];
+                        let s = self.call_session(&r);
+                        self.format_call_detail_clipboard(s, &s.turns[r.turn_idx], r.gap_secs)
+                    })
+                });
+                if let Some(text) = text {
                     if copy_text_to_clipboard(hwnd, &text) {
                         self.call_copied_until = Some(Instant::now() + std::time::Duration::from_millis(1600));
                     }
@@ -2484,38 +3387,44 @@ impl DashboardView {
         self.cached_date = today;
         let (sessions, agg) =
             filter_snapshot_range(snapshot, self.scope, self.custom_since, self.custom_until);
-        let all_ids: HashSet<&str> = snapshot
-            .sessions
-            .iter()
-            .map(|s| s.conversation_id.as_str())
-            .collect();
-        self.pinned_ids = snapshot
-            .session_meta
-            .iter()
-            .filter(|(k, m)| m.pinned && all_ids.contains(k.as_str()))
-            .map(|(k, _)| k.clone())
-            .collect();
-        let in_scope_ids: HashSet<&str> = sessions
-            .iter()
-            .map(|s| s.conversation_id.as_str())
-            .collect();
-        let pinned_out_of_scope: Vec<SessionInfo> = snapshot
-            .sessions
-            .iter()
-            .filter(|s| {
-                self.pinned_ids.contains(&s.conversation_id)
-                    && !in_scope_ids.contains(s.conversation_id.as_str())
-            })
-            .cloned()
-            .collect();
+        let has_any_pinned = snapshot.session_meta.values().any(|m| m.pinned);
+        let pinned_out_of_scope: Vec<SessionInfo> = if has_any_pinned {
+            let all_ids: HashSet<&str> = snapshot
+                .sessions
+                .iter()
+                .map(|s| s.conversation_id.as_str())
+                .collect();
+            self.pinned_ids = snapshot
+                .session_meta
+                .iter()
+                .filter(|(k, m)| m.pinned && all_ids.contains(k.as_str()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if self.pinned_ids.is_empty() {
+                Vec::new()
+            } else {
+                let in_scope_ids: HashSet<&str> = sessions
+                    .iter()
+                    .map(|s| s.conversation_id.as_str())
+                    .collect();
+                snapshot
+                    .sessions
+                    .iter()
+                    .filter(|s| {
+                        self.pinned_ids.contains(&s.conversation_id)
+                            && !in_scope_ids.contains(s.conversation_id.as_str())
+                    })
+                    .cloned()
+                    .collect()
+            }
+        } else {
+            self.pinned_ids.clear();
+            Vec::new()
+        };
 
-        // Build Redactor across both in-scope sessions and out-of-scope pinned sessions so
-        // cross-scope pinned rows never degrade to `S-???` / `项目 ?`, while preserving exact
-        // in-scope numbering and Hero aggregates.
-        let mut all_for_redactor = Vec::with_capacity(sessions.len() + pinned_out_of_scope.len());
-        all_for_redactor.extend(sessions.iter().cloned());
-        all_for_redactor.extend(pinned_out_of_scope.iter().cloned());
-        self.redactor = Redactor::build(&all_for_redactor, &agg);
+        // Invalidate Redactor lazily (zero allocation when privacy_mode == false!).
+        *self.redactor.get_mut() = Redactor::default();
+        self.redactor_built.set(false);
 
         if self.pinned_ids.is_empty() {
             self.pinned_only = false;
@@ -2532,29 +3441,103 @@ impl DashboardView {
                 OverviewTopMode::WeeklyCompare
             };
         }
+        let (all_root, all_sub) = Self::session_split_counts_of(&snapshot.sessions);
+        let (cached_root, cached_sub) = Self::session_split_counts_of(&sessions);
         self.cached_sessions = sessions;
         self.pinned_out_of_scope = pinned_out_of_scope;
         self.cached_agg = agg;
         self.all_total = snapshot.agg.total;
         self.all_sessions_count = snapshot.sessions.len();
+        self.all_root_sessions = all_root;
+        self.all_sub_sessions = all_sub;
+        self.cached_root_sessions = cached_root;
+        self.cached_sub_sessions = cached_sub;
         self.has_non_antigravity = snapshot.has_non_antigravity();
         self.dirty_filter = false;
+        self.data_gen = self.data_gen.wrapping_add(1);
+        self.cached_alert_level = None;
+        self.clear_view_caches();
 
-        let visible = self.display_sessions_for_tab();
-        let keep = self
-            .selected_session
-            .as_ref()
-            .map(|id| visible.iter().any(|r| &self.row_session(r).conversation_id == id))
-            .unwrap_or(false);
-        if !keep {
-            self.selected_session = visible.first().map(|r| self.row_session(r).conversation_id.clone());
+        // Only eagerly build `session_rows_cache` when already on `Tab::Sessions`; on all other
+        // tabs validate `selected_session` via a zero-alloc scan and defer row-cache building.
+        if self.active_tab == Tab::Sessions {
+            let replacement = self.with_display_sessions_for_tab(|visible| {
+                let keep = self
+                    .selected_session
+                    .as_ref()
+                    .map(|id| visible.iter().any(|r| &self.row_session(r).conversation_id == id))
+                    .unwrap_or(false);
+                if keep {
+                    None
+                } else {
+                    Some(visible.first().map(|r| self.row_session(r).conversation_id.clone()))
+                }
+            });
+            if let Some(new_sel) = replacement {
+                self.selected_session = new_sel;
+            }
+        } else if let Some(ref sel_id) = self.selected_session {
+            let exists = self
+                .cached_sessions
+                .iter()
+                .chain(self.pinned_out_of_scope.iter())
+                .any(|s| &s.conversation_id == sel_id);
+            if !exists {
+                self.selected_session = None;
+            }
         }
+    }
+
+    fn compute_alert_level(&mut self, snapshot: &ScanSnapshot) -> u8 {
+        let now_utc = Utc::now();
+        let minute_bucket = now_utc.timestamp() / 60;
+        if let Some((gen, bucket, lvl)) = self.cached_alert_level {
+            if gen == self.data_gen && bucket == minute_bucket {
+                return lvl;
+            }
+        }
+        let today_date = Local::now().date_naive();
+        let today_key = today_date.format("%Y-%m-%d").to_string();
+        let week_key = iso_week_key(today_date);
+        let today_usd = snapshot
+            .agg
+            .by_day
+            .get(&today_key)
+            .map(|c| c.cost.total_usd())
+            .unwrap_or(0.0);
+        let week_usd = snapshot
+            .agg
+            .by_week
+            .get(&week_key)
+            .map(|c| c.cost.total_usd())
+            .unwrap_or(0.0);
+        let alerts = evaluate_alerts(
+            &snapshot.budget,
+            &today_key,
+            today_usd,
+            &week_key,
+            week_usd,
+            snapshot.statusline.as_ref(),
+            now_utc,
+        );
+        let lvl = match alerts
+            .iter()
+            .map(|a| a.severity)
+            .max()
+            .unwrap_or(AlertSeverity::Normal)
+        {
+            AlertSeverity::Critical => 2u8,
+            AlertSeverity::Warn => 1u8,
+            AlertSeverity::Normal => 0u8,
+        };
+        self.cached_alert_level = Some((self.data_gen, minute_bucket, lvl));
+        lvl
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn render_to_hdc(
         &mut self,
-        factories: &D2DFactories,
+        _shared_factories: &D2DFactories,
         fonts: &Fonts,
         hwnd: HWND,
         target_hdc: Option<HDC>,
@@ -2566,6 +3549,12 @@ impl DashboardView {
     ) -> Result<()> {
         self.ensure_filtered(snapshot);
 
+        // Lazily create an isolated dashboard-only Direct2D + DirectWrite factory so D3D10Warp
+        // software rasterizer pools are genuinely torn down when `on_hide()` drops it.
+        if self.dash_factories.is_none() {
+            self.dash_factories = Some(D2DFactories::new()?);
+        }
+
         let mut rc = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd, &mut rc);
@@ -2576,116 +3565,111 @@ impl DashboardView {
         let w = px_w as f32 / scale;
         let h = px_h as f32 / scale;
 
-        let need_new = match &self.surface {
-            Some(s) => !s.matches(px_w, px_h, dpi),
-            None => true,
+        let dash_f = self.dash_factories.take().expect("dash_factories initialized");
+        let surface_res: Result<WindowSurface> = match self.surface.take() {
+            Some(mut existing) => {
+                if !existing.matches(px_w, px_h, dpi) {
+                    match existing.resize(px_w, px_h, dpi) {
+                        Ok(()) => Ok(existing),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(existing)
+                }
+            }
+            None => WindowSurface::new(&dash_f, px_w, px_h, dpi),
         };
-        if need_new {
-            self.surface = Some(WindowSurface::new(factories, px_w, px_h, dpi)?);
-        }
+        let surface = match surface_res {
+            Ok(s) => s,
+            Err(e) => {
+                self.dash_factories = Some(dash_f);
+                return Err(e);
+            }
+        };
 
         self.hit_boxes.clear();
         self.session_row_rects.clear();
         self.plot_rects.clear();
+        self.discrete_plots.clear();
         self.pricing_field_rects = None;
         self.budget_field_rects = None;
         self.search_field_rect = None;
         self.custom_date_rects = None;
         self.export_btn_rect = None;
         self.detail_more_btn_rect = None;
+        self.hero_block4_layout = None;
         let theme = theme_for(light_theme);
+        let alert_level = self.compute_alert_level(snapshot);
 
-        let alert_level = {
-            let today_date = Local::now().date_naive();
-            let today_key = today_date.format("%Y-%m-%d").to_string();
-            let week_key = iso_week_key(today_date);
-            let today_usd = snapshot
-                .agg
-                .by_day
-                .get(&today_key)
-                .map(|c| c.cost.total_usd())
-                .unwrap_or(0.0);
-            let week_usd = snapshot
-                .agg
-                .by_week
-                .get(&week_key)
-                .map(|c| c.cost.total_usd())
-                .unwrap_or(0.0);
-            let alerts = evaluate_alerts(
-                &snapshot.budget,
-                &today_key,
-                today_usd,
-                &week_key,
-                week_usd,
-                snapshot.statusline.as_ref(),
-                Utc::now(),
-            );
-            match alerts
-                .iter()
-                .map(|a| a.severity)
-                .max()
-                .unwrap_or(AlertSeverity::Normal)
-            {
-                AlertSeverity::Critical => 2u8,
-                AlertSeverity::Warn => 1u8,
-                AlertSeverity::Normal => 0u8,
-            }
-        };
-
-        let Some(surface) = self.surface.take() else {
-            return Ok(());
-        };
-        let res = surface.render_and_blit(target_hdc, |rt| {
-            unsafe {
-                rt.Clear(Some(&theme.bg));
-            }
-            self.draw_header(factories, rt, fonts, theme, w, human, light_theme, alert_level);
-            let y_off = if self.is_custom_date_active() {
-                self.draw_custom_date_bar(rt, fonts, theme, w);
-                32.0
-            } else {
-                0.0
-            };
-            self.draw_hero_strip(factories, rt, fonts, theme, w, 58.0 + y_off, snapshot, telemetry, human);
-
-            let body = rect_f(
-                20.0,
-                148.0 + y_off,
-                (w - 40.0).max(200.0),
-                (h - 166.0 - y_off).max(180.0),
-            );
-            match self.active_tab {
-                Tab::Overview => self.draw_overview_tab(factories, rt, fonts, theme, body, snapshot, human),
-                Tab::Daily => self.draw_daily_tab(rt, fonts, theme, body, snapshot, human),
-                Tab::Weekly => self.draw_weekly_tab(rt, fonts, theme, body, snapshot, human),
-                Tab::Models => self.draw_models_tab(factories, rt, fonts, theme, body, snapshot, human),
-                Tab::Sessions => self.draw_sessions_tab(factories, rt, fonts, theme, body, snapshot, human),
-                Tab::Calls => self.draw_calls_tab(factories, rt, fonts, theme, body, human),
-                Tab::System => self.draw_system_tab(factories, rt, fonts, theme, body, snapshot, telemetry),
-            }
-
-            // Quiet bottom-center ephemeral confirmation toast (export / statusline copy)
-            if let Some((ref msg, is_err, until)) = self.banner_status {
-                if Instant::now() < until {
-                    let tw = (factories.measure_text_width(msg, &fonts.ui_small) + 28.0).clamp(180.0, w - 60.0);
-                    let th = 28.0;
-                    let tr = rect_f((w - tw) * 0.5, h - th - 14.0, tw, th);
-                    fill_round_rect(rt, tr, 7.0, theme.tooltip_bg);
-                    stroke_round_rect(rt, tr, 7.0, if is_err { theme.danger } else { theme.sage }, 1.0);
-                    draw_text(rt, msg, &fonts.ui_small_center, tr, if is_err { theme.danger } else { theme.text });
+        let res = fonts.with_dash(&dash_f, |df| {
+            surface.render_and_blit(target_hdc, |rt| {
+                unsafe {
+                    rt.Clear(Some(&theme.bg));
                 }
-            }
+                self.draw_header(&dash_f, rt, df, theme, w, human, light_theme, alert_level);
+                let y_off = if self.is_custom_date_active() {
+                    self.draw_custom_date_bar(rt, df, theme, w);
+                    32.0
+                } else {
+                    0.0
+                };
+                self.draw_hero_strip(&dash_f, rt, df, theme, w, 58.0 + y_off, snapshot, telemetry, human);
+
+                let body = rect_f(
+                    20.0,
+                    148.0 + y_off,
+                    (w - 40.0).max(200.0),
+                    (h - 166.0 - y_off).max(180.0),
+                );
+                match self.active_tab {
+                    Tab::Overview => self.draw_overview_tab(&dash_f, rt, df, theme, body, snapshot, human),
+                    Tab::Daily => self.draw_daily_tab(rt, df, theme, body, snapshot, human),
+                    Tab::Weekly => self.draw_weekly_tab(rt, df, theme, body, snapshot, human),
+                    Tab::Models => self.draw_models_tab(&dash_f, rt, df, theme, body, snapshot, human),
+                    Tab::Sessions => self.draw_sessions_tab(&dash_f, rt, df, theme, body, snapshot, human),
+                    Tab::Calls => self.draw_calls_tab(&dash_f, rt, df, theme, body, human),
+                    Tab::System => self.draw_system_tab(&dash_f, rt, df, theme, body, snapshot, telemetry),
+                }
+
+                // Quiet bottom-center ephemeral confirmation toast (export / statusline copy)
+                if let Some((ref msg, is_err, until)) = self.banner_status {
+                    if Instant::now() < until {
+                        let tw = (dash_f.measure_text_width(msg, &df.ui_small) + 28.0).clamp(180.0, w - 60.0);
+                        let th = 28.0;
+                        let tr = rect_f((w - tw) * 0.5, h - th - 14.0, tw, th);
+                        fill_round_rect(rt, tr, 7.0, theme.tooltip_bg);
+                        stroke_round_rect(rt, tr, 7.0, if is_err { theme.danger } else { theme.sage }, 1.0);
+                        draw_text(rt, msg, &df.ui_small_center, tr, if is_err { theme.danger } else { theme.text });
+                    }
+                }
+            })
         });
-        if res.is_ok() {
-            self.surface = Some(surface);
+
+        self.dash_factories = Some(dash_f);
+        match res {
+            Ok(Ok(())) => {
+                self.surface = Some(surface);
+                let now = Instant::now();
+                self.last_full_paint = Some(now);
+                self.had_active_toast = self.has_active_toast(now);
+                self.last_hero_telemetry_sig = Some(HeroTelemetrySig::from_telemetry(telemetry));
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.last_hero_telemetry_sig = None;
+                Err(e)
+            }
+            Err(e) => {
+                self.last_hero_telemetry_sig = None;
+                Err(e)
+            }
         }
-        res
     }
 
     fn draw_custom_date_bar(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         w: f32,
     ) {
@@ -2749,7 +3733,7 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         w: f32,
         human: bool,
@@ -2937,7 +3921,7 @@ impl DashboardView {
     fn draw_ghost_btn(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         r: D2D_RECT_F,
         label: &str,
@@ -2963,11 +3947,76 @@ impl DashboardView {
     // ---------- Typographic Hero Strip (Clickable CPU/RAM Ring Block) ----------
 
     #[allow(clippy::too_many_arguments)]
+    fn draw_hero_block4(
+        factories: &D2DFactories,
+        rt: &ID2D1RenderTarget,
+        fonts: &DashFonts,
+        theme: &Theme,
+        layout: HeroBlock4Layout,
+        telemetry: &SystemTelemetry,
+        sys_act: bool,
+        sys_hov: bool,
+    ) {
+        let HeroBlock4Layout { band, x3, y, h, b4 } = layout;
+        if sys_act {
+            fill_round_rect(rt, b4, 7.0, with_alpha(theme.accent, 0.08));
+            fill_round_rect(
+                rt,
+                rect_f(b4.left + 14.0, band.bottom - 2.5, (b4.right - b4.left - 28.0).max(20.0), 2.5),
+                1.25,
+                theme.accent,
+            );
+        } else if sys_hov {
+            fill_round_rect(rt, b4, 7.0, theme.hover);
+        }
+
+        let tel = telemetry.latest;
+        let g_cy = y + h * 0.5;
+        let c_cx = x3 + 32.0;
+        let mut fbuf = FmtBuf::new();
+        draw_ring_gauge(factories, rt, c_cx, g_cy, 17.0, 3.0, tel.cpu_pct, theme.grid, theme.accent);
+        let _ = write!(fbuf, "{:.0}%", tel.cpu_pct);
+        draw_text(rt, fbuf.as_str(), &fonts.mono_small_center, rect_f(c_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
+
+        let r_cx = x3 + 80.0;
+        draw_ring_gauge(factories, rt, r_cx, g_cy, 17.0, 3.0, tel.mem_pct, theme.grid, theme.ram);
+        fbuf.clear();
+        let _ = write!(fbuf, "{:.0}%", tel.mem_pct);
+        draw_text(rt, fbuf.as_str(), &fonts.mono_small_center, rect_f(r_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
+
+        let tx_l = x3 + 106.0;
+        let tx_w = (band.right - tx_l - 10.0).max(60.0);
+        draw_text(
+            rt,
+            if sys_act { "系统监控  ‹ 返回" } else { "CPU / 内存  ›" },
+            &fonts.ui_micro,
+            rect_f(tx_l, y + 14.0, tx_w, 14.0),
+            if sys_act { theme.accent } else if sys_hov { theme.text } else { theme.muted },
+        );
+        fbuf.clear();
+        if tx_w >= 104.0 {
+            let _ = write!(fbuf, "{:.1}/{:.1} GB", tel.mem_used_gb, tel.mem_total_gb);
+        } else {
+            let _ = write!(fbuf, "{:.1}/{:.0}G", tel.mem_used_gb, tel.mem_total_gb);
+        }
+        draw_text(
+            rt,
+            fbuf.as_str(),
+            &fonts.mono_med,
+            rect_f(tx_l, y + 31.0, tx_w, 18.0),
+            theme.text,
+        );
+        fbuf.clear();
+        let _ = write!(fbuf, "{} 核实时", tel.cpu_cores);
+        draw_text(rt, fbuf.as_str(), &fonts.ui_micro, rect_f(tx_l, y + 50.0, tx_w, 14.0), theme.sub);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_hero_strip(
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         w: f32,
         y: f32,
@@ -2995,10 +4044,15 @@ impl DashboardView {
 
         let use_full = !self.tab_uses_scope();
         let (t, days_cnt, root_sess, sub_sess, total_sess) = if use_full {
-            let (r, s) = Self::session_split_counts_of(&snapshot.sessions);
-            (snapshot.agg.total, snapshot.agg.by_day.len(), r, s, snapshot.sessions.len())
+            (
+                snapshot.agg.total,
+                snapshot.agg.by_day.len(),
+                self.all_root_sessions,
+                self.all_sub_sessions,
+                snapshot.sessions.len(),
+            )
         } else {
-            let (r, s) = Self::session_split_counts_of(&self.cached_sessions);
+            let (r, s) = self.session_split_counts();
             (self.cached_agg.total, self.cached_agg.by_day.len(), r, s, self.cached_sessions.len())
         };
 
@@ -3043,9 +4097,7 @@ impl DashboardView {
                         continue;
                     }
                     let sw = ((v / tot_usd) as f32 * bar_w).max(2.0);
-                    if let Some(b) = brush(rt, col) {
-                        unsafe { rt.FillRectangle(&rect_f(bx, bar_y, sw.min(bar_l + bar_w - bx), 2.5), &b) };
-                    }
+                    fill_rect(rt, rect_f(bx, bar_y, sw.min(bar_l + bar_w - bx), 2.5), col);
                     bx += sw;
                 }
             }
@@ -3085,9 +4137,7 @@ impl DashboardView {
                         continue;
                     }
                     let sw = ((v as f32 / tot) * bar_w).max(2.0);
-                    if let Some(b) = brush(rt, col) {
-                        unsafe { rt.FillRectangle(&rect_f(bx, bar_y, sw.min(bar_l + bar_w - bx), 2.5), &b) };
-                    }
+                    fill_rect(rt, rect_f(bx, bar_y, sw.min(bar_l + bar_w - bx), 2.5), col);
                     bx += sw;
                 }
             }
@@ -3154,56 +4204,15 @@ impl DashboardView {
 
         // Block 4: Clickable Radial Ring Gauges for CPU & RAM (toggles System Monitor view!)
         let b4 = rect_f(x3 + 4.0, y + 4.0, (band.right - x3 - 8.0).max(80.0), h - 8.0);
+        let layout = HeroBlock4Layout { band, x3, y, h, b4 };
+        self.hero_block4_layout = Some(layout);
         let sys_act = self.active_tab == Tab::System;
         let sys_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&b4, mx, my)).unwrap_or(false);
-        if sys_act {
-            fill_round_rect(rt, b4, 7.0, with_alpha(theme.accent, 0.08));
-            fill_round_rect(
-                rt,
-                rect_f(b4.left + 14.0, band.bottom - 2.5, (b4.right - b4.left - 28.0).max(20.0), 2.5),
-                1.25,
-                theme.accent,
-            );
-        } else if sys_hov {
-            fill_round_rect(rt, b4, 7.0, theme.hover);
-        }
         self.hit_boxes.push(HitBox {
             rect: b4,
             action: ClickAction::ToggleSystemView,
         });
-
-        let tel = telemetry.latest;
-        let g_cy = y + h * 0.5;
-        let c_cx = x3 + 32.0;
-        draw_ring_gauge(factories, rt, c_cx, g_cy, 17.0, 3.0, tel.cpu_pct, theme.grid, theme.accent);
-        draw_text(rt, &format!("{:.0}%", tel.cpu_pct), &fonts.mono_small_center, rect_f(c_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
-
-        let r_cx = x3 + 80.0;
-        draw_ring_gauge(factories, rt, r_cx, g_cy, 17.0, 3.0, tel.mem_pct, theme.grid, theme.ram);
-        draw_text(rt, &format!("{:.0}%", tel.mem_pct), &fonts.mono_small_center, rect_f(r_cx - 18.0, g_cy - 8.0, 36.0, 16.0), theme.text);
-
-        let tx_l = x3 + 106.0;
-        let tx_w = (band.right - tx_l - 10.0).max(60.0);
-        draw_text(
-            rt,
-            if sys_act { "系统监控  ‹ 返回" } else { "CPU / 内存  ›" },
-            &fonts.ui_micro,
-            rect_f(tx_l, y + 14.0, tx_w, 14.0),
-            if sys_act { theme.accent } else if sys_hov { theme.text } else { theme.muted },
-        );
-        let ram_str = if tx_w >= 104.0 {
-            format!("{:.1}/{:.1} GB", tel.mem_used_gb, tel.mem_total_gb)
-        } else {
-            format!("{:.1}/{:.0}G", tel.mem_used_gb, tel.mem_total_gb)
-        };
-        draw_text(
-            rt,
-            &ram_str,
-            &fonts.mono_med,
-            rect_f(tx_l, y + 31.0, tx_w, 18.0),
-            theme.text,
-        );
-        draw_text(rt, &format!("{} 核实时", tel.cpu_cores), &fonts.ui_micro, rect_f(tx_l, y + 50.0, tx_w, 14.0), theme.sub);
+        Self::draw_hero_block4(factories, rt, fonts, theme, layout, telemetry, sys_act, sys_hov);
     }
 
     // ---------- Tab 1: Redesigned 3-Panel Editorial Overview ----------
@@ -3213,12 +4222,17 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
         human: bool,
     ) {
+        enum OverviewBarMeta {
+            Hour(usize, TokenCounts),
+            Day(NaiveDate, String, TokenCounts),
+        }
+
         let gap = 14.0;
         let bw = body.right - body.left;
         let bh = body.bottom - body.top;
@@ -3233,7 +4247,7 @@ impl DashboardView {
         fill_round_rect(rt, tl, 10.0, theme.surface);
         stroke_round_rect(rt, tl, 10.0, theme.border, 1.0);
 
-        let (chart_title, bars, bar_days, empty_msg) = if self.scope == DateScope::Today {
+        let (chart_title, bars, bar_meta, bar_days, empty_msg) = if self.scope == DateScope::Today {
             let active_hours: Vec<usize> = self
                 .cached_agg
                 .by_hour
@@ -3241,6 +4255,7 @@ impl DashboardView {
                 .enumerate()
                 .filter_map(|(h, c)| if c.calls > 0 { Some(h) } else { None })
                 .collect();
+            let mut meta = Vec::new();
             let items: Vec<BarItem> = if let (Some(&first_h), Some(&last_h)) =
                 (active_hours.first(), active_hours.last())
             {
@@ -3250,36 +4265,23 @@ impl DashboardView {
                 if end_h.saturating_sub(start_h) < 7 {
                     start_h = end_h.saturating_sub(7);
                 }
+                const HOUR_LABELS: [&str; 24] = [
+                    "00h", "01h", "02h", "03h", "04h", "05h", "06h", "07h",
+                    "08h", "09h", "10h", "11h", "12h", "13h", "14h", "15h",
+                    "16h", "17h", "18h", "19h", "20h", "21h", "22h", "23h",
+                ];
                 (start_h..=end_h)
                     .map(|h| {
                         let c = self.cached_agg.by_hour[h];
-                        let tip = if self.cost_mode {
-                            vec![
-                                format!("今日 {:02}:00 - {:02}:59 · {} 次", h, h, c.calls),
-                                format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
-                                format!("新输入  : {} ({})", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_compact(c.input_tokens)),
-                                format!("缓存读  : {} ({:.1}%)", fmt_usd_precise(c.cost.cache_read_usd), c.cache_hit_rate()),
-                                format!("输出    : {} ({})", fmt_usd_precise(c.cost.output_usd), fmt_compact(c.output_tokens)),
-                                format!("总Token : {}", fmt_commas(c.total_tokens())),
-                            ]
-                        } else {
-                            vec![
-                                format!("今日 {:02}:00 - {:02}:59 · {} 次", h, h, c.calls),
-                                format!("总计   : {}", fmt_commas(c.total_tokens())),
-                                format!("估算费 : {}", fmt_cost(&c.cost, c.calls, false)),
-                                format!("新输入 : {}", fmt_commas(c.input_tokens)),
-                                format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
-                                format!("输出   : {}", fmt_commas(c.output_tokens)),
-                            ]
-                        };
-                        self.make_bar(format!("{:02}h", h), &c, false, tip)
+                        meta.push(OverviewBarMeta::Hour(h, c));
+                        self.make_bar(HOUR_LABELS[h], &c, false)
                     })
                     .collect()
             } else {
                 Vec::new()
             };
             let title = if self.cost_mode { "今日分时费用 ($)" } else { "今日分时趋势" };
-            (title, items, Vec::new(), "今日暂无用量 · 右上角可切换 7天 / 全部")
+            (title, items, meta, Vec::new(), "今日暂无用量 · 右上角可切换 7天 / 全部")
         } else {
             let (end_day, n_days): (NaiveDate, u64) = match self.scope {
                 DateScope::Days7 => (today, 7),
@@ -3321,7 +4323,8 @@ impl DashboardView {
                     (today, span)
                 }
             };
-            let mut days_keys: Vec<Option<String>> = Vec::new();
+            let mut days_keys: Vec<Option<String>> = Vec::with_capacity(n_days as usize);
+            let mut meta: Vec<OverviewBarMeta> = Vec::with_capacity(n_days as usize);
             let items: Vec<BarItem> = (0..n_days)
                 .rev()
                 .filter_map(|off| end_day.checked_sub_days(chrono::Days::new(off)))
@@ -3329,26 +4332,8 @@ impl DashboardView {
                     let k = d.format("%Y-%m-%d").to_string();
                     let c = self.cached_agg.by_day.get(&k).copied().unwrap_or_default();
                     days_keys.push(if c.calls > 0 { Some(k.clone()) } else { None });
-                    let tip = if self.cost_mode {
-                        vec![
-                            format!("{} ({}) · {} 次", k, weekday_cn(d), c.calls),
-                            format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
-                            format!("新输入  : {} ({})", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_compact(c.input_tokens)),
-                            format!("缓存读  : {} ({:.1}%)", fmt_usd_precise(c.cost.cache_read_usd), c.cache_hit_rate()),
-                            format!("输出    : {} ({})", fmt_usd_precise(c.cost.output_usd), fmt_compact(c.output_tokens)),
-                            format!("总Token : {}", fmt_commas(c.total_tokens())),
-                        ]
-                    } else {
-                        vec![
-                            format!("{} ({}) · {} 次", k, weekday_cn(d), c.calls),
-                            format!("总计   : {}", fmt_commas(c.total_tokens())),
-                            format!("估算费 : {}", fmt_cost(&c.cost, c.calls, false)),
-                            format!("新输入 : {}", fmt_commas(c.input_tokens)),
-                            format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
-                            format!("输出   : {}", fmt_commas(c.output_tokens)),
-                        ]
-                    };
-                    self.make_bar(d.format("%m/%d").to_string(), &c, false, tip)
+                    meta.push(OverviewBarMeta::Day(d, k, c));
+                    self.make_bar(d.format("%m/%d").to_string(), &c, false)
                 })
                 .collect();
             let title = if self.cost_mode {
@@ -3358,14 +4343,14 @@ impl DashboardView {
             } else {
                 "每日用量趋势"
             };
-            (title, items, days_keys, "暂无用量数据")
+            (title, items, meta, days_keys, "暂无用量数据")
         };
 
         draw_text(rt, chart_title, &fonts.ui_section, rect_f(tl.left + 16.0, tl.top + 11.0, 146.0, 20.0), theme.text);
         self.draw_chart_legend_and_toggle(rt, fonts, theme, tl);
         let tl_plot = rect_f(tl.left + 10.0, tl.top + 38.0, left_w - 20.0, top_h - 46.0);
-        self.plot_rects.push(tl_plot);
-        let tl_slots = draw_editorial_bars(
+        let cost_mode = self.cost_mode;
+        let (tl_slots, tl_inner) = draw_editorial_bars(
             rt,
             fonts,
             theme,
@@ -3375,7 +4360,57 @@ impl DashboardView {
             self.bar_unit(),
             self.mouse_dip,
             empty_msg,
+            |idx| match &bar_meta[idx] {
+                OverviewBarMeta::Hour(h, c) => {
+                    if cost_mode {
+                        vec![
+                            format!("今日 {:02}:00 - {:02}:59 · {} 次", h, h, c.calls),
+                            format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
+                            format!("新输入  : {} ({})", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_compact(c.input_tokens)),
+                            format!("缓存读  : {} ({:.1}%)", fmt_usd_precise(c.cost.cache_read_usd), c.cache_hit_rate()),
+                            format!("输出    : {} ({})", fmt_usd_precise(c.cost.output_usd), fmt_compact(c.output_tokens)),
+                            format!("总Token : {}", fmt_commas(c.total_tokens())),
+                        ]
+                    } else {
+                        vec![
+                            format!("今日 {:02}:00 - {:02}:59 · {} 次", h, h, c.calls),
+                            format!("总计   : {}", fmt_commas(c.total_tokens())),
+                            format!("估算费 : {}", fmt_cost(&c.cost, c.calls, false)),
+                            format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                            format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                            format!("输出   : {}", fmt_commas(c.output_tokens)),
+                        ]
+                    }
+                }
+                OverviewBarMeta::Day(d, k, c) => {
+                    if cost_mode {
+                        vec![
+                            format!("{} ({}) · {} 次", k, weekday_cn(*d), c.calls),
+                            format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
+                            format!("新输入  : {} ({})", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_compact(c.input_tokens)),
+                            format!("缓存读  : {} ({:.1}%)", fmt_usd_precise(c.cost.cache_read_usd), c.cache_hit_rate()),
+                            format!("输出    : {} ({})", fmt_usd_precise(c.cost.output_usd), fmt_compact(c.output_tokens)),
+                            format!("总Token : {}", fmt_commas(c.total_tokens())),
+                        ]
+                    } else {
+                        vec![
+                            format!("{} ({}) · {} 次", k, weekday_cn(*d), c.calls),
+                            format!("总计   : {}", fmt_commas(c.total_tokens())),
+                            format!("估算费 : {}", fmt_cost(&c.cost, c.calls, false)),
+                            format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                            format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                            format!("输出   : {}", fmt_commas(c.output_tokens)),
+                        ]
+                    }
+                }
+            },
         );
+        if let Some(inner) = tl_inner {
+            self.discrete_plots.push(DiscretePlot::VerticalBars {
+                plot: inner,
+                n: bars.len(),
+            });
+        }
         for (rect, maybe_day) in tl_slots.into_iter().zip(bar_days.into_iter()) {
             if let Some(day) = maybe_day {
                 self.hit_boxes.push(HitBox {
@@ -3793,175 +4828,179 @@ impl DashboardView {
         fill_round_rect(rt, bot, 10.0, theme.surface);
         stroke_round_rect(rt, bot, 10.0, theme.border, 1.0);
 
-        let mut recent_rows = self.display_sessions(false);
-        recent_rows.sort_by(|a, b| b.last_time.cmp(&a.last_time));
         let (_, sub_total) = self.session_split_counts();
+        let show_multi = self.has_non_antigravity;
+        let (new_row_rects, new_hits) = self.with_overview_recent_sessions(|recent_rows| {
+            let mut row_rects_out = Vec::with_capacity(6);
+            let mut hits_out = Vec::with_capacity(6);
 
-        draw_text(rt, "最近活跃会话", &fonts.ui_section, rect_f(bot.left + 16.0, bot.top + 9.0, 96.0, 20.0), theme.text);
-        let cnt_txt = if self.group_subagents && sub_total > 0 {
-            format!("{} 个主会话 · 含 {} 子会话", recent_rows.len(), sub_total)
-        } else {
-            format!("共 {} 个", recent_rows.len())
-        };
-        draw_text(
-            rt,
-            &cnt_txt,
-            &fonts.ui_micro,
-            rect_f(bot.left + 108.0, bot.top + 11.0, 200.0, 16.0),
-            theme.muted,
-        );
-        draw_text(
-            rt,
-            "左键剖析 · 右键管理 →",
-            &fonts.ui_small_right,
-            rect_f(bot.right - 170.0, bot.top + 10.0, 154.0, 18.0),
-            theme.muted,
-        );
-
-        let rr_l = bot.left + 10.0;
-        let rr_w = bw - 20.0;
-        let rx = rr_l + rr_w - 10.0;
-        let list_y = bot.top + 54.0;
-        let avail_h = (bot.bottom - 8.0 - list_y).max(28.0);
-        let max_vis = ((avail_h / 28.0).floor() as usize).clamp(1, 6);
-        let show_n = recent_rows.len().min(max_vis);
-
-        // Measure actual model names in visible rows so long names (e.g. 30-char models) fit without ellipsis.
-        let max_model_px = recent_rows
-            .iter()
-            .take(show_n)
-            .map(|r| factories.measure_text_width(&r.primary_model, &fonts.mono_small_right))
-            .fold(132.0_f32, f32::max);
-        let model_cap = (rr_w * 0.28).clamp(156.0, 228.0);
-        let model_w = (max_model_px + 8.0).clamp(132.0, model_cap);
-        // Unified 3-chunk Gestalt columns shared with Sessions tab:
-        // [轮数] — [总Token | 新输入 | 输出] — [命中率 | 费用]
-        let (sm_x, sm_w, metrics_w) = session_metric_columns(rx);
-        let sm_rect = |i: usize, y: f32, h: f32| rect_f(sm_x[i], y, sm_w[i], h);
-        let model_x = rx - metrics_w - model_w;
-        let time_x = rr_l + 34.0;
-        let title_x = rr_l + 94.0;
-        let title_w = (model_x - 10.0 - title_x).max(80.0);
-
-        // Subtle column header row
-        let hdr_y = bot.top + 31.0;
-        let hdr_h = 20.0;
-        draw_text(rt, "时间", &fonts.ui_micro, rect_f(time_x, hdr_y, 56.0, hdr_h), theme.muted);
-        draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
-        draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
-        for (i, lbl) in SESSION_METRIC_LABELS.iter().enumerate() {
-            draw_text(rt, lbl, &fonts.ui_small_right, sm_rect(i, hdr_y, hdr_h), theme.muted);
-        }
-        draw_line(rt, bot.left + 14.0, bot.top + 51.0, bot.right - 14.0, bot.top + 51.0, theme.border, 1.0);
-
-        if recent_rows.is_empty() {
+            draw_text(rt, "最近活跃会话", &fonts.ui_section, rect_f(bot.left + 16.0, bot.top + 9.0, 96.0, 20.0), theme.text);
+            let cnt_txt = if self.group_subagents && sub_total > 0 {
+                format!("{} 个主会话 · 含 {} 子会话", recent_rows.len(), sub_total)
+            } else {
+                format!("共 {} 个", recent_rows.len())
+            };
             draw_text(
                 rt,
-                "当前范围暂无会话 · 点击右上角可切换 7天 / 30天 / 全部",
-                &fonts.ui_reg_center,
-                rect_f(bot.left, list_y, bw, avail_h),
+                &cnt_txt,
+                &fonts.ui_micro,
+                rect_f(bot.left + 108.0, bot.top + 11.0, 200.0, 16.0),
                 theme.muted,
             );
-        } else {
-            let now_local = Local::now();
-            let row_h = (avail_h / max_vis as f32).clamp(26.0, 32.0);
-            for (i, row) in recent_rows.iter().take(show_n).enumerate() {
-                let s = self.row_session(row);
-                let ry = list_y + i as f32 * row_h;
-                let cell_h = row_h - 2.0;
-                let rr = rect_f(rr_l, ry, rr_w, cell_h);
-                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
-                if hov {
-                    fill_round_rect(rt, rr, 6.0, theme.hover);
-                }
-                if i > 0 {
-                    draw_line(rt, bot.left + 16.0, ry - 1.0, bot.right - 16.0, ry - 1.0, theme.grid, 0.8);
-                }
-                let cy = ry + cell_h * 0.5;
-                draw_session_status_dot(rt, theme, rr_l + 10.5, cy, s, row.last_time, now_local);
-                if row.is_pinned {
-                    draw_text(
-                        rt,
-                        "★",
-                        &fonts.ui_small_center,
-                        rect_f(rr_l + 16.0, ry, 16.0, cell_h),
-                        theme.accent,
-                    );
-                }
+            draw_text(
+                rt,
+                "左键剖析 · 右键管理 →",
+                &fonts.ui_small_right,
+                rect_f(bot.right - 170.0, bot.top + 10.0, 154.0, 18.0),
+                theme.muted,
+            );
 
-                let t_str = fmt_relative_time_cn(row.last_time, now_local);
-                let hit_str = format!("{:.1}%", row.counts.cache_hit_rate());
-                let hit_col = cache_hit_color(theme, &row.counts);
-                let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
-                let base_title = self.format_session_title(s);
-                let show_multi = snapshot.has_non_antigravity();
-                let mut prefix = String::new();
-                if row.is_child_row {
-                    prefix.push_str("↳ ");
-                }
-                if let Some(tag) = format_source_tag(s.source, show_multi) {
-                    prefix.push_str(&format!("[{tag}] "));
-                }
-                if s.is_archived {
-                    prefix.push_str("[归档] ");
-                }
-                let title_disp = format!("{prefix}{base_title}");
-                let sub_badge = if !row.is_child_row && row.subagent_count > 0 {
-                    Some(format!("+{}子", row.subagent_count))
-                } else {
-                    None
-                };
+            let rr_l = bot.left + 10.0;
+            let rr_w = bw - 20.0;
+            let rx = rr_l + rr_w - 10.0;
+            let list_y = bot.top + 54.0;
+            let avail_h = (bot.bottom - 8.0 - list_y).max(28.0);
+            let max_vis = ((avail_h / 28.0).floor() as usize).clamp(1, 6);
+            let show_n = recent_rows.len().min(max_vis);
 
-                draw_text(rt, &t_str, &fonts.mono_small, rect_f(time_x, ry, 56.0, cell_h), theme.muted);
-                let (actual_title_w, badge_rect) = if let Some(ref b) = sub_badge {
-                    let bw = (factories.measure_text_width(b, &fonts.ui_small_center) + 10.0).ceil();
-                    if title_w > bw + 40.0 {
-                        let tw = (title_w - bw - 6.0).max(32.0);
-                        let nat = factories.measure_text_width(&title_disp, &fonts.ui_reg);
-                        let bx = title_x + nat.min(tw) + 6.0;
-                        (tw, Some(rect_f(bx, ry + (cell_h - 16.0) * 0.5, bw, 16.0)))
-                    } else {
-                        (title_w, None)
-                    }
-                } else {
-                    (title_w, None)
-                };
+            // Measure actual model names in visible rows so long names (e.g. 30-char models) fit without ellipsis.
+            let max_model_px = recent_rows
+                .iter()
+                .take(show_n)
+                .map(|r| factories.measure_text_width(&r.primary_model, &fonts.mono_small_right))
+                .fold(132.0_f32, f32::max);
+            let model_cap = (rr_w * 0.28).clamp(156.0, 228.0);
+            let model_w = (max_model_px + 8.0).clamp(132.0, model_cap);
+            let (sm_x, sm_w, metrics_w) = session_metric_columns(rx);
+            let sm_rect = |i: usize, y: f32, h: f32| rect_f(sm_x[i], y, sm_w[i], h);
+            let model_x = rx - metrics_w - model_w;
+            let time_x = rr_l + 34.0;
+            let title_x = rr_l + 94.0;
+            let title_w = (model_x - 10.0 - title_x).max(80.0);
+
+            // Subtle column header row
+            let hdr_y = bot.top + 31.0;
+            let hdr_h = 20.0;
+            draw_text(rt, "时间", &fonts.ui_micro, rect_f(time_x, hdr_y, 56.0, hdr_h), theme.muted);
+            draw_text(rt, "会话", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
+            draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
+            for (i, lbl) in SESSION_METRIC_LABELS.iter().enumerate() {
+                draw_text(rt, lbl, &fonts.ui_small_right, sm_rect(i, hdr_y, hdr_h), theme.muted);
+            }
+            draw_line(rt, bot.left + 14.0, bot.top + 51.0, bot.right - 14.0, bot.top + 51.0, theme.border, 1.0);
+
+            if recent_rows.is_empty() {
                 draw_text(
                     rt,
-                    &title_disp,
-                    &fonts.ui_reg,
-                    rect_f(title_x, ry, actual_title_w, cell_h),
-                    if row.is_child_row { theme.sub } else { theme.text },
+                    "当前范围暂无会话 · 点击右上角可切换 7天 / 30天 / 全部",
+                    &fonts.ui_reg_center,
+                    rect_f(bot.left, list_y, bw, avail_h),
+                    theme.muted,
                 );
-                if let (Some(b), Some(br)) = (sub_badge.as_deref(), badge_rect) {
-                    fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
-                    draw_text(rt, b, &fonts.ui_small_center, br, theme.accent);
-                }
-                draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, cell_h), theme.muted);
-                draw_session_metric_cells(
-                    rt,
-                    fonts,
-                    theme,
-                    &sm_x,
-                    &sm_w,
-                    ry,
-                    cell_h,
-                    &row.counts,
-                    &hit_str,
-                    hit_col,
-                    &cost_str,
-                    self.cost_mode,
-                    human,
-                );
+            } else {
+                let now_local = Local::now();
+                let row_h = (avail_h / max_vis as f32).clamp(26.0, 32.0);
+                for (i, row) in recent_rows.iter().take(show_n).enumerate() {
+                    let s = self.row_session(row);
+                    let ry = list_y + i as f32 * row_h;
+                    let cell_h = row_h - 2.0;
+                    let rr = rect_f(rr_l, ry, rr_w, cell_h);
+                    let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
+                    if hov {
+                        fill_round_rect(rt, rr, 6.0, theme.hover);
+                    }
+                    if i > 0 {
+                        draw_line(rt, bot.left + 16.0, ry - 1.0, bot.right - 16.0, ry - 1.0, theme.grid, 0.8);
+                    }
+                    let cy = ry + cell_h * 0.5;
+                    draw_session_status_dot(rt, theme, rr_l + 10.5, cy, s, row.last_time, now_local);
+                    if row.is_pinned {
+                        draw_text(
+                            rt,
+                            "★",
+                            &fonts.ui_small_center,
+                            rect_f(rr_l + 16.0, ry, 16.0, cell_h),
+                            theme.accent,
+                        );
+                    }
 
-                let cid = s.conversation_id.clone();
-                self.session_row_rects.push((rr, cid.clone()));
-                self.hit_boxes.push(HitBox {
-                    rect: rr,
-                    action: ClickAction::InspectSession(cid),
-                });
+                    let t_str = fmt_relative_time_cn(row.last_time, now_local);
+                    let mut hit_buf = FmtBuf::new();
+                    let _ = write!(hit_buf, "{:.1}%", row.counts.cache_hit_rate());
+                    let hit_col = cache_hit_color(theme, &row.counts);
+                    let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
+                    let base_title = self.format_session_title(s);
+                    let mut prefix = String::new();
+                    if row.is_child_row {
+                        prefix.push_str("↳ ");
+                    }
+                    if let Some(tag) = format_source_tag(s.source, show_multi) {
+                        prefix.push_str(&format!("[{tag}] "));
+                    }
+                    if s.is_archived {
+                        prefix.push_str("[归档] ");
+                    }
+                    let title_disp = format!("{prefix}{base_title}");
+                    let mut sub_buf = FmtBuf::new();
+                    let has_sub_badge = !row.is_child_row && row.subagent_count > 0;
+                    if has_sub_badge {
+                        let _ = write!(sub_buf, "+{}子", row.subagent_count);
+                    }
+
+                    draw_text(rt, &t_str, &fonts.mono_small, rect_f(time_x, ry, 56.0, cell_h), theme.muted);
+                    let (actual_title_w, badge_rect) = if has_sub_badge {
+                        let bw = (factories.measure_text_width(sub_buf.as_str(), &fonts.ui_small_center) + 10.0).ceil();
+                        if title_w > bw + 40.0 {
+                            let tw = (title_w - bw - 6.0).max(32.0);
+                            let nat = factories.measure_text_width(&title_disp, &fonts.ui_reg);
+                            let bx = title_x + nat.min(tw) + 6.0;
+                            (tw, Some(rect_f(bx, ry + (cell_h - 16.0) * 0.5, bw, 16.0)))
+                        } else {
+                            (title_w, None)
+                        }
+                    } else {
+                        (title_w, None)
+                    };
+                    draw_text(
+                        rt,
+                        &title_disp,
+                        &fonts.ui_reg,
+                        rect_f(title_x, ry, actual_title_w, cell_h),
+                        if row.is_child_row { theme.sub } else { theme.text },
+                    );
+                    if let Some(br) = badge_rect {
+                        fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
+                        draw_text(rt, sub_buf.as_str(), &fonts.ui_small_center, br, theme.accent);
+                    }
+                    draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, cell_h), theme.muted);
+                    draw_session_metric_cells(
+                        rt,
+                        fonts,
+                        theme,
+                        &sm_x,
+                        &sm_w,
+                        ry,
+                        cell_h,
+                        &row.counts,
+                        hit_buf.as_str(),
+                        hit_col,
+                        &cost_str,
+                        self.cost_mode,
+                        human,
+                    );
+
+                    let cid = s.conversation_id.clone();
+                    row_rects_out.push((rr, cid.clone()));
+                    hits_out.push(HitBox {
+                        rect: rr,
+                        action: ClickAction::InspectSession(cid),
+                    });
+                }
             }
-        }
+            (row_rects_out, hits_out)
+        });
+        self.session_row_rects.extend(new_row_rects);
+        self.hit_boxes.extend(new_hits);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3969,7 +5008,7 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         bounds: D2D_RECT_F,
         human: bool,
@@ -3980,7 +5019,7 @@ impl DashboardView {
             }
             ModelCardMetric::CacheHit => ModelSort::HitRateDesc,
         };
-        let (primary, secondary) = self.ordered_models(sort);
+        let (primary, secondary) = Self::ordered_models_of(&self.cached_agg.by_model, sort);
         if primary.is_empty() && secondary.is_empty() {
             draw_text(rt, "当前范围暂无模型数据", &fonts.ui_small, bounds, theme.muted);
             return;
@@ -3991,7 +5030,7 @@ impl DashboardView {
             && (primary.is_empty() || primary.len() < max_show || max_show >= 3);
         let max_primary = if show_secondary { max_show.saturating_sub(1) } else { max_show };
 
-        let mut rows: Vec<(String, TokenCounts, bool)> = primary
+        let mut rows: Vec<(&str, TokenCounts, bool)> = primary
             .into_iter()
             .take(max_primary)
             .map(|(n, c)| (n, c, false))
@@ -4009,9 +5048,7 @@ impl DashboardView {
         let w = bounds.right - bounds.left;
         let palette = [theme.accent, theme.output, theme.ram];
 
-        // Pre-format stats & hit strings so right columns take only their exact needed width,
-        // giving maximum room to long model names.
-        let formatted: Vec<(String, TokenCounts, bool, f32, String, String)> = rows
+        let formatted: Vec<(&str, TokenCounts, bool, f32, String, String)> = rows
             .into_iter()
             .map(|(name, c, is_sec)| {
                 let (share, stat) = if self.cost_mode {
@@ -4045,8 +5082,8 @@ impl DashboardView {
         let name_w = (w - hit_w - stat_w - 8.0).max(96.0);
         let stat_l = bounds.left + name_w + 4.0;
 
-        self.plot_rects.push(bounds);
-        let mut hover_tip: Option<(f32, String, String)> = None;
+        let mut hover_tip: Option<(f32, &str, String)> = None;
+        let mut row_rects = Vec::with_capacity(formatted.len());
 
         for (i, (name, c, is_sec, share, stat, hit_s)) in formatted.into_iter().enumerate() {
             let y = bounds.top + i as f32 * row_h;
@@ -4054,6 +5091,7 @@ impl DashboardView {
                 draw_line(rt, bounds.left, y - 2.0, bounds.right, y - 2.0, theme.border, 0.8);
             }
             let row_r = rect_f(bounds.left - 4.0, y - 1.5, w + 8.0, row_h.min(24.0));
+            row_rects.push(row_r);
             let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&row_r, mx, my)).unwrap_or(false);
             if hov {
                 fill_round_rect(rt, row_r, 5.0, with_alpha(theme.text, 0.04));
@@ -4064,7 +5102,7 @@ impl DashboardView {
                     fmt_cost_compact(&c.cost, c.calls),
                     hit_s
                 );
-                hover_tip = Some((y, name.clone(), detail));
+                hover_tip = Some((y, name, detail));
             }
             let hit = c.cache_hit_rate();
             let hit_col = if is_sec { theme.muted } else { cache_hit_color(theme, &c) };
@@ -4077,7 +5115,7 @@ impl DashboardView {
             };
             let stat_col = if is_sec { theme.muted } else { theme.sub };
 
-            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, name_w, 15.0), name_col);
+            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, name_w, 15.0), name_col);
             draw_text(rt, &stat, &fonts.mono_small_right, rect_f(stat_l, y, stat_w, 15.0), stat_col);
             draw_text(
                 rt,
@@ -4103,17 +5141,19 @@ impl DashboardView {
             }
             self.hit_boxes.push(HitBox {
                 rect: row_r,
-                action: ClickAction::FilterSessions(SessionFilter::Model(name)),
+                action: ClickAction::FilterSessions(SessionFilter::Model(name.to_string())),
             });
         }
+        self.discrete_plots.push(DiscretePlot::RowRects {
+            bounds: rect_f(bounds.left - 4.0, bounds.top - 2.0, w + 8.0, avail_h + 4.0),
+            rows: row_rects,
+        });
 
         // Compact floating tooltip when hovering a row whose model name is truncated (narrow window)
         if let Some((ry, full_name, detail)) = hover_tip {
-            if factories.measure_text_width(&full_name, &fonts.mono_small) > name_w - 2.0 {
-                let tw = factories
-                    .measure_text_width(&full_name, &fonts.mono_small)
-                    .max(factories.measure_text_width(&detail, &fonts.mono_small))
-                    + 20.0;
+            let full_w = factories.measure_text_width(full_name, &fonts.mono_small);
+            if full_w > name_w - 2.0 {
+                let tw = full_w.max(factories.measure_text_width(&detail, &fonts.mono_small)) + 20.0;
                 let tw = tw.clamp(180.0, (w + 16.0).max(180.0));
                 let th = 40.0;
                 let tx = (bounds.right - tw).max(bounds.left - 4.0);
@@ -4125,47 +5165,49 @@ impl DashboardView {
                 let tr = rect_f(tx, ty, tw, th);
                 fill_round_rect(rt, tr, 6.0, theme.tooltip_bg);
                 stroke_round_rect(rt, tr, 6.0, theme.border, 1.0);
-                draw_text(rt, &full_name, &fonts.mono_small, rect_f(tx + 9.0, ty + 5.0, tw - 18.0, 15.0), theme.text);
+                draw_text(rt, full_name, &fonts.mono_small, rect_f(tx + 9.0, ty + 5.0, tw - 18.0, 15.0), theme.text);
                 draw_text(rt, &detail, &fonts.mono_small, rect_f(tx + 9.0, ty + 20.0, tw - 18.0, 15.0), theme.sub);
             }
         }
     }
 
-    fn draw_compact_workspaces(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
-        let mut items: Vec<(String, String, usize, TokenCounts)> = self
+    fn draw_compact_workspaces(&mut self, rt: &ID2D1RenderTarget, fonts: &DashFonts, theme: &Theme, bounds: D2D_RECT_F, human: bool) {
+        let mut refs: Vec<(&str, usize, TokenCounts)> = self
             .cached_agg
             .by_workspace
             .iter()
-            .map(|(ws, (cnt, c))| {
-                let label = self.format_workspace_label(ws);
-                (ws.clone(), label, *cnt, *c)
-            })
+            .map(|(ws, &(cnt, c))| (ws.as_str(), cnt, c))
             .collect();
         if self.cost_mode {
-            items.sort_by(|a, b| {
-                b.3.cost
+            refs.sort_by(|a, b| {
+                b.2.cost
                     .total_usd()
-                    .partial_cmp(&a.3.cost.total_usd())
+                    .partial_cmp(&a.2.cost.total_usd())
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.3.total_tokens().cmp(&a.3.total_tokens()))
+                    .then_with(|| b.2.total_tokens().cmp(&a.2.total_tokens()))
             });
         } else {
-            items.sort_by(|a, b| b.3.total_tokens().cmp(&a.3.total_tokens()));
+            refs.sort_by(|a, b| b.2.total_tokens().cmp(&a.2.total_tokens()));
         }
-        if items.is_empty() {
+        if refs.is_empty() {
             draw_text(rt, "当前范围暂无项目数据", &fonts.ui_small, bounds, theme.muted);
             return;
         }
         let avail_h = (bounds.bottom - bounds.top).max(24.0);
         let max_show = if avail_h >= 82.0 { 3 } else { 2 };
-        let show_n = items.len().min(max_show);
+        let show_n = refs.len().min(max_show);
+        let items: Vec<(String, String, usize, TokenCounts)> = refs
+            .into_iter()
+            .take(show_n)
+            .map(|(ws, cnt, c)| (ws.to_string(), self.format_workspace_label(ws), cnt, c))
+            .collect();
         let total_all_tok = self.cached_agg.total.total_tokens().max(1);
         let total_all_usd = self.cached_agg.total.cost.total_usd();
         let row_h = (avail_h / show_n as f32).clamp(24.0, 34.0);
         let w = bounds.right - bounds.left;
         let palette = [theme.accent, theme.output, theme.ram];
 
-        for (i, (full_ws, name, sess_cnt, c)) in items.into_iter().take(show_n).enumerate() {
+        for (i, (full_ws, name, sess_cnt, c)) in items.into_iter().enumerate() {
             let y = bounds.top + i as f32 * row_h;
             let row_r = rect_f(bounds.left - 4.0, y - 2.0, w + 8.0, row_h.min(27.0));
             let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&row_r, mx, my)).unwrap_or(false);
@@ -4202,14 +5244,14 @@ impl DashboardView {
         }
     }
 
-    fn draw_compact_tools(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, bounds: D2D_RECT_F) {
-        let mut items: Vec<(String, u64)> = self
+    fn draw_compact_tools(&mut self, rt: &ID2D1RenderTarget, fonts: &DashFonts, theme: &Theme, bounds: D2D_RECT_F) {
+        let mut items: Vec<(&str, u64)> = self
             .cached_agg
             .by_tool
             .iter()
-            .map(|(k, &v)| (k.clone(), v))
+            .map(|(k, &v)| (k.as_str(), v))
             .collect();
-        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         if items.is_empty() {
             draw_text(rt, "当前范围暂无工具调用记录", &fonts.ui_small, bounds, theme.muted);
             return;
@@ -4225,7 +5267,7 @@ impl DashboardView {
         for (i, (name, cnt)) in items.into_iter().take(show_n).enumerate() {
             let y = bounds.top + i as f32 * row_h;
             let share = (cnt as f64 / total as f64) as f32;
-            draw_text(rt, &name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.60, 15.0), theme.text);
+            draw_text(rt, name, &fonts.mono_small, rect_f(bounds.left, y, w * 0.60, 15.0), theme.text);
             draw_text(
                 rt,
                 &format!("{} 次 ({:.0}%)", cnt, share * 100.0),
@@ -4243,7 +5285,7 @@ impl DashboardView {
     fn draw_compact_sources(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         bounds: D2D_RECT_F,
         human: bool,
@@ -4347,7 +5389,7 @@ impl DashboardView {
         }
     }
 
-    fn draw_chart_legend_and_toggle(&mut self, rt: &ID2D1RenderTarget, fonts: &Fonts, theme: &Theme, card: D2D_RECT_F) {
+    fn draw_chart_legend_and_toggle(&mut self, rt: &ID2D1RenderTarget, fonts: &DashFonts, theme: &Theme, card: D2D_RECT_F) {
         let _ = self.draw_chart_legend_and_toggle_at(rt, fonts, theme, card, card.top + 9.0);
     }
 
@@ -4356,7 +5398,7 @@ impl DashboardView {
     fn draw_chart_legend_and_toggle_at(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         card: D2D_RECT_F,
         y_top: f32,
@@ -4413,7 +5455,7 @@ impl DashboardView {
     fn draw_daily_tab(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -4456,7 +5498,6 @@ impl DashboardView {
         }
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
-        self.plot_rects.push(plot);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
         let days_asc: Vec<(&String, &TokenCounts)> = snapshot.agg.by_day.iter().collect();
@@ -4468,49 +5509,79 @@ impl DashboardView {
             let end_sun = today + chrono::Duration::days(6 - wd_today);
             let start_mon = end_sun - chrono::Duration::days((n_weeks as i64) * 7 - 1);
             let mut h_days = Vec::with_capacity(n_weeks * 7);
+            let mut h_meta: Vec<(NaiveDate, TokenCounts)> = Vec::with_capacity(n_weeks * 7);
             let mut prev_month = 0u32;
+            let mut ymd_buf = [0u8; 10];
             for offset in 0..(n_weeks * 7) {
                 let d = start_mon + chrono::Duration::days(offset as i64);
                 if d > today {
                     continue;
                 }
-                let k = d.format("%Y-%m-%d").to_string();
-                let c = snapshot.agg.by_day.get(&k).copied().unwrap_or_default();
+                let y = d.year().unsigned_abs();
+                let m = d.month();
+                let day_num = d.day();
+                ymd_buf[0] = b'0' + ((y / 1000) % 10) as u8;
+                ymd_buf[1] = b'0' + ((y / 100) % 10) as u8;
+                ymd_buf[2] = b'0' + ((y / 10) % 10) as u8;
+                ymd_buf[3] = b'0' + (y % 10) as u8;
+                ymd_buf[4] = b'-';
+                ymd_buf[5] = b'0' + (m / 10) as u8;
+                ymd_buf[6] = b'0' + (m % 10) as u8;
+                ymd_buf[7] = b'-';
+                ymd_buf[8] = b'0' + (day_num / 10) as u8;
+                ymd_buf[9] = b'0' + (day_num % 10) as u8;
+                let k_str = std::str::from_utf8(&ymd_buf).unwrap_or("");
+                let c = snapshot.agg.by_day.get(k_str).copied().unwrap_or_default();
                 let val = if self.cost_mode {
                     c.cost.total_usd()
                 } else {
                     c.total_tokens() as f64
                 };
-                let month_label = if d.month() != prev_month && d.weekday() == chrono::Weekday::Mon {
-                    prev_month = d.month();
-                    Some(format!("{}月", d.month()))
+                let month_label = if m != prev_month && d.weekday() == chrono::Weekday::Mon {
+                    prev_month = m;
+                    Some(format!("{m}月"))
                 } else if offset == 0 {
-                    prev_month = d.month();
-                    Some(format!("{}月", d.month()))
+                    prev_month = m;
+                    Some(format!("{m}月"))
                 } else {
                     None
                 };
-                let tip = if c.calls > 0 {
-                    vec![
-                        format!("{} ({}) · {} 次调用", k, weekday_cn(d), c.calls),
-                        format!("总计   : {}", fmt_commas(c.total_tokens())),
-                        format!("估算费 : {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
-                        format!("命中率 : {:.1}%  |  峰值Ctx: {}", c.cache_hit_rate(), fmt_compact(c.peak_context)),
-                    ]
-                } else {
-                    vec![format!("{} ({}) · 无使用记录", k, weekday_cn(d))]
-                };
+                h_meta.push((d, c));
                 h_days.push(HeatmapDay {
-                    date_key: k,
+                    date_key: if c.calls > 0 { k_str.to_string() } else { String::new() },
                     weekday_idx: d.weekday().num_days_from_monday() as usize,
                     week_col: offset / 7,
                     month_label,
                     value: val,
                     calls: c.calls,
-                    tooltip: tip,
                 });
             }
-            let cells = draw_activity_heatmap(rt, fonts, theme, plot, n_weeks, &h_days, self.mouse_dip);
+            let (cells, geom) = draw_activity_heatmap(
+                rt,
+                fonts,
+                theme,
+                plot,
+                n_weeks,
+                &h_days,
+                self.mouse_dip,
+                |idx| {
+                    let (d, c) = h_meta[idx];
+                    let k = d.format("%Y-%m-%d");
+                    if c.calls > 0 {
+                        vec![
+                            format!("{} ({}) · {} 次调用", k, weekday_cn(d), c.calls),
+                            format!("总计   : {}", fmt_commas(c.total_tokens())),
+                            format!("估算费 : {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
+                            format!("命中率 : {:.1}%  |  峰值Ctx: {}", c.cache_hit_rate(), fmt_compact(c.peak_context)),
+                        ]
+                    } else {
+                        vec![format!("{} ({}) · 无使用记录", k, weekday_cn(d))]
+                    }
+                },
+            );
+            if let Some(g) = geom {
+                self.discrete_plots.push(DiscretePlot::Heatmap(g));
+            }
             for (rect, day_key) in cells {
                 self.hit_boxes.push(HitBox {
                     rect,
@@ -4536,7 +5607,23 @@ impl DashboardView {
                 .iter()
                 .map(|(day, c)| {
                     let lbl = if day.len() >= 10 { day[5..].to_string() } else { day.clone() };
-                    let tip = if self.cost_mode {
+                    self.make_bar(lbl, c, false)
+                })
+                .collect();
+            let cost_mode = self.cost_mode;
+            let (day_slots, inner) = draw_editorial_bars(
+                rt,
+                fonts,
+                theme,
+                plot,
+                &bars,
+                self.fresh_only,
+                self.bar_unit(),
+                self.mouse_dip,
+                "暂无按天数据",
+                |idx| {
+                    let (day, c) = &chart_days[idx];
+                    if cost_mode {
                         vec![
                             format!("{} · {} 次调用", day, c.calls),
                             format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
@@ -4555,21 +5642,15 @@ impl DashboardView {
                             format!("输出   : {}", fmt_commas(c.output_tokens)),
                             format!("峰值Ctx: {}", fmt_commas(c.peak_context)),
                         ]
-                    };
-                    self.make_bar(lbl, c, false, tip)
-                })
-                .collect();
-            let day_slots = draw_editorial_bars(
-                rt,
-                fonts,
-                theme,
-                plot,
-                &bars,
-                self.fresh_only,
-                self.bar_unit(),
-                self.mouse_dip,
-                "暂无按天数据",
+                    }
+                },
             );
+            if let Some(p) = inner {
+                self.discrete_plots.push(DiscretePlot::VerticalBars {
+                    plot: p,
+                    n: bars.len(),
+                });
+            }
             for (rect, (day, c)) in day_slots.into_iter().zip(chart_days.iter()) {
                 if c.calls > 0 {
                     self.hit_boxes.push(HitBox {
@@ -4580,44 +5661,6 @@ impl DashboardView {
             }
         }
 
-        let rows: Vec<Vec<String>> = days_asc
-            .iter()
-            .rev()
-            .map(|(day, c)| {
-                let wd = NaiveDate::parse_from_str(day, "%Y-%m-%d").map(weekday_cn).unwrap_or("-");
-                if self.cost_mode {
-                    vec![
-                        (*day).clone(),
-                        wd.into(),
-                        c.calls.to_string(),
-                        fmt_cost(&c.cost, c.calls, human),
-                        fmt_usd(c.cost.input_plus_write_usd(), human),
-                        fmt_usd(c.cost.output_usd, human),
-                        fmt_usd(c.cost.cache_read_usd, human),
-                        fmt_usd(c.cost.cache_saved_usd, human),
-                        format!("{:.1}%", c.cache_hit_rate()),
-                        fmt_num(c.total_tokens(), human),
-                    ]
-                } else {
-                    vec![
-                        (*day).clone(),
-                        wd.into(),
-                        c.calls.to_string(),
-                        fmt_num(c.total_tokens(), human),
-                        fmt_num(c.input_tokens + c.cache_write_tokens, human),
-                        fmt_num(c.output_tokens, human),
-                        fmt_num(c.cache_read_tokens, human),
-                        format!("{:.1}%", c.cache_hit_rate()),
-                        fmt_cost(&c.cost, c.calls, human),
-                    ]
-                }
-            })
-            .collect();
-        let row_actions: Vec<ClickAction> = days_asc
-            .iter()
-            .rev()
-            .map(|(day, _)| ClickAction::FilterSessions(SessionFilter::Date((*day).clone())))
-            .collect();
         let cols: &[(&str, f32, bool)] = if self.cost_mode {
             &[
                 ("日期", 0.11, false),
@@ -4644,7 +5687,39 @@ impl DashboardView {
                 ("估算费用", 0.14, true),
             ]
         };
-        self.draw_table(rt, fonts, theme, tbl_r, cols, &rows, Some(&row_actions), None, None);
+        let cost_mode = self.cost_mode;
+        let total_days = days_asc.len();
+        self.draw_table_virtual(rt, fonts, theme, tbl_r, cols, total_days, None, None, |abs_idx, cells| {
+            let (day, c) = days_asc[total_days - 1 - abs_idx];
+            let wd = NaiveDate::parse_from_str(day, "%Y-%m-%d").map(weekday_cn).unwrap_or("-");
+            if cost_mode {
+                cells.extend([
+                    day.clone(),
+                    wd.into(),
+                    c.calls.to_string(),
+                    fmt_cost(&c.cost, c.calls, human),
+                    fmt_usd(c.cost.input_plus_write_usd(), human),
+                    fmt_usd(c.cost.output_usd, human),
+                    fmt_usd(c.cost.cache_read_usd, human),
+                    fmt_usd(c.cost.cache_saved_usd, human),
+                    format!("{:.1}%", c.cache_hit_rate()),
+                    fmt_num(c.total_tokens(), human),
+                ]);
+            } else {
+                cells.extend([
+                    day.clone(),
+                    wd.into(),
+                    c.calls.to_string(),
+                    fmt_num(c.total_tokens(), human),
+                    fmt_num(c.input_tokens + c.cache_write_tokens, human),
+                    fmt_num(c.output_tokens, human),
+                    fmt_num(c.cache_read_tokens, human),
+                    format!("{:.1}%", c.cache_hit_rate()),
+                    fmt_cost(&c.cost, c.calls, human),
+                ]);
+            }
+            Some(ClickAction::FilterSessions(SessionFilter::Date(day.clone())))
+        });
     }
 
     // ---------- Tab 3: Direct ISO Weekly (with quiet Monthly sub-toggle) ----------
@@ -4652,7 +5727,7 @@ impl DashboardView {
     fn draw_weekly_tab(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -4683,58 +5758,35 @@ impl DashboardView {
         self.draw_chart_legend_and_toggle(rt, fonts, theme, chart_c);
 
         let plot = rect_f(chart_c.left + 12.0, chart_c.top + 40.0, bw - 24.0, chart_h - 48.0);
-        self.plot_rects.push(plot);
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
 
         match self.weekly_mode {
             WeeklyMode::Weekly => {
                 let weeks_asc: Vec<(&String, &TokenCounts)> = snapshot.agg.by_week.iter().collect();
-                let mut wow: HashMap<String, String> = HashMap::new();
-                let mut prev: Option<f64> = None;
-                for (wk, c) in &weeks_asc {
-                    let cur_v = if self.cost_mode { c.cost.total_usd() } else { c.total_tokens() as f64 };
-                    if let Some(p) = prev.filter(|&p| p > 0.0) {
-                        let d = ((cur_v - p) / p) * 100.0;
-                        wow.insert((*wk).clone(), format!("{:+.1}%", d));
-                    } else {
-                        wow.insert((*wk).clone(), "-".into());
+                let cost_mode = self.cost_mode;
+                let wow_at = |asc_idx: usize| -> String {
+                    if asc_idx == 0 {
+                        return "-".into();
                     }
-                    prev = Some(cur_v);
-                }
+                    let prev_c = weeks_asc[asc_idx - 1].1;
+                    let cur_c = weeks_asc[asc_idx].1;
+                    let prev_v = if cost_mode { prev_c.cost.total_usd() } else { prev_c.total_tokens() as f64 };
+                    let cur_v = if cost_mode { cur_c.cost.total_usd() } else { cur_c.total_tokens() as f64 };
+                    if prev_v > 0.0 {
+                        format!("{:+.1}%", ((cur_v - prev_v) / prev_v) * 100.0)
+                    } else {
+                        "-".into()
+                    }
+                };
                 let start = weeks_asc.len().saturating_sub(16);
                 let bars: Vec<BarItem> = weeks_asc[start..]
                     .iter()
                     .map(|(wk, c)| {
-                        let ad = snapshot.agg.week_active_days.get(*wk).copied().unwrap_or(1).max(1) as u64;
                         let lbl = wk.split('-').last().unwrap_or(wk).to_string();
-                        let tip = if self.cost_mode {
-                            vec![
-                                format!("{} ({})", wk, iso_week_range_label(wk)),
-                                format!(
-                                    "估算费用: {} (环比 {})",
-                                    fmt_cost(&c.cost, c.calls, false),
-                                    wow.get(*wk).map(String::as_str).unwrap_or("-")
-                                ),
-                                format!("日均费用: {} ({} 活跃天)", fmt_usd_compact(c.cost.total_usd() / ad as f64), ad),
-                                format!("新输入  : {}  |  输出: {}", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_usd_precise(c.cost.output_usd)),
-                                format!("缓存读  : {} (省 {})", fmt_usd_precise(c.cost.cache_read_usd), fmt_usd_compact(c.cost.cache_saved_usd)),
-                                format!("总Token : {}", fmt_commas(c.total_tokens())),
-                            ]
-                        } else {
-                            vec![
-                                format!("{} ({})", wk, iso_week_range_label(wk)),
-                                format!("总计   : {} (环比 {})", fmt_commas(c.total_tokens()), wow.get(*wk).map(String::as_str).unwrap_or("-")),
-                                format!("估算费 : {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
-                                format!("日均   : {} ({} 活跃天)", fmt_commas(c.total_tokens() / ad), ad),
-                                format!("新输入 : {}", fmt_commas(c.input_tokens)),
-                                format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
-                                format!("输出   : {}", fmt_commas(c.output_tokens)),
-                            ]
-                        };
-                        self.make_bar(lbl, c, false, tip)
+                        self.make_bar(lbl, c, false)
                     })
                     .collect();
-                let wk_slots = draw_editorial_bars(
+                let (wk_slots, inner) = draw_editorial_bars(
                     rt,
                     fonts,
                     theme,
@@ -4744,7 +5796,39 @@ impl DashboardView {
                     self.bar_unit(),
                     self.mouse_dip,
                     "暂无按周数据",
+                    |rel_idx| {
+                        let asc_idx = start + rel_idx;
+                        let (wk, c) = weeks_asc[asc_idx];
+                        let ad = snapshot.agg.week_active_days.get(wk).copied().unwrap_or(1).max(1) as u64;
+                        let w_str = wow_at(asc_idx);
+                        if cost_mode {
+                            vec![
+                                format!("{} ({})", wk, iso_week_range_label(wk)),
+                                format!("估算费用: {} (环比 {})", fmt_cost(&c.cost, c.calls, false), w_str),
+                                format!("日均费用: {} ({} 活跃天)", fmt_usd_compact(c.cost.total_usd() / ad as f64), ad),
+                                format!("新输入  : {}  |  输出: {}", fmt_usd_precise(c.cost.input_plus_write_usd()), fmt_usd_precise(c.cost.output_usd)),
+                                format!("缓存读  : {} (省 {})", fmt_usd_precise(c.cost.cache_read_usd), fmt_usd_compact(c.cost.cache_saved_usd)),
+                                format!("总Token : {}", fmt_commas(c.total_tokens())),
+                            ]
+                        } else {
+                            vec![
+                                format!("{} ({})", wk, iso_week_range_label(wk)),
+                                format!("总计   : {} (环比 {})", fmt_commas(c.total_tokens()), w_str),
+                                format!("估算费 : {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
+                                format!("日均   : {} ({} 活跃天)", fmt_commas(c.total_tokens() / ad), ad),
+                                format!("新输入 : {}", fmt_commas(c.input_tokens)),
+                                format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
+                                format!("输出   : {}", fmt_commas(c.output_tokens)),
+                            ]
+                        }
+                    },
                 );
+                if let Some(p) = inner {
+                    self.discrete_plots.push(DiscretePlot::VerticalBars {
+                        plot: p,
+                        n: bars.len(),
+                    });
+                }
                 for (rect, (wk, c)) in wk_slots.into_iter().zip(weeks_asc[start..].iter()) {
                     if c.calls > 0 {
                         self.hit_boxes.push(HitBox {
@@ -4754,50 +5838,6 @@ impl DashboardView {
                     }
                 }
 
-                let rows: Vec<Vec<String>> = weeks_asc
-                    .iter()
-                    .rev()
-                    .map(|(wk, c)| {
-                        let ad = snapshot.agg.week_active_days.get(*wk).copied().unwrap_or(0);
-                        if self.cost_mode {
-                            let avg_usd = if ad > 0 { c.cost.total_usd() / ad as f64 } else { 0.0 };
-                            vec![
-                                (*wk).clone(),
-                                iso_week_range_label(wk),
-                                format!("{}天", ad),
-                                c.calls.to_string(),
-                                fmt_cost(&c.cost, c.calls, human),
-                                fmt_usd(avg_usd, human),
-                                fmt_usd(c.cost.input_plus_write_usd(), human),
-                                fmt_usd(c.cost.output_usd, human),
-                                fmt_usd(c.cost.cache_saved_usd, human),
-                                format!("{:.1}%", c.cache_hit_rate()),
-                                wow.get(*wk).cloned().unwrap_or_else(|| "-".into()),
-                                fmt_num(c.total_tokens(), human),
-                            ]
-                        } else {
-                            let avg = if ad > 0 { c.total_tokens() / ad as u64 } else { 0 };
-                            vec![
-                                (*wk).clone(),
-                                iso_week_range_label(wk),
-                                format!("{}天", ad),
-                                c.calls.to_string(),
-                                fmt_num(c.total_tokens(), human),
-                                fmt_num(avg, human),
-                                fmt_num(c.input_tokens + c.cache_write_tokens, human),
-                                fmt_num(c.output_tokens, human),
-                                format!("{:.1}%", c.cache_hit_rate()),
-                                wow.get(*wk).cloned().unwrap_or_else(|| "-".into()),
-                                fmt_cost(&c.cost, c.calls, human),
-                            ]
-                        }
-                    })
-                    .collect();
-                let wk_actions: Vec<ClickAction> = weeks_asc
-                    .iter()
-                    .rev()
-                    .map(|(wk, _)| ClickAction::FilterSessions(SessionFilter::Week((*wk).clone())))
-                    .collect();
                 let cols: &[(&str, f32, bool)] = if self.cost_mode {
                     &[
                         ("ISO 周", 0.09, false),
@@ -4828,14 +5868,67 @@ impl DashboardView {
                         ("估算费用", 0.11, true),
                     ]
                 };
-                self.draw_table(rt, fonts, theme, tbl_r, cols, &rows, Some(&wk_actions), None, None);
+                let total_weeks = weeks_asc.len();
+                self.draw_table_virtual(rt, fonts, theme, tbl_r, cols, total_weeks, None, None, |abs_idx, cells| {
+                    let asc_idx = total_weeks - 1 - abs_idx;
+                    let (wk, c) = weeks_asc[asc_idx];
+                    let ad = snapshot.agg.week_active_days.get(wk).copied().unwrap_or(0);
+                    let w_str = wow_at(asc_idx);
+                    if cost_mode {
+                        let avg_usd = if ad > 0 { c.cost.total_usd() / ad as f64 } else { 0.0 };
+                        cells.extend([
+                            wk.clone(),
+                            iso_week_range_label(wk),
+                            format!("{}天", ad),
+                            c.calls.to_string(),
+                            fmt_cost(&c.cost, c.calls, human),
+                            fmt_usd(avg_usd, human),
+                            fmt_usd(c.cost.input_plus_write_usd(), human),
+                            fmt_usd(c.cost.output_usd, human),
+                            fmt_usd(c.cost.cache_saved_usd, human),
+                            format!("{:.1}%", c.cache_hit_rate()),
+                            w_str,
+                            fmt_num(c.total_tokens(), human),
+                        ]);
+                    } else {
+                        let avg = if ad > 0 { c.total_tokens() / ad as u64 } else { 0 };
+                        cells.extend([
+                            wk.clone(),
+                            iso_week_range_label(wk),
+                            format!("{}天", ad),
+                            c.calls.to_string(),
+                            fmt_num(c.total_tokens(), human),
+                            fmt_num(avg, human),
+                            fmt_num(c.input_tokens + c.cache_write_tokens, human),
+                            fmt_num(c.output_tokens, human),
+                            format!("{:.1}%", c.cache_hit_rate()),
+                            w_str,
+                            fmt_cost(&c.cost, c.calls, human),
+                        ]);
+                    }
+                    Some(ClickAction::FilterSessions(SessionFilter::Week(wk.clone())))
+                });
             }
             WeeklyMode::Monthly => {
                 let m_asc: Vec<(&String, &TokenCounts)> = snapshot.agg.by_month.iter().collect();
+                let cost_mode = self.cost_mode;
                 let bars: Vec<BarItem> = m_asc
                     .iter()
-                    .map(|(m, c)| {
-                        let tip = if self.cost_mode {
+                    .map(|(m, c)| self.make_bar((*m).clone(), c, false))
+                    .collect();
+                let (_, inner) = draw_editorial_bars(
+                    rt,
+                    fonts,
+                    theme,
+                    plot,
+                    &bars,
+                    self.fresh_only,
+                    self.bar_unit(),
+                    self.mouse_dip,
+                    "暂无按月数据",
+                    |idx| {
+                        let (m, c) = m_asc[idx];
+                        if cost_mode {
                             vec![
                                 format!("{} · {} 次调用", m, c.calls),
                                 format!("估算费用: {} (省 {})", fmt_cost(&c.cost, c.calls, false), fmt_usd_compact(c.cost.cache_saved_usd)),
@@ -4852,53 +5945,16 @@ impl DashboardView {
                                 format!("缓存读 : {} ({:.1}%)", fmt_commas(c.cache_read_tokens), c.cache_hit_rate()),
                                 format!("输出   : {}", fmt_commas(c.output_tokens)),
                             ]
-                        };
-                        self.make_bar((*m).clone(), c, false, tip)
-                    })
-                    .collect();
-                let _ = draw_editorial_bars(
-                    rt,
-                    fonts,
-                    theme,
-                    plot,
-                    &bars,
-                    self.fresh_only,
-                    self.bar_unit(),
-                    self.mouse_dip,
-                    "暂无按月数据",
-                );
-
-                let rows: Vec<Vec<String>> = m_asc
-                    .iter()
-                    .rev()
-                    .map(|(m, c)| {
-                        if self.cost_mode {
-                            vec![
-                                (*m).clone(),
-                                c.calls.to_string(),
-                                fmt_cost(&c.cost, c.calls, human),
-                                fmt_usd(c.cost.input_plus_write_usd(), human),
-                                fmt_usd(c.cost.output_usd, human),
-                                fmt_usd(c.cost.cache_read_usd, human),
-                                fmt_usd(c.cost.cache_saved_usd, human),
-                                format!("{:.1}%", c.cache_hit_rate()),
-                                fmt_num(c.total_tokens(), human),
-                            ]
-                        } else {
-                            vec![
-                                (*m).clone(),
-                                c.calls.to_string(),
-                                fmt_num(c.total_tokens(), human),
-                                fmt_num(c.input_tokens + c.cache_write_tokens, human),
-                                fmt_num(c.output_tokens, human),
-                                fmt_num(c.cache_read_tokens, human),
-                                format!("{:.1}%", c.cache_hit_rate()),
-                                fmt_usd(c.cost.cache_saved_usd, human),
-                                fmt_cost(&c.cost, c.calls, human),
-                            ]
                         }
-                    })
-                    .collect();
+                    },
+                );
+                if let Some(p) = inner {
+                    self.discrete_plots.push(DiscretePlot::VerticalBars {
+                        plot: p,
+                        n: bars.len(),
+                    });
+                }
+
                 let cols: &[(&str, f32, bool)] = if self.cost_mode {
                     &[
                         ("月份", 0.10, false),
@@ -4924,7 +5980,36 @@ impl DashboardView {
                         ("估算费用", 0.125, true),
                     ]
                 };
-                self.draw_table(rt, fonts, theme, tbl_r, cols, &rows, None, None, None);
+                let total_months = m_asc.len();
+                self.draw_table_virtual(rt, fonts, theme, tbl_r, cols, total_months, None, None, |abs_idx, cells| {
+                    let (m, c) = m_asc[total_months - 1 - abs_idx];
+                    if cost_mode {
+                        cells.extend([
+                            m.clone(),
+                            c.calls.to_string(),
+                            fmt_cost(&c.cost, c.calls, human),
+                            fmt_usd(c.cost.input_plus_write_usd(), human),
+                            fmt_usd(c.cost.output_usd, human),
+                            fmt_usd(c.cost.cache_read_usd, human),
+                            fmt_usd(c.cost.cache_saved_usd, human),
+                            format!("{:.1}%", c.cache_hit_rate()),
+                            fmt_num(c.total_tokens(), human),
+                        ]);
+                    } else {
+                        cells.extend([
+                            m.clone(),
+                            c.calls.to_string(),
+                            fmt_num(c.total_tokens(), human),
+                            fmt_num(c.input_tokens + c.cache_write_tokens, human),
+                            fmt_num(c.output_tokens, human),
+                            fmt_num(c.cache_read_tokens, human),
+                            format!("{:.1}%", c.cache_hit_rate()),
+                            fmt_usd(c.cost.cache_saved_usd, human),
+                            fmt_cost(&c.cost, c.calls, human),
+                        ]);
+                    }
+                    None
+                });
             }
         }
     }
@@ -4934,7 +6019,7 @@ impl DashboardView {
     fn draw_model_view_toggle(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         card_left: f32,
         card_top: f32,
@@ -4974,7 +6059,7 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -5041,9 +6126,8 @@ impl DashboardView {
             sx += sw + 3.0;
         }
 
-        let (primary, secondary) = self.ordered_models(self.model_sort);
+        let (primary, secondary) = Self::ordered_models_of(&self.cached_agg.by_model, self.model_sort);
         let plot = rect_f(chart_c.left + 14.0, chart_c.top + 38.0, bw - 28.0, chart_h - 46.0);
-        self.plot_rects.push(plot);
 
         if primary.is_empty() && secondary.is_empty() {
             draw_text(
@@ -5055,29 +6139,45 @@ impl DashboardView {
             );
         } else {
             let plot_w = plot.right - plot.left;
-            let max_name_px = primary
+            let axis_h = 18.0;
+            let rows_top = plot.top + 4.0;
+            let rows_bot = (plot.bottom - axis_h).max(rows_top + 28.0);
+            let max_chart_rows = (((rows_bot - rows_top) / 26.0).floor() as usize).clamp(2, 6);
+            let show_sec_in_chart = !secondary.is_empty() && (primary.is_empty() || max_chart_rows >= 2);
+            let max_pri = if show_sec_in_chart { max_chart_rows - 1 } else { max_chart_rows };
+            let mut chart_items: Vec<(&str, TokenCounts, bool)> = primary
                 .iter()
-                .chain(secondary.iter())
-                .map(|(n, _)| factories.measure_text_width(n, &fonts.mono_small))
+                .take(max_pri)
+                .map(|&(n, c)| (n, c, false))
+                .collect();
+            if show_sec_in_chart {
+                if let Some(&(n, c)) = secondary.first() {
+                    chart_items.push((n, c, true));
+                }
+            }
+
+            let max_name_px = chart_items
+                .iter()
+                .map(|(n, _, _)| factories.measure_text_width(n, &fonts.mono_small))
                 .fold(140.0_f32, f32::max);
             let label_w = (max_name_px + 10.0).clamp(146.0, (plot_w * 0.34).max(232.0));
             let right_w = 182.0_f32.min(plot_w * 0.28);
             let track_l = plot.left + label_w + 10.0;
             let track_r = (plot.right - right_w - 10.0).max(track_l + 80.0);
             let track_w = track_r - track_l;
-            let axis_h = 18.0;
-            let rows_top = plot.top + 4.0;
-            let rows_bot = (plot.bottom - axis_h).max(rows_top + 28.0);
 
             // Vertical percentage gridlines + 85% healthy guide
+            let mut fbuf = FmtBuf::new();
             for pct in [0, 25, 50, 75, 100] {
                 let gx = track_l + (pct as f32 / 100.0) * track_w;
                 let col = if pct == 0 || pct == 100 { theme.border } else { theme.grid };
                 draw_line(rt, gx, rows_top, gx, rows_bot, col, 1.0);
                 if pct == 0 || pct == 50 || pct == 100 {
+                    fbuf.clear();
+                    let _ = write!(fbuf, "{pct}%");
                     draw_text(
                         rt,
-                        &format!("{pct}%"),
+                        fbuf.as_str(),
                         &fonts.mono_small_center,
                         rect_f(gx - 20.0, rows_bot + 2.0, 40.0, 14.0),
                         theme.muted,
@@ -5094,40 +6194,28 @@ impl DashboardView {
                 with_alpha(theme.sage, 0.85),
             );
 
-            let max_chart_rows = (((rows_bot - rows_top) / 26.0).floor() as usize).clamp(2, 6);
-            let show_sec_in_chart = !secondary.is_empty() && (primary.is_empty() || max_chart_rows >= 2);
-            let max_pri = if show_sec_in_chart { max_chart_rows - 1 } else { max_chart_rows };
-            let mut chart_items: Vec<(String, TokenCounts, bool)> = primary
-                .iter()
-                .take(max_pri)
-                .map(|(n, c)| (n.clone(), *c, false))
-                .collect();
-            if show_sec_in_chart {
-                if let Some((n, c)) = secondary.first() {
-                    chart_items.push((n.clone(), *c, true));
-                }
-            }
-
             let n_rows = chart_items.len().max(1);
             let row_h = ((rows_bot - rows_top) / n_rows as f32).clamp(24.0, 36.0);
             let mut hovered_tip: Option<(f32, f32, Vec<String>)> = None;
+            let mut row_rects = Vec::with_capacity(chart_items.len());
 
-            for (i, (name, c, is_sec)) in chart_items.iter().enumerate() {
+            for (i, &(name, c, is_sec)) in chart_items.iter().enumerate() {
                 let ry = rows_top + i as f32 * row_h;
-                if *is_sec && i > 0 {
+                if is_sec && i > 0 {
                     draw_line(rt, plot.left, ry - 1.5, plot.right, ry - 1.5, theme.border, 0.9);
                 }
                 let rr = rect_f(plot.left - 4.0, ry + 1.0, (plot.right - plot.left) + 8.0, row_h - 3.0);
+                row_rects.push(rr);
                 let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
                 if hov {
                     fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
                 }
 
                 let hit = c.cache_hit_rate();
-                let col = if *is_sec { theme.cache } else { cache_hit_color(theme, c) };
+                let col = if is_sec { theme.cache } else { cache_hit_color(theme, &c) };
                 let name_col = if hov {
                     theme.accent
-                } else if *is_sec {
+                } else if is_sec {
                     theme.muted
                 } else {
                     theme.text
@@ -5142,8 +6230,9 @@ impl DashboardView {
                     fill_round_rect(rt, rect_f(track_l, bar_y, fill_w, bar_h), bar_h * 0.5, col);
                 }
 
-                let hit_txt = format!("{:.1}%", hit);
-                let meta_txt = if *is_sec {
+                fbuf.clear();
+                let _ = write!(fbuf, "{:.1}%", hit);
+                let meta_txt = if is_sec {
                     format!("{}次 · {}", c.calls, fmt_cost(&c.cost, c.calls, true))
                 } else if self.cost_mode {
                     format!("{}次 · {}", c.calls, fmt_cost(&c.cost, c.calls, human))
@@ -5152,22 +6241,22 @@ impl DashboardView {
                 };
                 draw_text(
                     rt,
-                    &hit_txt,
-                    if *is_sec { &fonts.mono_small_right } else { &fonts.mono_med_right },
+                    fbuf.as_str(),
+                    if is_sec { &fonts.mono_small_right } else { &fonts.mono_med_right },
                     rect_f(track_r + 8.0, ry, 50.0, row_h),
-                    if *is_sec { theme.muted } else { col },
+                    if is_sec { theme.muted } else { col },
                 );
                 draw_text(
                     rt,
                     &meta_txt,
                     &fonts.mono_small_right,
                     rect_f(track_r + 62.0, ry, (plot.right - (track_r + 62.0)).max(50.0), row_h),
-                    if self.cost_mode && !*is_sec { theme.output } else { theme.muted },
+                    if self.cost_mode && !is_sec { theme.output } else { theme.muted },
                 );
 
                 self.hit_boxes.push(HitBox {
                     rect: rr,
-                    action: ClickAction::FilterSessions(SessionFilter::Model(name.clone())),
+                    action: ClickAction::FilterSessions(SessionFilter::Model(name.to_string())),
                 });
 
                 if hov {
@@ -5177,7 +6266,7 @@ impl DashboardView {
                         .map(|r| format!("{r:.1}% (第2轮起 {} 次)", mcs.map(|m| m.multi_turn_calls).unwrap_or(0)))
                         .unwrap_or_else(|| "-".into());
                     let mut tip = vec![
-                        if *is_sec {
+                        if is_sec {
                             format!("{} · {} 次调用 (按会话主模型计价)", name, c.calls)
                         } else {
                             format!("{} · {} 次调用 (点击筛选会话)", name, c.calls)
@@ -5197,7 +6286,7 @@ impl DashboardView {
                         tip.push(format!("缓存已省 : {}", fmt_usd_precise(c.cost.cache_saved_usd)));
                     }
                     tip.push(format!("总命中率 : {:.1}%  |  稳定命中: {}", hit, mt_str));
-                    if !*is_sec {
+                    if !is_sec {
                         let (mc, mu) = mcs.map(|m| (m.miss_count, m.miss_uncached_tokens)).unwrap_or((0, 0));
                         tip.push(if mc > 0 {
                             format!("缓存未命 : {} 次 (重传 {})", mc, fmt_commas(mu))
@@ -5208,12 +6297,17 @@ impl DashboardView {
                     tip.push(format!("新增输入 : {}  |  缓存读 : {}", fmt_commas(c.input_tokens), fmt_commas(c.cache_read_tokens)));
                     tip.push(format!("输出     : {}  |  总计   : {}", fmt_commas(c.output_tokens), fmt_commas(c.total_tokens())));
                     tip.push(format!("峰值Ctx  : {}", fmt_commas(c.peak_context)));
-                    let (mx, _) = self.mouse_dip.unwrap_or((track_l + track_w * 0.5, ry));
-                    hovered_tip = Some((mx, ry, tip));
+                    // Anchor tooltip deterministically to bar geometry (enables discrete row hover gating)
+                    let anchor_x = track_l + (fill_w * 0.65).clamp(16.0, (track_w - 20.0).max(16.0));
+                    hovered_tip = Some((anchor_x, ry, tip));
                 }
             }
+            self.discrete_plots.push(DiscretePlot::RowRects {
+                bounds: rect_f(plot.left - 4.0, rows_top, plot_w + 8.0, rows_bot - rows_top),
+                rows: row_rects,
+            });
 
-            if let Some((mx, ry, lines)) = hovered_tip {
+            if let Some((anchor_x, ry, lines)) = hovered_tip {
                 let max_units = lines
                     .iter()
                     .map(|l| {
@@ -5224,7 +6318,7 @@ impl DashboardView {
                     .fold(0.0_f32, f32::max);
                 let tw = (max_units * 6.4 + 24.0).clamp(240.0, (plot.right - plot.left - 16.0).max(240.0));
                 let th = lines.len() as f32 * 16.0 + 14.0;
-                let tx = (mx + 14.0).min(plot.right - tw - 4.0).max(plot.left + 4.0);
+                let tx = (anchor_x + 12.0).min(plot.right - tw - 4.0).max(plot.left + 4.0);
                 let ty = (ry - 4.0).clamp(plot.top, (plot.bottom - th).max(plot.top));
                 let tr = rect_f(tx, ty, tw, th);
                 fill_round_rect(rt, tr, 8.0, theme.tooltip_bg);
@@ -5243,71 +6337,9 @@ impl DashboardView {
 
         // Bottom full-width breakdown table (compaction pinned to bottom secondary rows)
         let tbl_r = rect_f(body.left, chart_c.bottom + 12.0, bw, (body.bottom - chart_c.bottom - 12.0).max(110.0));
-        let secondary_from = if secondary.is_empty() { None } else { Some(primary.len()) };
-
-        let mut rows: Vec<Vec<String>> = Vec::with_capacity(primary.len() + secondary.len());
-        let mut actions: Vec<ClickAction> = Vec::with_capacity(primary.len() + secondary.len());
-
-        let cost_mode = self.cost_mode;
-        let mut push_model_row = |name: String, c: TokenCounts, is_sec: bool| {
-            let mcs = self.cached_agg.by_model_cache.get(&name);
-            let speed_str = mcs
-                .and_then(ModelCacheStats::output_tps)
-                .map(|v| format!("{v:.0}/s"))
-                .unwrap_or_else(|| "-".into());
-            let mt_str = if is_sec {
-                "-".to_string()
-            } else {
-                mcs.and_then(ModelCacheStats::multi_turn_hit_rate)
-                    .map(|r| format!("{r:.1}%"))
-                    .unwrap_or_else(|| "-".into())
-            };
-            let miss_str = if is_sec {
-                "-".to_string()
-            } else {
-                match mcs.map(|m| m.miss_count).unwrap_or(0) {
-                    0 => "-".to_string(),
-                    n => format!("{}次", n),
-                }
-            };
-            if cost_mode {
-                rows.push(vec![
-                    name.clone(),
-                    c.calls.to_string(),
-                    fmt_cost(&c.cost, c.calls, human),
-                    fmt_usd(c.cost.input_plus_write_usd(), human),
-                    fmt_usd(c.cost.output_usd, human),
-                    fmt_usd(c.cost.cache_read_usd, human),
-                    fmt_usd(c.cost.cache_saved_usd, human),
-                    format!("{:.1}%", c.cache_hit_rate()),
-                    mt_str,
-                    speed_str,
-                    fmt_num(c.total_tokens(), human),
-                ]);
-            } else {
-                rows.push(vec![
-                    name.clone(),
-                    c.calls.to_string(),
-                    fmt_num(c.total_tokens(), human),
-                    fmt_num(c.input_tokens + c.cache_write_tokens, human),
-                    fmt_num(c.output_tokens, human),
-                    format!("{:.1}%", c.cache_hit_rate()),
-                    mt_str,
-                    miss_str,
-                    speed_str,
-                    fmt_num(c.peak_context, human),
-                    fmt_cost(&c.cost, c.calls, human),
-                ]);
-            }
-            actions.push(ClickAction::FilterSessions(SessionFilter::Model(name)));
-        };
-
-        for (name, c) in primary {
-            push_model_row(name, c, false);
-        }
-        for (name, c) in secondary {
-            push_model_row(name, c, true);
-        }
+        let pri_len = primary.len();
+        let total_models = pri_len + secondary.len();
+        let secondary_from = if secondary.is_empty() { None } else { Some(pri_len) };
 
         let cols: &[(&str, f32, bool)] = if self.cost_mode {
             &[
@@ -5338,14 +6370,88 @@ impl DashboardView {
                 ("估算费用", 0.09, true),
             ]
         };
-
-        self.draw_table(rt, fonts, theme, tbl_r, cols, &rows, Some(&actions), secondary_from, None);
+        let cost_mode = self.cost_mode;
+        let by_model_cache = &self.cached_agg.by_model_cache;
+        Self::draw_table_virtual_state(
+            rt,
+            fonts,
+            theme,
+            tbl_r,
+            cols,
+            total_models,
+            secondary_from,
+            None,
+            &mut self.scroll_rows,
+            &mut self.max_scroll,
+            &mut self.hit_boxes,
+            self.mouse_dip,
+            cost_mode,
+            |abs_idx, cells| {
+                let (name, c, is_sec) = if abs_idx < pri_len {
+                    let &(n, c) = &primary[abs_idx];
+                    (n, c, false)
+                } else {
+                    let &(n, c) = &secondary[abs_idx - pri_len];
+                    (n, c, true)
+                };
+                let mcs = by_model_cache.get(name);
+                let speed_str = mcs
+                    .and_then(ModelCacheStats::output_tps)
+                    .map(|v| format!("{v:.0}/s"))
+                    .unwrap_or_else(|| "-".into());
+                let mt_str = if is_sec {
+                    "-".to_string()
+                } else {
+                    mcs.and_then(ModelCacheStats::multi_turn_hit_rate)
+                        .map(|r| format!("{r:.1}%"))
+                        .unwrap_or_else(|| "-".into())
+                };
+                let miss_str = if is_sec {
+                    "-".to_string()
+                } else {
+                    match mcs.map(|m| m.miss_count).unwrap_or(0) {
+                        0 => "-".to_string(),
+                        n => format!("{}次", n),
+                    }
+                };
+                if cost_mode {
+                    cells.extend([
+                        name.to_string(),
+                        c.calls.to_string(),
+                        fmt_cost(&c.cost, c.calls, human),
+                        fmt_usd(c.cost.input_plus_write_usd(), human),
+                        fmt_usd(c.cost.output_usd, human),
+                        fmt_usd(c.cost.cache_read_usd, human),
+                        fmt_usd(c.cost.cache_saved_usd, human),
+                        format!("{:.1}%", c.cache_hit_rate()),
+                        mt_str,
+                        speed_str,
+                        fmt_num(c.total_tokens(), human),
+                    ]);
+                } else {
+                    cells.extend([
+                        name.to_string(),
+                        c.calls.to_string(),
+                        fmt_num(c.total_tokens(), human),
+                        fmt_num(c.input_tokens + c.cache_write_tokens, human),
+                        fmt_num(c.output_tokens, human),
+                        format!("{:.1}%", c.cache_hit_rate()),
+                        mt_str,
+                        miss_str,
+                        speed_str,
+                        fmt_num(c.peak_context, human),
+                        fmt_cost(&c.cost, c.calls, human),
+                    ]);
+                }
+                Some(ClickAction::FilterSessions(SessionFilter::Model(name.to_string())))
+            },
+        );
     }
 
     fn draw_pricing_subview(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -5485,19 +6591,17 @@ impl DashboardView {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "pricing.json".to_string())
         };
-        let line1 = format!(
-            "优先级：精确模型名 > 前缀匹配（如 gemini-4-neon 匹配全档位） > 内置默认  ·  Tab 切框 / Enter 保存"
-        );
+        let line1 = "优先级：精确模型名 > 前缀匹配（如 gemini-4-neon 匹配全档位） > 内置默认  ·  Tab 切框 / Enter 保存";
         let line2 = format!(
             "共 {} 条单价 · 已自定义 {} 项 · 写入本地 {}（对所有 Agent 日志目录保持绝对只读）",
             snapshot.pricing_rows.len(),
             snapshot.custom_pricing_count,
             path_hint,
         );
-        draw_text(rt, &line1, &fonts.ui_micro, rect_f(inner_l, edit_c.top + 89.0, inner_r - inner_l, 15.0), theme.sub);
+        draw_text(rt, line1, &fonts.ui_micro, rect_f(inner_l, edit_c.top + 89.0, inner_r - inner_l, 15.0), theme.sub);
         draw_text(rt, &line2, &fonts.ui_micro, rect_f(inner_l, edit_c.top + 109.0, inner_r - inner_l, 15.0), theme.muted);
 
-        // Full-width scrollable API pricing table
+        // Full-width scrollable API pricing table (virtualized row formatting)
         let tbl_r = rect_f(body.left, edit_c.bottom + 12.0, bw, (body.bottom - edit_c.bottom - 12.0).max(110.0));
         let secondary_from = snapshot.pricing_rows.iter().position(|r| r.is_reference);
         let selected_idx = self.pricing_selected_model.as_deref().and_then(|sel| {
@@ -5507,10 +6611,25 @@ impl DashboardView {
                 .position(|r| r.model.eq_ignore_ascii_case(sel))
         });
 
-        let rows: Vec<Vec<String>> = snapshot
-            .pricing_rows
-            .iter()
-            .map(|r| {
+        self.draw_table_virtual(
+            rt,
+            fonts,
+            theme,
+            tbl_r,
+            &[
+                ("模型名 / 规则", 0.29, false),
+                ("来源", 0.11, false),
+                ("匹配规则 / 说明", 0.21, false),
+                ("输入 $/M", 0.0975, true),
+                ("缓存读 $/M", 0.0975, true),
+                ("缓存写 $/M", 0.0975, true),
+                ("输出 $/M", 0.0975, true),
+            ],
+            snapshot.pricing_rows.len(),
+            secondary_from,
+            selected_idx,
+            |abs_idx, cells| {
+                let r = &snapshot.pricing_rows[abs_idx];
                 let (in_s, cr_s, cw_s, out_s) = match r.rate {
                     Some(rate) => (
                         format!("${}", fmt_rate_plain(rate.input)),
@@ -5527,7 +6646,7 @@ impl DashboardView {
                 } else {
                     r.matched_rule.clone()
                 };
-                vec![
+                cells.extend([
                     r.model.clone(),
                     r.source.label_cn().to_string(),
                     rule_col,
@@ -5535,38 +6654,16 @@ impl DashboardView {
                     cr_s,
                     cw_s,
                     out_s,
-                ]
-            })
-            .collect();
-        let actions: Vec<ClickAction> = (0..snapshot.pricing_rows.len())
-            .map(ClickAction::PickPricingRow)
-            .collect();
-
-        self.draw_table(
-            rt,
-            fonts,
-            theme,
-            tbl_r,
-            &[
-                ("模型名 / 规则", 0.29, false),
-                ("来源", 0.11, false),
-                ("匹配规则 / 说明", 0.21, false),
-                ("输入 $/M", 0.0975, true),
-                ("缓存读 $/M", 0.0975, true),
-                ("缓存写 $/M", 0.0975, true),
-                ("输出 $/M", 0.0975, true),
-            ],
-            &rows,
-            Some(&actions),
-            secondary_from,
-            selected_idx,
+                ]);
+                Some(ClickAction::PickPricingRow(abs_idx))
+            },
         );
     }
 
     fn draw_budget_subview(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -5777,7 +6874,7 @@ impl DashboardView {
             ]);
         }
 
-        self.draw_table(
+        self.draw_table_virtual(
             rt,
             fonts,
             theme,
@@ -5790,10 +6887,13 @@ impl DashboardView {
                 ("重置 / 进度", 0.13, true),
                 ("状态", 0.09, true),
             ],
-            &rows,
+            rows.len(),
             None,
             None,
-            None,
+            |i, cells| {
+                cells.extend(std::mem::take(&mut rows[i]));
+                None
+            },
         );
     }
 
@@ -5804,7 +6904,7 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -5817,20 +6917,34 @@ impl DashboardView {
         fill_round_rect(rt, top_c, 10.0, theme.surface);
         stroke_round_rect(rt, top_c, 10.0, theme.border, 1.0);
 
-        let sorted = self.display_sessions_for_tab();
+        let (sorted_len, auto_sel) = self.with_display_sessions_for_tab(|sorted| {
+            let keep = self
+                .selected_session
+                .as_deref()
+                .is_some_and(|id| sorted.iter().any(|r| self.row_session(r).conversation_id == id));
+            let next = if keep {
+                None
+            } else {
+                Some(sorted.first().map(|r| self.row_session(r).conversation_id.clone()))
+            };
+            (sorted.len(), next)
+        });
+        if let Some(new_sel) = auto_sel {
+            self.selected_session = new_sel;
+        }
         let (root_total, sub_total) = self.session_split_counts();
         let pinned_total = self.pinned_ids.len();
         let now_local = Local::now();
 
         draw_text(rt, "会话记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 9.0, 66.0, 20.0), theme.text);
         let cnt_str = if self.session_filter.is_some() || self.pinned_only {
-            format!("{} 条", sorted.len())
+            format!("{} 条", sorted_len)
         } else if self.group_subagents && sub_total > 0 {
             format!("{} 主 (+{}子)", root_total, sub_total)
         } else if sub_total > 0 {
-            format!("{} 个 ({}子)", sorted.len(), sub_total)
+            format!("{} 个 ({}子)", sorted_len, sub_total)
         } else {
-            format!("{} 个", sorted.len())
+            format!("{} 个", sorted_len)
         };
         let cnt_w = (factories.measure_text_width(&cnt_str, &fonts.ui_micro) + 6.0).clamp(42.0, 102.0);
         draw_text(
@@ -5910,7 +7024,11 @@ impl DashboardView {
 
         // Dismissible drill-down filter chip (precisely measured so long model names don't clip!)
         if let Some(f) = self.session_filter.clone() {
-            let chip_lbl = f.label(self.privacy_mode.then_some(&self.redactor));
+            let chip_lbl = if self.privacy_mode {
+                self.with_redactor(|r| f.label(Some(r)))
+            } else {
+                f.label(None)
+            };
             let max_w = (sx - 8.0 - left_cursor).max(0.0);
             if max_w >= 72.0 {
                 let measured = factories.measure_text_width(&chip_lbl, &fonts.ui_small_center) + 18.0;
@@ -5954,423 +7072,348 @@ impl DashboardView {
         let row_h = 28.0;
         let vis = (((top_c.bottom - 8.0 - list_y) / row_h).floor() as usize).max(1);
         self.sessions_vis_rows = vis;
-        self.max_scroll = sorted.len().saturating_sub(vis);
+        self.max_scroll = sorted_len.saturating_sub(vis);
         if self.scroll_rows > self.max_scroll {
             self.scroll_rows = self.max_scroll;
         }
+        let scroll_rows = self.scroll_rows;
+        let max_scroll = self.max_scroll;
+        let show_multi = self.has_non_antigravity;
 
-        // Dynamically size model column to fit long model names cleanly
-        let max_model_px = sorted
-            .iter()
-            .skip(self.scroll_rows)
-            .take(vis)
-            .map(|r| factories.measure_text_width(&r.primary_model, &fonts.mono_small_right))
-            .fold(124.0_f32, f32::max);
-        let model_cap = (rr_w * 0.24).clamp(138.0, 206.0);
-        let model_w = (max_model_px + 8.0).clamp(124.0, model_cap);
-        let (sm_x, sm_w, metrics_w) = session_metric_columns(rx);
-        let sm_rect = |i: usize, y: f32, h: f32| rect_f(sm_x[i], y, sm_w[i], h);
-        let model_x = rx - metrics_w - model_w;
-        // Reclaimed 52 DIP ID column -> 28 DIP [dot + pin star] + 56 DIP compact relative time + wider title + workspace pill
-        let time_x = rr_l + 36.0;
-        let title_x = rr_l + 96.0;
-        let title_w = (model_x - 10.0 - title_x).max(96.0);
+        let (new_row_rects, new_hits) = self.with_display_sessions_for_tab(|sorted| {
+            let mut row_rects_out = Vec::with_capacity(vis);
+            let mut hits_out = Vec::with_capacity(vis * 2);
 
-        // Column headers
-        let hdr_y = top_c.top + 32.0;
-        let hdr_h = 19.0;
-        draw_text(rt, "时间", &fonts.ui_micro, rect_f(time_x, hdr_y, 56.0, hdr_h), theme.muted);
-        draw_text(rt, "会话 / 项目", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
-        draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
-        for (i, lbl) in SESSION_METRIC_LABELS.iter().enumerate() {
-            draw_text(rt, lbl, &fonts.ui_small_right, sm_rect(i, hdr_y, hdr_h), theme.muted);
-        }
-        draw_line(rt, top_c.left + 14.0, top_c.top + 52.0, top_c.right - 14.0, top_c.top + 52.0, theme.border, 1.0);
+            // Dynamically size model column to fit long model names cleanly
+            let max_model_px = sorted
+                .iter()
+                .skip(scroll_rows)
+                .take(vis)
+                .map(|r| factories.measure_text_width(&r.primary_model, &fonts.mono_small_right))
+                .fold(124.0_f32, f32::max);
+            let model_cap = (rr_w * 0.24).clamp(138.0, 206.0);
+            let model_w = (max_model_px + 8.0).clamp(124.0, model_cap);
+            let (sm_x, sm_w, metrics_w) = session_metric_columns(rx);
+            let sm_rect = |i: usize, y: f32, h: f32| rect_f(sm_x[i], y, sm_w[i], h);
+            let model_x = rx - metrics_w - model_w;
+            let time_x = rr_l + 36.0;
+            let title_x = rr_l + 96.0;
+            let title_w = (model_x - 10.0 - title_x).max(96.0);
 
-        if sorted.is_empty() {
-            let empty_txt = if self.pinned_only {
-                "当前筛选条件下无置顶会话 · 点击上方「★置顶」或清除搜索查看全部"
-            } else if self.session_filter.is_some() {
-                "当前筛选条件下无匹配会话 · 点击上方筛选标签或按 Backspace 清除"
-            } else {
-                "当前范围暂无会话 · 可在右上角切换 7天 / 30天 / 全部"
-            };
-            draw_text(
-                rt,
-                empty_txt,
-                &fonts.ui_reg_center,
-                rect_f(top_c.left, list_y, bw, (top_c.bottom - list_y).max(30.0)),
-                theme.muted,
-            );
-        } else {
-            let mut prev_was_pinned = false;
-            for (vi, row) in sorted.iter().skip(self.scroll_rows).take(vis).enumerate() {
-                let s = self.row_session(row);
-                let ry = list_y + vi as f32 * row_h;
-                let cell_h = row_h - 2.0;
-                let rr = rect_f(rr_l, ry, rr_w, cell_h);
-                let sel = self.selected_session.as_deref() == Some(s.conversation_id.as_str());
-                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
+            // Column headers
+            let hdr_y = top_c.top + 32.0;
+            let hdr_h = 19.0;
+            draw_text(rt, "时间", &fonts.ui_micro, rect_f(time_x, hdr_y, 56.0, hdr_h), theme.muted);
+            draw_text(rt, "会话 / 项目", &fonts.ui_micro, rect_f(title_x, hdr_y, title_w, hdr_h), theme.muted);
+            draw_text(rt, "模型", &fonts.ui_small_right, rect_f(model_x, hdr_y, model_w, hdr_h), theme.muted);
+            for (i, lbl) in SESSION_METRIC_LABELS.iter().enumerate() {
+                draw_text(rt, lbl, &fonts.ui_small_right, sm_rect(i, hdr_y, hdr_h), theme.muted);
+            }
+            draw_line(rt, top_c.left + 14.0, top_c.top + 52.0, top_c.right - 14.0, top_c.top + 52.0, theme.border, 1.0);
 
-                // Soft divider separating pinned block from regular rows
-                if vi > 0 && prev_was_pinned && !row.is_pinned {
-                    draw_line(
-                        rt,
-                        top_c.left + 16.0,
-                        ry - 1.0,
-                        top_c.right - 16.0,
-                        ry - 1.0,
-                        theme.border,
-                        1.0,
-                    );
-                }
-                prev_was_pinned = row.is_pinned;
-
-                if sel {
-                    fill_round_rect(rt, rr, 6.0, theme.hover);
-                    fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, cell_h - 10.0), 1.25, theme.accent);
-                } else if hov {
-                    fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
-                }
-
-                // 28 DIP left gutter: live/recent status dot + clickable pin star
-                let cy = ry + cell_h * 0.5;
-                draw_session_status_dot(rt, theme, rr_l + 10.5, cy, s, row.last_time, now_local);
-                let star_r = rect_f(rr_l + 16.0, ry + 3.0, 18.0, cell_h - 6.0);
-                let star_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&star_r, mx, my)).unwrap_or(false);
-                if row.is_pinned || hov || sel {
-                    if star_hov {
-                        fill_round_rect(rt, star_r, 4.5, theme.accent_soft);
-                    }
-                    let (glyph, col) = if row.is_pinned {
-                        ("★", theme.accent)
-                    } else if star_hov {
-                        ("☆", theme.accent)
-                    } else {
-                        ("☆", theme.muted)
-                    };
-                    draw_text(rt, glyph, &fonts.ui_small_center, star_r, col);
-                }
-
-                let t_str = fmt_relative_time_cn(row.last_time, now_local);
-                let hit_str = format!("{:.1}%", row.counts.cache_hit_rate());
-                let hit_col = cache_hit_color(theme, &row.counts);
-                let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
-                let base_title = self.format_session_title(s);
-                let show_multi = snapshot.has_non_antigravity();
-                let mut prefix = String::new();
-                if row.is_child_row {
-                    prefix.push_str("↳ ");
-                }
-                if let Some(tag) = format_source_tag(s.source, show_multi) {
-                    prefix.push_str(&format!("[{tag}] "));
-                }
-                if s.is_archived {
-                    prefix.push_str("[归档] ");
-                }
-                let title_disp = format!("{prefix}{base_title}");
-                let sub_badge = if !row.is_child_row && row.subagent_count > 0 {
-                    Some(format!("+{}子", row.subagent_count))
+            if sorted.is_empty() {
+                let empty_txt = if self.pinned_only {
+                    "当前筛选条件下无置顶会话 · 点击上方「★置顶」或清除搜索查看全部"
+                } else if self.session_filter.is_some() {
+                    "当前筛选条件下无匹配会话 · 点击上方筛选标签或按 Backspace 清除"
                 } else {
-                    None
+                    "当前范围暂无会话 · 可在右上角切换 7天 / 30天 / 全部"
                 };
-                let ws_badge = {
-                    let ws = self.format_workspace_short(&s.workspace);
-                    if ws.is_empty() { None } else { Some(ws) }
-                };
-
                 draw_text(
                     rt,
-                    &t_str,
-                    &fonts.mono_small,
-                    rect_f(time_x, ry, 56.0, cell_h),
-                    if row.out_of_scope { theme.muted } else { theme.sub },
+                    empty_txt,
+                    &fonts.ui_reg_center,
+                    rect_f(top_c.left, list_y, bw, (top_c.bottom - list_y).max(30.0)),
+                    theme.muted,
                 );
+            } else {
+                let mut prev_was_pinned = false;
+                for (vi, row) in sorted.iter().skip(scroll_rows).take(vis).enumerate() {
+                    let s = self.row_session(row);
+                    let ry = list_y + vi as f32 * row_h;
+                    let cell_h = row_h - 2.0;
+                    let rr = rect_f(rr_l, ry, rr_w, cell_h);
+                    let sel = self.selected_session.as_deref() == Some(s.conversation_id.as_str());
+                    let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
 
-                // Compute trailing pill budgets cleanly: Title [workspace] [+N子]
-                let mut reserved = 0.0_f32;
-                let sub_w = sub_badge.as_deref().map(|b| {
-                    (factories.measure_text_width(b, &fonts.ui_small_center) + 10.0).ceil()
-                });
-                if let Some(sw) = sub_w {
-                    if title_w > sw + 56.0 {
-                        reserved += sw + 5.0;
+                    // Soft divider separating pinned block from regular rows
+                    if vi > 0 && prev_was_pinned && !row.is_pinned {
+                        draw_line(
+                            rt,
+                            top_c.left + 16.0,
+                            ry - 1.0,
+                            top_c.right - 16.0,
+                            ry - 1.0,
+                            theme.border,
+                            1.0,
+                        );
                     }
-                }
-                let ws_w = ws_badge.as_deref().and_then(|w| {
-                    let nat = (factories.measure_text_width(w, &fonts.ui_micro) + 10.0).ceil();
-                    let capped = nat.min(104.0);
-                    if title_w - reserved > capped + 76.0 {
-                        Some(capped)
+                    prev_was_pinned = row.is_pinned;
+
+                    if sel {
+                        fill_round_rect(rt, rr, 6.0, theme.hover);
+                        fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, cell_h - 10.0), 1.25, theme.accent);
+                    } else if hov {
+                        fill_round_rect(rt, rr, 6.0, with_alpha(theme.text, 0.04));
+                    }
+
+                    // 28 DIP left gutter: live/recent status dot + clickable pin star
+                    let cy = ry + cell_h * 0.5;
+                    draw_session_status_dot(rt, theme, rr_l + 10.5, cy, s, row.last_time, now_local);
+                    let star_r = rect_f(rr_l + 16.0, ry + 3.0, 18.0, cell_h - 6.0);
+                    let star_hov = self.mouse_dip.map(|(mx, my)| hit_rect(&star_r, mx, my)).unwrap_or(false);
+                    if row.is_pinned || hov || sel {
+                        if star_hov {
+                            fill_round_rect(rt, star_r, 4.5, theme.accent_soft);
+                        }
+                        let (glyph, col) = if row.is_pinned {
+                            ("★", theme.accent)
+                        } else if star_hov {
+                            ("☆", theme.accent)
+                        } else {
+                            ("☆", theme.muted)
+                        };
+                        draw_text(rt, glyph, &fonts.ui_small_center, star_r, col);
+                    }
+
+                    let t_str = fmt_relative_time_cn(row.last_time, now_local);
+                    let mut hit_buf = FmtBuf::new();
+                    let _ = write!(hit_buf, "{:.1}%", row.counts.cache_hit_rate());
+                    let hit_col = cache_hit_color(theme, &row.counts);
+                    let cost_str = fmt_cost(&row.counts.cost, row.counts.calls, human);
+                    let base_title = self.format_session_title(s);
+                    let mut prefix = String::new();
+                    if row.is_child_row {
+                        prefix.push_str("↳ ");
+                    }
+                    if let Some(tag) = format_source_tag(s.source, show_multi) {
+                        prefix.push_str(&format!("[{tag}] "));
+                    }
+                    if s.is_archived {
+                        prefix.push_str("[归档] ");
+                    }
+                    let title_disp = format!("{prefix}{base_title}");
+                    let mut sub_buf = FmtBuf::new();
+                    let has_sub_badge = !row.is_child_row && row.subagent_count > 0;
+                    if has_sub_badge {
+                        let _ = write!(sub_buf, "+{}子", row.subagent_count);
+                    }
+                    let ws_badge = {
+                        let ws = self.format_workspace_short(&s.workspace);
+                        if ws.is_empty() { None } else { Some(ws) }
+                    };
+
+                    draw_text(
+                        rt,
+                        &t_str,
+                        &fonts.mono_small,
+                        rect_f(time_x, ry, 56.0, cell_h),
+                        if row.out_of_scope { theme.muted } else { theme.sub },
+                    );
+
+                    // Compute trailing pill budgets cleanly: Title [workspace] [+N子]
+                    let mut reserved = 0.0_f32;
+                    let sub_w = if has_sub_badge {
+                        Some((factories.measure_text_width(sub_buf.as_str(), &fonts.ui_small_center) + 10.0).ceil())
                     } else {
                         None
+                    };
+                    if let Some(sw) = sub_w {
+                        if title_w > sw + 56.0 {
+                            reserved += sw + 5.0;
+                        }
                     }
-                });
-                if let Some(ww) = ws_w {
-                    reserved += ww + 5.0;
-                }
-                let actual_title_w = (title_w - reserved).max(40.0);
-                draw_text(
-                    rt,
-                    &title_disp,
-                    &fonts.ui_reg,
-                    rect_f(title_x, ry, actual_title_w, cell_h),
-                    if row.is_child_row { theme.sub } else { theme.text },
-                );
-
-                let nat_title = factories.measure_text_width(&title_disp, &fonts.ui_reg);
-                let mut pill_x = title_x + nat_title.min(actual_title_w) + 6.0;
-                let pill_y = ry + (cell_h - 16.0) * 0.5;
-                if let (Some(ws), Some(ww)) = (ws_badge.as_deref(), ws_w) {
-                    let wr = rect_f(pill_x, pill_y, ww, 16.0);
-                    fill_round_rect(rt, wr, 5.0, theme.surface_subtle);
-                    stroke_round_rect(rt, wr, 5.0, theme.border, 0.7);
-                    draw_text(rt, ws, &fonts.ui_micro, rect_f(wr.left + 5.0, wr.top, ww - 10.0, 16.0), theme.sub);
-                    pill_x += ww + 5.0;
-                }
-                if let (Some(b), Some(sw)) = (sub_badge.as_deref(), sub_w) {
-                    if pill_x + sw <= title_x + title_w + 2.0 {
-                        let br = rect_f(pill_x, pill_y, sw, 16.0);
-                        fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
-                        draw_text(rt, b, &fonts.ui_small_center, br, theme.accent);
+                    let ws_w = ws_badge.as_deref().and_then(|w| {
+                        let nat = (factories.measure_text_width(w, &fonts.ui_micro) + 10.0).ceil();
+                        let capped = nat.min(104.0);
+                        if title_w - reserved > capped + 76.0 {
+                            Some(capped)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(ww) = ws_w {
+                        reserved += ww + 5.0;
                     }
+                    let actual_title_w = (title_w - reserved).max(40.0);
+                    draw_text(
+                        rt,
+                        &title_disp,
+                        &fonts.ui_reg,
+                        rect_f(title_x, ry, actual_title_w, cell_h),
+                        if row.is_child_row { theme.sub } else { theme.text },
+                    );
+
+                    let nat_title = factories.measure_text_width(&title_disp, &fonts.ui_reg);
+                    let mut pill_x = title_x + nat_title.min(actual_title_w) + 6.0;
+                    let pill_y = ry + (cell_h - 16.0) * 0.5;
+                    if let (Some(ws), Some(ww)) = (ws_badge.as_deref(), ws_w) {
+                        let wr = rect_f(pill_x, pill_y, ww, 16.0);
+                        fill_round_rect(rt, wr, 5.0, theme.surface_subtle);
+                        stroke_round_rect(rt, wr, 5.0, theme.border, 0.7);
+                        draw_text(rt, ws, &fonts.ui_micro, rect_f(wr.left + 5.0, wr.top, ww - 10.0, 16.0), theme.sub);
+                        pill_x += ww + 5.0;
+                    }
+                    if let Some(sw) = sub_w {
+                        if pill_x + sw <= title_x + title_w + 2.0 {
+                            let br = rect_f(pill_x, pill_y, sw, 16.0);
+                            fill_round_rect(rt, br, 8.0, with_alpha(theme.accent, 0.14));
+                            draw_text(rt, sub_buf.as_str(), &fonts.ui_small_center, br, theme.accent);
+                        }
+                    }
+
+                    draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, cell_h), theme.muted);
+                    draw_session_metric_cells(
+                        rt,
+                        fonts,
+                        theme,
+                        &sm_x,
+                        &sm_w,
+                        ry,
+                        cell_h,
+                        &row.counts,
+                        hit_buf.as_str(),
+                        hit_col,
+                        &cost_str,
+                        self.cost_mode,
+                        human,
+                    );
+
+                    let cid = s.conversation_id.clone();
+                    row_rects_out.push((rr, cid.clone()));
+                    hits_out.push(HitBox {
+                        rect: rr,
+                        action: ClickAction::SelectSession(cid.clone()),
+                    });
+                    // Push pin star hitbox AFTER row hitbox so reverse-order hit_test_click hits star first.
+                    hits_out.push(HitBox {
+                        rect: star_r,
+                        action: ClickAction::TogglePinSession(cid),
+                    });
                 }
 
-                draw_text(rt, &row.primary_model, &fonts.mono_small_right, rect_f(model_x, ry, model_w, cell_h), theme.muted);
-                draw_session_metric_cells(
-                    rt,
-                    fonts,
-                    theme,
-                    &sm_x,
-                    &sm_w,
-                    ry,
-                    cell_h,
-                    &row.counts,
-                    &hit_str,
-                    hit_col,
-                    &cost_str,
-                    self.cost_mode,
-                    human,
-                );
-
-                let cid = s.conversation_id.clone();
-                self.session_row_rects.push((rr, cid.clone()));
-                self.hit_boxes.push(HitBox {
-                    rect: rr,
-                    action: ClickAction::SelectSession(cid.clone()),
-                });
-                // Push pin star hitbox AFTER row hitbox so reverse-order hit_test_click hits star first.
-                self.hit_boxes.push(HitBox {
-                    rect: star_r,
-                    action: ClickAction::TogglePinSession(cid),
-                });
+                if max_scroll > 0 {
+                    let track_h = (top_c.bottom - 10.0 - list_y).max(20.0);
+                    let thumb_h = ((vis as f32 / sorted.len() as f32) * track_h).clamp(24.0, track_h);
+                    let ratio = scroll_rows as f32 / max_scroll as f32;
+                    let thumb_y = list_y + ratio * (track_h - thumb_h);
+                    fill_round_rect(rt, rect_f(top_c.right - 7.0, thumb_y, 3.0, thumb_h), 1.5, theme.muted);
+                }
             }
-
-            if self.max_scroll > 0 {
-                let track_h = (top_c.bottom - 10.0 - list_y).max(20.0);
-                let thumb_h = ((vis as f32 / sorted.len() as f32) * track_h).clamp(24.0, track_h);
-                let ratio = self.scroll_rows as f32 / self.max_scroll as f32;
-                let thumb_y = list_y + ratio * (track_h - thumb_h);
-                fill_round_rect(rt, rect_f(top_c.right - 7.0, thumb_y, 3.0, thumb_h), 1.5, theme.muted);
-            }
-        }
+            (row_rects_out, hits_out)
+        });
+        self.session_row_rects.extend(new_row_rects);
+        self.hit_boxes.extend(new_hits);
 
         // Bottom: Session Action Header + Meta/Legend + Turn-by-Turn Context Anatomy
         let bot_c = rect_f(body.left, top_c.bottom + 12.0, bw, (body.bottom - top_c.bottom - 12.0).max(140.0));
         fill_round_rect(rt, bot_c, 10.0, theme.surface);
         stroke_round_rect(rt, bot_c, 10.0, theme.border, 1.0);
 
-        let sel = self
-            .selected_session
-            .as_deref()
-            .and_then(|id| self.session_for_detail(id));
-
-        if let Some(s) = sel {
-            let (sub_cnt, sub_agg) = self.count_subagents_of(&s.conversation_id);
-            let is_pinned = self.pinned_ids.contains(&s.conversation_id);
-            let cap = classify_resume_capability(&s, &snapshot.sessions);
-            let valid_id = validate_conversation_id(&s.conversation_id);
-            let direct_ok = cap.is_direct_resumable() && valid_id;
-            let blocked_msg: &'static str = if !valid_id {
-                BlockedReason::InvalidConversationId.message_cn()
+        let sel_cid = self.selected_session.clone();
+        let found_loc = sel_cid.as_deref().and_then(|id| {
+            if let Some(idx) = self.cached_sessions.iter().position(|s| s.conversation_id == id) {
+                Some((false, idx))
             } else {
-                cap.disabled_reason_cn()
-                    .or_else(|| cap.blocked_reason().map(BlockedReason::message_cn))
-                    .unwrap_or("该会话不支持终端恢复")
+                self.pinned_out_of_scope
+                    .iter()
+                    .position(|s| s.conversation_id == id)
+                    .map(|idx| (true, idx))
+            }
+        });
+
+        if let (Some(sel_id), Some((is_oos, sess_idx))) = (sel_cid, found_loc) {
+            let detail_key = SessionDetailKey {
+                data_gen: self.data_gen,
+                sess_ptr: self.cached_sessions.as_ptr() as usize,
+                sess_len: self.cached_sessions.len(),
+                snap_sess_len: snapshot.sessions.len(),
+                selected_cid: sel_id,
+                session_filter: self.session_filter.clone(),
             };
-            let resumable_parent_id = find_resumable_parent(&s, &snapshot.sessions)
-                .map(|p| p.conversation_id.clone());
-            let has_ws = normalize_workspace_path_str(&s.workspace).is_some();
-            let show_multi = snapshot.has_non_antigravity();
-
-            // ---- Row 1 (bot_c.top + 8, h = 22): Pin + Title + #id · workspace  |  [▶ 继续] [复制命令] [目录] [···] ----
-            let r1_y = bot_c.top + 8.0;
-            let r1_h = 22.0;
-
-            let mut act_rx = bot_c.right - 14.0;
-            // [···] overflow / context menu button
-            let more_w = 28.0;
-            let more_r = rect_f(act_rx - more_w, r1_y, more_w, r1_h);
-            self.detail_more_btn_rect = Some(more_r);
-            self.draw_ghost_btn(
-                rt,
-                fonts,
-                theme,
-                more_r,
-                "···",
-                false,
-                ClickAction::SessionMoreMenu(s.conversation_id.clone()),
-            );
-            stroke_round_rect(rt, more_r, 6.0, theme.border, 0.8);
-            act_rx = more_r.left - 5.0;
-
-            // [目录] open workspace button
-            let dir_w = 40.0;
-            let dir_r = rect_f(act_rx - dir_w, r1_y, dir_w, r1_h);
-            if has_ws {
-                self.draw_ghost_btn(
-                    rt,
-                    fonts,
-                    theme,
-                    dir_r,
-                    "目录",
-                    false,
-                    ClickAction::OpenWorkspace(s.conversation_id.clone()),
-                );
-                stroke_round_rect(rt, dir_r, 6.0, theme.border, 0.8);
-            } else {
-                fill_round_rect(rt, dir_r, 6.0, theme.surface_subtle);
-                draw_text(rt, "目录", &fonts.ui_small_center, dir_r, theme.muted);
-                self.hit_boxes.push(HitBox {
-                    rect: dir_r,
-                    action: ClickAction::ShowBlockedReason("该会话无可用本地工作区路径".to_string()),
+            let need_rebuild = self
+                .session_detail_cache
+                .borrow()
+                .as_ref()
+                .is_none_or(|c| c.key != detail_key);
+            if need_rebuild {
+                let raw_s = if is_oos {
+                    &self.pinned_out_of_scope[sess_idx]
+                } else {
+                    &self.cached_sessions[sess_idx]
+                };
+                let sliced_override = if !is_oos {
+                    self.slicing_filter().and_then(|f| slice_session(raw_s, f))
+                } else {
+                    None
+                };
+                let eff = sliced_override.as_ref().unwrap_or(raw_s);
+                let (sub_cnt, sub_agg) = self.count_subagents_of(&eff.conversation_id);
+                let cap = classify_resume_capability(eff, &snapshot.sessions);
+                let valid_id = validate_conversation_id(&eff.conversation_id);
+                let direct_ok = cap.is_direct_resumable() && valid_id;
+                let blocked_msg: &'static str = if !valid_id {
+                    BlockedReason::InvalidConversationId.message_cn()
+                } else {
+                    cap.disabled_reason_cn()
+                        .or_else(|| cap.blocked_reason().map(BlockedReason::message_cn))
+                        .unwrap_or("该会话不支持终端恢复")
+                };
+                let resumable_parent_id = find_resumable_parent(eff, &snapshot.sessions)
+                    .map(|p| p.conversation_id.clone());
+                let has_ws = normalize_workspace_path_str(&eff.workspace).is_some();
+                let compaction_count = eff.compaction_count as usize;
+                let (cache_miss_count, _) = eff.cache_miss_stats();
+                let active_duration_secs = eff.active_duration_secs();
+                let thinking_turns = eff.thinking_turns as usize;
+                let mut tools_vec: Vec<(String, u64)> = eff.tool_counts().into_iter().collect();
+                tools_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let top_tools_str = if !tools_vec.is_empty() {
+                    let top_t: Vec<String> = tools_vec
+                        .into_iter()
+                        .take(2)
+                        .map(|(n, c)| format!("{n}×{c}"))
+                        .collect();
+                    top_t.join("/")
+                } else {
+                    String::new()
+                };
+                *self.session_detail_cache.borrow_mut() = Some(SessionDetailCache {
+                    key: detail_key,
+                    sliced_override,
+                    sub_cnt,
+                    sub_agg,
+                    direct_ok,
+                    blocked_msg,
+                    resumable_parent_id,
+                    has_ws,
+                    compaction_count,
+                    cache_miss_count,
+                    active_duration_secs,
+                    thinking_turns,
+                    top_tools_str,
                 });
             }
-            act_rx = dir_r.left - 5.0;
 
-            // [复制命令] copy resume command button
-            let cmd_copied = self
-                .resume_cmd_copied_until
-                .map(|t| Instant::now() < t)
-                .unwrap_or(false);
-            let cmd_w = 62.0;
-            let cmd_r = rect_f(act_rx - cmd_w, r1_y, cmd_w, r1_h);
-            if direct_ok {
-                self.draw_ghost_btn(
-                    rt,
-                    fonts,
-                    theme,
-                    cmd_r,
-                    if cmd_copied { "已复制" } else { "复制命令" },
-                    cmd_copied,
-                    ClickAction::CopyResumeCmd(s.conversation_id.clone()),
-                );
-                stroke_round_rect(
-                    rt,
-                    cmd_r,
-                    6.0,
-                    if cmd_copied { theme.accent } else { theme.border },
-                    0.8,
-                );
-            } else {
-                fill_round_rect(rt, cmd_r, 6.0, theme.surface_subtle);
-                draw_text(rt, "复制命令", &fonts.ui_small_center, cmd_r, theme.muted);
-                self.hit_boxes.push(HitBox {
-                    rect: cmd_r,
-                    action: ClickAction::ShowBlockedReason(blocked_msg.to_string()),
-                });
-            }
-            act_rx = cmd_r.left - 5.0;
-
-            // [▶ 继续] / [定位父会话] primary button
-            if direct_ok {
-                let res_w = 64.0;
-                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
-                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&res_r, mx, my)).unwrap_or(false);
-                fill_round_rect(
-                    rt,
-                    res_r,
-                    6.0,
-                    if hov { theme.accent } else { theme.accent_soft },
-                );
-                stroke_round_rect(rt, res_r, 6.0, with_alpha(theme.accent, 0.8), 0.9);
-                draw_text(
-                    rt,
-                    "▶ 继续",
-                    &fonts.ui_small_center,
-                    res_r,
-                    if hov { theme.bg } else { theme.accent },
-                );
-                self.hit_boxes.push(HitBox {
-                    rect: res_r,
-                    action: ClickAction::ResumeSession(s.conversation_id.clone()),
-                });
-                act_rx = res_r.left - 8.0;
-            } else if let Some(pid) = resumable_parent_id {
-                let res_w = 78.0;
-                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
-                self.draw_ghost_btn(
-                    rt,
-                    fonts,
-                    theme,
-                    res_r,
-                    "定位父会话 ›",
-                    true,
-                    ClickAction::InspectSession(pid),
-                );
-                stroke_round_rect(rt, res_r, 6.0, with_alpha(theme.accent, 0.65), 0.8);
-                act_rx = res_r.left - 8.0;
-            } else {
-                let res_w = 64.0;
-                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
-                fill_round_rect(rt, res_r, 6.0, theme.surface_subtle);
-                stroke_round_rect(rt, res_r, 6.0, theme.border, 0.7);
-                draw_text(rt, "▶ 继续", &fonts.ui_small_center, res_r, theme.muted);
-                self.hit_boxes.push(HitBox {
-                    rect: res_r,
-                    action: ClickAction::ShowBlockedReason(blocked_msg.to_string()),
-                });
-                act_rx = res_r.left - 8.0;
-            }
-
-            // Optional clickable `+N子` drilldown pill just left of action cluster when parent has subagents
-            let already_in_parent_group = matches!(
-                &self.session_filter,
-                Some(SessionFilter::Parent(pid, _))
-                    if *pid == s.conversation_id || s.parent_id.as_deref() == Some(pid.as_str())
-            );
-            if sub_cnt > 0 && !already_in_parent_group {
-                let lbl = format!("+{}子 ›", sub_cnt);
-                let sub_w = (factories.measure_text_width(&lbl, &fonts.ui_small_center) + 12.0).clamp(48.0, 74.0);
-                if act_rx - sub_w > bot_c.left + 200.0 {
-                    let sub_r = rect_f(act_rx - sub_w, r1_y + 1.0, sub_w, r1_h - 2.0);
-                    self.draw_ghost_btn(
-                        rt,
-                        fonts,
-                        theme,
-                        sub_r,
-                        &lbl,
-                        true,
-                        ClickAction::FilterSessions(SessionFilter::Parent(
-                            s.conversation_id.clone(),
-                            s.title.clone(),
-                        )),
-                    );
-                    act_rx = sub_r.left - 6.0;
+            let detail_cache = self.session_detail_cache.borrow();
+            let det = detail_cache.as_ref().expect("detail cache populated");
+            let s: &SessionInfo = det.sliced_override.as_ref().unwrap_or_else(|| {
+                if is_oos {
+                    &self.pinned_out_of_scope[sess_idx]
+                } else {
+                    &self.cached_sessions[sess_idx]
                 }
-            }
+            });
 
-            // Left identity: clickable pin star + title + short `#id · workspace`
-            let pin_r = rect_f(bot_c.left + 12.0, r1_y, 22.0, r1_h);
-            self.draw_ghost_btn(
-                rt,
-                fonts,
-                theme,
-                pin_r,
-                if is_pinned { "★" } else { "☆" },
-                is_pinned,
-                ClickAction::TogglePinSession(s.conversation_id.clone()),
-            );
+            let cid = s.conversation_id.clone();
+            let raw_title = s.title.clone();
+            let is_pinned = self.pinned_ids.contains(&cid);
+            let sub_cnt = det.sub_cnt;
+            let sub_agg = det.sub_agg;
+            let direct_ok = det.direct_ok;
+            let blocked_msg = det.blocked_msg;
+            let resumable_parent_id = det.resumable_parent_id.clone();
+            let has_ws = det.has_ws;
 
             let slice_note = match self.slicing_filter() {
                 Some(SessionFilter::Model(m)) => format!(" [仅 {m}]"),
@@ -6385,48 +7428,14 @@ impl DashboardView {
             if s.is_subagent {
                 title_prefix.push_str("[子会话] ");
             }
-            let title_str = format!("{}{}{}", title_prefix, self.format_session_title(&s), slice_note);
-            let sid_short = self.format_session_id(&s.conversation_id);
+            let title_str = format!("{}{}{}", title_prefix, self.format_session_title(s), slice_note);
+            let sid_short = self.format_session_id(&cid);
             let ws_short = self.format_workspace_short(&s.workspace);
             let id_ws_suffix = if ws_short.is_empty() {
                 format!("#{sid_short}")
             } else {
                 format!("#{sid_short} · {ws_short}")
             };
-
-            let id_left = bot_c.left + 38.0;
-            let id_avail = (act_rx - id_left).max(100.0);
-            let suffix_w = (factories.measure_text_width(&id_ws_suffix, &fonts.mono_small) + 6.0).min(210.0);
-            let show_suffix = id_avail > suffix_w + 110.0;
-            let title_max_w = if show_suffix {
-                (id_avail - suffix_w - 8.0).max(80.0)
-            } else {
-                id_avail
-            };
-            draw_text(
-                rt,
-                &title_str,
-                &fonts.ui_section,
-                rect_f(id_left, r1_y, title_max_w, r1_h),
-                theme.text,
-            );
-            if show_suffix {
-                let nat_t = factories.measure_text_width(&title_str, &fonts.ui_section);
-                let sx_pos = id_left + nat_t.min(title_max_w) + 8.0;
-                let rem_w = (act_rx - sx_pos).max(0.0);
-                if rem_w >= 48.0 {
-                    draw_text(
-                        rt,
-                        &id_ws_suffix,
-                        &fonts.mono_small,
-                        rect_f(sx_pos, r1_y + 1.0, rem_w, r1_h - 2.0),
-                        theme.muted,
-                    );
-                }
-            }
-
-            // ---- Row 2 (bot_c.top + 33, h = 22): Meta summary on left | Chart legend + 总计/仅增量 on right ----
-            let legend_left = self.draw_chart_legend_and_toggle_at(rt, fonts, theme, bot_c, bot_c.top + 32.0);
 
             let mut meta = if self.cost_mode {
                 format!(
@@ -6471,31 +7480,20 @@ impl DashboardView {
                     meta.push_str(&format!(" · 所属: {}", p_disp));
                 }
             }
-            let cp = s.compaction_count();
-            if cp > 0 {
-                meta.push_str(&format!(" · {}压缩", cp));
+            if det.compaction_count > 0 {
+                meta.push_str(&format!(" · {}压缩", det.compaction_count));
             }
-            let (misses, _) = s.cache_miss_stats();
-            if misses > 0 {
-                meta.push_str(&format!(" · {}未命中", misses));
+            if det.cache_miss_count > 0 {
+                meta.push_str(&format!(" · {}未命中", det.cache_miss_count));
             }
-            let active_s = s.active_duration_secs();
-            if active_s > 0 {
-                meta.push_str(&format!(" · 活跃{}", fmt_duration_short(active_s)));
+            if det.active_duration_secs > 0 {
+                meta.push_str(&format!(" · 活跃{}", fmt_duration_short(det.active_duration_secs)));
             }
-            let th_n = s.thinking_turns();
-            if th_n > 0 {
-                meta.push_str(&format!(" · 思考{}/{}", th_n, s.turns.len()));
+            if det.thinking_turns > 0 {
+                meta.push_str(&format!(" · 思考{}/{}", det.thinking_turns, s.turns.len()));
             }
-            let mut tools_vec: Vec<(String, u64)> = s.tool_counts().into_iter().collect();
-            tools_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            if !tools_vec.is_empty() {
-                let top_t: Vec<String> = tools_vec
-                    .into_iter()
-                    .take(2)
-                    .map(|(n, c)| format!("{n}×{c}"))
-                    .collect();
-                meta.push_str(&format!(" · 工具 {}", top_t.join("/")));
+            if !det.top_tools_str.is_empty() {
+                meta.push_str(&format!(" · 工具 {}", det.top_tools_str));
             }
             if let Some(tag) = format_source_tag(s.source, show_multi) {
                 meta.push_str(&format!(" · [{tag}]"));
@@ -6503,7 +7501,203 @@ impl DashboardView {
             if s.is_archived {
                 meta.push_str(" · [归档]");
             }
+            let already_in_parent_group = matches!(
+                &self.session_filter,
+                Some(SessionFilter::Parent(pid, _))
+                    if *pid == cid || s.parent_id.as_deref() == Some(pid.as_str())
+            );
+            // Cheap O(1) Arc refcount clone of turns slice so we can drop `detail_cache` borrow before `&mut self` draws!
+            let turns_arc: Arc<[TurnRecord]> = Arc::clone(&s.turns);
+            drop(detail_cache);
 
+            // ---- Row 1 (bot_c.top + 8, h = 22): Pin + Title + #id · workspace  |  [▶ 继续] [复制命令] [目录] [···] ----
+            let r1_y = bot_c.top + 8.0;
+            let r1_h = 22.0;
+
+            let mut act_rx = bot_c.right - 14.0;
+            let more_w = 28.0;
+            let more_r = rect_f(act_rx - more_w, r1_y, more_w, r1_h);
+            self.detail_more_btn_rect = Some(more_r);
+            self.draw_ghost_btn(
+                rt,
+                fonts,
+                theme,
+                more_r,
+                "···",
+                false,
+                ClickAction::SessionMoreMenu(cid.clone()),
+            );
+            stroke_round_rect(rt, more_r, 6.0, theme.border, 0.8);
+            act_rx = more_r.left - 5.0;
+
+            let dir_w = 40.0;
+            let dir_r = rect_f(act_rx - dir_w, r1_y, dir_w, r1_h);
+            if has_ws {
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    dir_r,
+                    "目录",
+                    false,
+                    ClickAction::OpenWorkspace(cid.clone()),
+                );
+                stroke_round_rect(rt, dir_r, 6.0, theme.border, 0.8);
+            } else {
+                fill_round_rect(rt, dir_r, 6.0, theme.surface_subtle);
+                draw_text(rt, "目录", &fonts.ui_small_center, dir_r, theme.muted);
+                self.hit_boxes.push(HitBox {
+                    rect: dir_r,
+                    action: ClickAction::ShowBlockedReason("该会话无可用本地工作区路径".to_string()),
+                });
+            }
+            act_rx = dir_r.left - 5.0;
+
+            let cmd_copied = self
+                .resume_cmd_copied_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+            let cmd_w = 62.0;
+            let cmd_r = rect_f(act_rx - cmd_w, r1_y, cmd_w, r1_h);
+            if direct_ok {
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    cmd_r,
+                    if cmd_copied { "已复制" } else { "复制命令" },
+                    cmd_copied,
+                    ClickAction::CopyResumeCmd(cid.clone()),
+                );
+                stroke_round_rect(
+                    rt,
+                    cmd_r,
+                    6.0,
+                    if cmd_copied { theme.accent } else { theme.border },
+                    0.8,
+                );
+            } else {
+                fill_round_rect(rt, cmd_r, 6.0, theme.surface_subtle);
+                draw_text(rt, "复制命令", &fonts.ui_small_center, cmd_r, theme.muted);
+                self.hit_boxes.push(HitBox {
+                    rect: cmd_r,
+                    action: ClickAction::ShowBlockedReason(blocked_msg.to_string()),
+                });
+            }
+            act_rx = cmd_r.left - 5.0;
+
+            if direct_ok {
+                let res_w = 64.0;
+                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
+                let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&res_r, mx, my)).unwrap_or(false);
+                fill_round_rect(
+                    rt,
+                    res_r,
+                    6.0,
+                    if hov { theme.accent } else { theme.accent_soft },
+                );
+                stroke_round_rect(rt, res_r, 6.0, with_alpha(theme.accent, 0.8), 0.9);
+                draw_text(
+                    rt,
+                    "▶ 继续",
+                    &fonts.ui_small_center,
+                    res_r,
+                    if hov { theme.bg } else { theme.accent },
+                );
+                self.hit_boxes.push(HitBox {
+                    rect: res_r,
+                    action: ClickAction::ResumeSession(cid.clone()),
+                });
+                act_rx = res_r.left - 8.0;
+            } else if let Some(pid) = resumable_parent_id {
+                let res_w = 78.0;
+                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
+                self.draw_ghost_btn(
+                    rt,
+                    fonts,
+                    theme,
+                    res_r,
+                    "定位父会话 ›",
+                    true,
+                    ClickAction::InspectSession(pid),
+                );
+                stroke_round_rect(rt, res_r, 6.0, with_alpha(theme.accent, 0.65), 0.8);
+                act_rx = res_r.left - 8.0;
+            } else {
+                let res_w = 64.0;
+                let res_r = rect_f(act_rx - res_w, r1_y, res_w, r1_h);
+                fill_round_rect(rt, res_r, 6.0, theme.surface_subtle);
+                stroke_round_rect(rt, res_r, 6.0, theme.border, 0.7);
+                draw_text(rt, "▶ 继续", &fonts.ui_small_center, res_r, theme.muted);
+                self.hit_boxes.push(HitBox {
+                    rect: res_r,
+                    action: ClickAction::ShowBlockedReason(blocked_msg.to_string()),
+                });
+                act_rx = res_r.left - 8.0;
+            }
+
+            if sub_cnt > 0 && !already_in_parent_group {
+                let lbl = format!("+{}子 ›", sub_cnt);
+                let sub_w = (factories.measure_text_width(&lbl, &fonts.ui_small_center) + 12.0).clamp(48.0, 74.0);
+                if act_rx - sub_w > bot_c.left + 200.0 {
+                    let sub_r = rect_f(act_rx - sub_w, r1_y + 1.0, sub_w, r1_h - 2.0);
+                    self.draw_ghost_btn(
+                        rt,
+                        fonts,
+                        theme,
+                        sub_r,
+                        &lbl,
+                        true,
+                        ClickAction::FilterSessions(SessionFilter::Parent(cid.clone(), raw_title)),
+                    );
+                    act_rx = sub_r.left - 6.0;
+                }
+            }
+
+            let pin_r = rect_f(bot_c.left + 12.0, r1_y, 22.0, r1_h);
+            self.draw_ghost_btn(
+                rt,
+                fonts,
+                theme,
+                pin_r,
+                if is_pinned { "★" } else { "☆" },
+                is_pinned,
+                ClickAction::TogglePinSession(cid),
+            );
+
+            let id_left = bot_c.left + 38.0;
+            let id_avail = (act_rx - id_left).max(100.0);
+            let suffix_w = (factories.measure_text_width(&id_ws_suffix, &fonts.mono_small) + 6.0).min(210.0);
+            let show_suffix = id_avail > suffix_w + 110.0;
+            let title_max_w = if show_suffix {
+                (id_avail - suffix_w - 8.0).max(80.0)
+            } else {
+                id_avail
+            };
+            draw_text(
+                rt,
+                &title_str,
+                &fonts.ui_section,
+                rect_f(id_left, r1_y, title_max_w, r1_h),
+                theme.text,
+            );
+            if show_suffix {
+                let nat_t = factories.measure_text_width(&title_str, &fonts.ui_section);
+                let sx_pos = id_left + nat_t.min(title_max_w) + 8.0;
+                let rem_w = (act_rx - sx_pos).max(0.0);
+                if rem_w >= 48.0 {
+                    draw_text(
+                        rt,
+                        &id_ws_suffix,
+                        &fonts.mono_small,
+                        rect_f(sx_pos, r1_y + 1.0, rem_w, r1_h - 2.0),
+                        theme.muted,
+                    );
+                }
+            }
+
+            // ---- Row 2 (bot_c.top + 33, h = 22): Meta summary on left | Chart legend + 总计/仅增量 on right ----
+            let legend_left = self.draw_chart_legend_and_toggle_at(rt, fonts, theme, bot_c, bot_c.top + 32.0);
             let meta_w = (legend_left - 10.0 - (bot_c.left + 16.0)).max(120.0);
             draw_text(
                 rt,
@@ -6513,14 +7707,41 @@ impl DashboardView {
                 theme.sub,
             );
 
-            let mut prev_ts: Option<chrono::DateTime<chrono::Utc>> = None;
-            let bars: Vec<BarItem> = s
-                .turns
+            // Lightweight bars: ZERO tooltip allocations unless hovered, and only format X-axis
+            // labels on indices actually rendered by `draw_editorial_bars` (500 allocs -> ~15).
+            let plot = rect_f(bot_c.left + 12.0, bot_c.top + 56.0, bw - 24.0, (bot_c.bottom - bot_c.top - 64.0).max(60.0));
+            let n_turns = turns_arc.len();
+            let stride = editorial_bar_label_stride(plot, n_turns);
+            let bars: Vec<BarItem> = turns_arc
                 .iter()
                 .enumerate()
                 .map(|(idx, t)| {
+                    let need_lbl = idx + 1 == n_turns || idx % stride == 0;
+                    let lbl: Cow<'static, str> = if !need_lbl {
+                        Cow::Borrowed("")
+                    } else if t.step_index >= 0 {
+                        Cow::Owned(format!("#{}", t.step_index))
+                    } else {
+                        Cow::Borrowed("-")
+                    };
+                    self.make_turn_bar(lbl, t)
+                })
+                .collect();
+            let (_, inner) = draw_editorial_bars(
+                rt,
+                fonts,
+                theme,
+                plot,
+                &bars,
+                self.fresh_only,
+                self.bar_unit(),
+                self.mouse_dip,
+                "无逐轮记录",
+                |idx| {
+                    let t = &turns_arc[idx];
                     let lbl = if t.step_index >= 0 { format!("#{}", t.step_index) } else { "-".into() };
                     let ts = t.timestamp_utc.map(|u| u.with_timezone(&Local).format("%H:%M:%S").to_string()).unwrap_or_else(|| "-".into());
+                    let prev_ts = turns_arc[..idx].iter().rev().find_map(|p| p.timestamp_utc);
                     let gap_s = match (prev_ts, t.timestamp_utc) {
                         (Some(p), Some(cur)) => {
                             let g = fmt_gap((cur - p).num_seconds());
@@ -6528,9 +7749,6 @@ impl DashboardView {
                         }
                         _ => String::new(),
                     };
-                    if t.timestamp_utc.is_some() {
-                        prev_ts = t.timestamp_utc;
-                    }
                     let is_miss = idx > 0
                         && !t.is_checkpoint
                         && t.total_input() >= 30_000
@@ -6568,7 +7786,7 @@ impl DashboardView {
                         (None, _) => {}
                     }
                     if !t.tool_names.is_empty() {
-                        let shown_t: Vec<&str> = t.tool_names.iter().take(4).map(String::as_str).collect();
+                        let shown_t: Vec<&str> = t.tool_names.iter().take(4).map(Arc::as_ref).collect();
                         let more = if t.tool_names.len() > 4 {
                             format!(" +{}", t.tool_names.len() - 4)
                         } else {
@@ -6579,22 +7797,15 @@ impl DashboardView {
                     if let Some(th) = format_turn_thinking(t) {
                         tip.push(format!("思考   : {th}"));
                     }
-                    self.make_turn_bar(lbl, t, tip)
-                })
-                .collect();
-            let plot = rect_f(bot_c.left + 12.0, bot_c.top + 56.0, bw - 24.0, (bot_c.bottom - bot_c.top - 64.0).max(60.0));
-            self.plot_rects.push(plot);
-            let _ = draw_editorial_bars(
-                rt,
-                fonts,
-                theme,
-                plot,
-                &bars,
-                self.fresh_only,
-                self.bar_unit(),
-                self.mouse_dip,
-                "无逐轮记录",
+                    tip
+                },
             );
+            if let Some(p) = inner {
+                self.discrete_plots.push(DiscretePlot::VerticalBars {
+                    plot: p,
+                    n: bars.len(),
+                });
+            }
         } else {
             draw_text(rt, "点击上方会话查看逐轮上下文增长趋势", &fonts.ui_reg_center, bot_c, theme.muted);
         }
@@ -6606,7 +7817,7 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         human: bool,
@@ -6616,7 +7827,7 @@ impl DashboardView {
             time: String,
             title: String,
             is_child: bool,
-            model: String,
+            model: Arc<str>,
             tools: String,
             tools_col: D2D1_COLOR_F,
             gen: String,
@@ -6636,34 +7847,36 @@ impl DashboardView {
         fill_round_rect(rt, top_c, 10.0, theme.surface);
         stroke_round_rect(rt, top_c, 10.0, theme.border, 1.0);
 
-        let rows = self.call_rows();
-        let sel_idx = match self.selected_call_index(&rows) {
+        let (total_rows, init_sel_idx, first_key, sum, speed_out, speed_secs) =
+            self.with_call_rows(|rows, sum, speed_out, speed_secs| {
+                let sel_idx = self.selected_call_index(rows);
+                let first_k = if sel_idx.is_none() && !rows.is_empty() {
+                    Some(self.call_key(&rows[0]))
+                } else {
+                    None
+                };
+                (rows.len(), sel_idx, first_k, sum, speed_out, speed_secs)
+            });
+        let sel_idx = match init_sel_idx {
             Some(i) => Some(i),
-            None if !rows.is_empty() => {
-                self.selected_call = Some(self.call_key(&rows[0]));
-                Some(0)
+            None => {
+                if let Some(fk) = first_key {
+                    self.selected_call = Some(fk);
+                    Some(0)
+                } else {
+                    None
+                }
             }
-            None => None,
         };
-        let mut sum = TokenCounts::default();
-        let (mut speed_out, mut speed_secs) = (0u64, 0u64);
-        for r in &rows {
-            let t = &self.call_session(r).turns[r.turn_idx];
-            sum.add_call_with_cost(t.input_tokens, t.cache_read_tokens, t.cache_write_tokens, t.output_tokens, t.cost);
-            if t.output_tps().is_some() {
-                speed_out += t.output_tokens;
-                speed_secs += t.gen_secs.unwrap_or(0) as u64;
-            }
-        }
 
         // ---- Header: title, count/cost summary, session chip, search, sort toggles ----
         draw_text(rt, "调用记录", &fonts.ui_section, rect_f(top_c.left + 16.0, top_c.top + 9.0, 66.0, 20.0), theme.text);
-        let cnt_str = if rows.is_empty() {
+        let cnt_str = if total_rows == 0 {
             "0 次".to_string()
         } else if speed_secs > 0 {
             format!(
                 "{} 次 · 总 {} · {} · 均速 {:.0} tok/s",
-                rows.len(),
+                total_rows,
                 fmt_compact(sum.total_tokens()),
                 fmt_cost(&sum.cost, sum.calls, true),
                 speed_out as f64 / speed_secs as f64
@@ -6671,7 +7884,7 @@ impl DashboardView {
         } else {
             format!(
                 "{} 次 · 总 {} · {}",
-                rows.len(),
+                total_rows,
                 fmt_compact(sum.total_tokens()),
                 fmt_cost(&sum.cost, sum.calls, true)
             )
@@ -6757,14 +7970,12 @@ impl DashboardView {
         let row_h = 25.0;
         let vis = (((top_c.bottom - 8.0 - list_y) / row_h).floor() as usize).max(1);
         self.sessions_vis_rows = vis;
-        self.max_scroll = rows.len().saturating_sub(vis);
+        self.max_scroll = total_rows.saturating_sub(vis);
         if self.scroll_rows > self.max_scroll {
             self.scroll_rows = self.max_scroll;
         }
+        let scroll_rows = self.scroll_rows;
 
-        // Right-aligned 3-chunk Gestalt columns:
-        //   [耗时 | tok/s]  —10px—  [总Token | 新输入 | 输出]  —10px—  [命中率 | 费用]
-        // Cache read tokens live in the bottom detail card; 命中率 already conveys cache share cleanly.
         const MCOLS: [(&str, f32, f32); 7] = [
             ("耗时", 40.0, 4.0),
             ("tok/s", 42.0, 10.0),
@@ -6788,14 +7999,137 @@ impl DashboardView {
         let time_x = rr_l + 8.0;
         let title_x = rr_l + 112.0;
         let avail = (rx - metrics_w - title_x - 12.0).max(160.0);
-        let max_model_px = rows
-            .iter()
-            .skip(self.scroll_rows)
-            .take(vis)
-            .map(|r| {
-                factories.measure_text_width(&self.call_session(r).turns[r.turn_idx].model, &fonts.mono_small)
-            })
-            .fold(96.0_f32, f32::max);
+        let show_multi = self.has_non_antigravity;
+
+        let (max_model_px, disp, sel_detail) = self.with_call_rows(|rows, _, _, _| {
+            let max_model_px = rows
+                .iter()
+                .skip(scroll_rows)
+                .take(vis)
+                .map(|r| {
+                    factories.measure_text_width(&self.call_session(r).turns[r.turn_idx].model, &fonts.mono_small)
+                })
+                .fold(96.0_f32, f32::max);
+
+            let disp: Vec<CallDisp> = rows
+                .iter()
+                .skip(scroll_rows)
+                .take(vis)
+                .map(|r| {
+                    let s = self.call_session(r);
+                    let t = &s.turns[r.turn_idx];
+                    let mut prefix = String::new();
+                    if s.is_subagent {
+                        prefix.push_str("↳ ");
+                    }
+                    if let Some(tag) = format_source_tag(s.source, show_multi) {
+                        prefix.push_str(&format!("[{tag}] "));
+                    }
+                    let ctx = t.total_input();
+                    let rate = t.cache_hit_rate();
+                    let is_miss = r.turn_idx > 0 && !t.is_checkpoint && ctx >= 30_000 && rate < 50.0;
+                    let hit_col = if t.is_checkpoint || r.turn_idx == 0 {
+                        theme.muted
+                    } else if is_miss {
+                        theme.danger
+                    } else if rate >= 85.0 {
+                        theme.sage
+                    } else {
+                        theme.sub
+                    };
+                    let tools_col = if t.is_checkpoint {
+                        theme.warn
+                    } else if t.tool_names.is_empty() {
+                        theme.muted
+                    } else {
+                        theme.sub
+                    };
+                    CallDisp {
+                        key: (s.conversation_id.clone(), t.step_index),
+                        time: t
+                            .timestamp_utc
+                            .map(|u| u.with_timezone(&Local).format("%m/%d %H:%M:%S").to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        title: format!("{prefix}{}", self.format_session_title(s)),
+                        is_child: s.is_subagent,
+                        model: t.model.clone(),
+                        tools: Self::call_tools_label(t, 3),
+                        tools_col,
+                        gen: t.gen_secs.map(|g| fmt_duration_short(g as u64)).unwrap_or_else(|| "-".into()),
+                        tps: t.output_tps().map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into()),
+                        total_tok: t.total_tokens(),
+                        fresh_in: t.input_tokens + t.cache_write_tokens,
+                        out: t.output_tokens,
+                        hit: if t.is_checkpoint { "-".into() } else { format!("{rate:.1}%") },
+                        hit_col,
+                        cost: fmt_cost(&t.cost, 1, human),
+                    }
+                })
+                .collect();
+
+            let sel_detail = sel_idx.and_then(|i| rows.get(i)).map(|r| {
+                let s = self.call_session(r);
+                let t = &s.turns[r.turn_idx];
+                let time = t
+                    .timestamp_utc
+                    .map(|u| u.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "-".into());
+                let kind = if t.is_checkpoint { " · 上下文压缩" } else { "" };
+                let src_prefix = format_source_tag(s.source, show_multi)
+                    .map(|tag| format!("[{tag}] "))
+                    .unwrap_or_default();
+                let hdr = format!("调用详情 · {src_prefix}{} · Step #{}{}", self.format_session_title(s), t.step_index, kind);
+                let cost = if t.cost.is_fully_unpriced(1) {
+                    "费用 - (未定价)".to_string()
+                } else {
+                    format!(
+                        "费用 {} (入{} / 缓{} / 出{})",
+                        fmt_usd_precise(t.cost.total_usd()),
+                        fmt_usd_compact(t.cost.input_plus_write_usd()),
+                        fmt_usd_compact(t.cost.cache_read_usd),
+                        fmt_usd_compact(t.cost.output_usd),
+                    )
+                };
+                let mut line_cost = format!("{} · {} · {}", time, t.model, cost);
+                match (t.gen_secs, t.output_tps()) {
+                    (Some(g), Some(v)) => {
+                        line_cost.push_str(&format!(" · 生成 {} · {:.0} tok/s", fmt_duration_short(g as u64), v))
+                    }
+                    (Some(g), None) => line_cost.push_str(&format!(" · 生成 {}", fmt_duration_short(g as u64))),
+                    (None, _) => {}
+                }
+                if let Some(g) = r.gap_secs.map(fmt_gap).filter(|g| !g.is_empty()) {
+                    line_cost.push_str(&format!(" · 距上一步 {g}"));
+                }
+                if let Some(th) = format_turn_thinking(t) {
+                    line_cost.push_str(&format!(" · 思考 {th}"));
+                }
+                let mut line_tok = format!(
+                    "总 Token {} · 新输入 {} · 输出 {} · 缓存读 {} ({:.1}%)",
+                    fmt_commas(t.total_tokens()),
+                    fmt_commas(t.input_tokens),
+                    fmt_commas(t.output_tokens),
+                    fmt_commas(t.cache_read_tokens),
+                    t.cache_hit_rate(),
+                );
+                if t.cache_write_tokens > 0 {
+                    line_tok.push_str(&format!(" · 缓存写 {}", fmt_commas(t.cache_write_tokens)));
+                }
+                let ws = self.format_workspace_short(&s.workspace);
+                if !ws.is_empty() {
+                    line_tok.push_str(&format!(" · {ws}"));
+                }
+                let line_tools = if t.tool_names.is_empty() {
+                    if t.is_checkpoint { "工具   : 无（上下文压缩步骤）".to_string() } else { "工具   : 无（纯回复 / 思考）".to_string() }
+                } else {
+                    format!("工具({}): {}", t.tool_names.len(), Self::call_tools_label(t, usize::MAX))
+                };
+                (s.conversation_id.clone(), hdr, line_cost, line_tok, line_tools)
+            });
+
+            (max_model_px, disp, sel_detail)
+        });
+
         let model_w = (max_model_px + 8.0).clamp(96.0, (avail * 0.34).max(96.0).min(176.0));
         let flex = (avail - model_w - 12.0).max(80.0);
         let title_w = flex * 0.52;
@@ -6813,64 +8147,6 @@ impl DashboardView {
             draw_text(rt, lbl, &fonts.ui_small_right, mrect(i, hdr_y, hdr_h), theme.muted);
         }
         draw_line(rt, top_c.left + 14.0, top_c.top + 52.0, top_c.right - 14.0, top_c.top + 52.0, theme.border, 1.0);
-
-        // ---- Rows (immutable data phase, then draw phase) ----
-        let show_multi = self.is_multi_agent();
-        let disp: Vec<CallDisp> = rows
-            .iter()
-            .skip(self.scroll_rows)
-            .take(vis)
-            .map(|r| {
-                let s = self.call_session(r);
-                let t = &s.turns[r.turn_idx];
-                let mut prefix = String::new();
-                if s.is_subagent {
-                    prefix.push_str("↳ ");
-                }
-                if let Some(tag) = format_source_tag(s.source, show_multi) {
-                    prefix.push_str(&format!("[{tag}] "));
-                }
-                let ctx = t.total_input();
-                let rate = t.cache_hit_rate();
-                let is_miss = r.turn_idx > 0 && !t.is_checkpoint && ctx >= 30_000 && rate < 50.0;
-                let hit_col = if t.is_checkpoint || r.turn_idx == 0 {
-                    theme.muted
-                } else if is_miss {
-                    theme.danger
-                } else if rate >= 85.0 {
-                    theme.sage
-                } else {
-                    theme.sub
-                };
-                let tools_col = if t.is_checkpoint {
-                    theme.warn
-                } else if t.tool_names.is_empty() {
-                    theme.muted
-                } else {
-                    theme.sub
-                };
-                CallDisp {
-                    key: (s.conversation_id.clone(), t.step_index),
-                    time: t
-                        .timestamp_utc
-                        .map(|u| u.with_timezone(&Local).format("%m/%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    title: format!("{prefix}{}", self.format_session_title(s)),
-                    is_child: s.is_subagent,
-                    model: t.model.clone(),
-                    tools: Self::call_tools_label(t, 3),
-                    tools_col,
-                    gen: t.gen_secs.map(|g| fmt_duration_short(g as u64)).unwrap_or_else(|| "-".into()),
-                    tps: t.output_tps().map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into()),
-                    total_tok: t.total_tokens(),
-                    fresh_in: t.input_tokens + t.cache_write_tokens,
-                    out: t.output_tokens,
-                    hit: if t.is_checkpoint { "-".into() } else { format!("{rate:.1}%") },
-                    hit_col,
-                    cost: fmt_cost(&t.cost, 1, human),
-                }
-            })
-            .collect();
 
         if disp.is_empty() {
             let empty_txt = if !self.search_query.trim().is_empty() || self.call_session_filter.is_some() {
@@ -6890,7 +8166,7 @@ impl DashboardView {
                 let ry = list_y + vi as f32 * row_h;
                 let rr = rect_f(rr_l, ry, rr_w, row_h - 2.0);
                 let cell_h = row_h - 2.0;
-                let sel = sel_idx == Some(self.scroll_rows + vi);
+                let sel = sel_idx == Some(scroll_rows + vi);
                 let hov = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
                 if sel {
                     fill_round_rect(rt, rr, 6.0, theme.hover);
@@ -6910,7 +8186,6 @@ impl DashboardView {
                 draw_text(rt, &d.tools, &fonts.mono_small, rect_f(tools_x, ry, tools_w, cell_h), d.tools_col);
                 draw_text(rt, &d.gen, &fonts.mono_small_right, mrect(0, ry, cell_h), theme.muted);
                 draw_text(rt, &d.tps, &fonts.mono_small_right, mrect(1, ry, cell_h), theme.sub);
-                // Tier 1 (Tok mode) / Tier 3 ($ mode): 总Token
                 draw_text(
                     rt,
                     &fmt_num(d.total_tok, human),
@@ -6918,7 +8193,6 @@ impl DashboardView {
                     mrect(2, ry, cell_h),
                     if self.cost_mode { theme.sub } else { theme.text },
                 );
-                // Tier 2: fresh input & output
                 let driver_col = if self.cost_mode { theme.sub } else { theme.text };
                 draw_text(rt, &fmt_num(d.fresh_in, human), &fonts.mono_small_right, mrect(3, ry, cell_h), driver_col);
                 draw_text(rt, &fmt_num(d.out, human), &fonts.mono_small_right, mrect(4, ry, cell_h), driver_col);
@@ -6938,8 +8212,8 @@ impl DashboardView {
 
             if self.max_scroll > 0 {
                 let track_h = (top_c.bottom - 10.0 - list_y).max(20.0);
-                let thumb_h = ((vis as f32 / rows.len() as f32) * track_h).clamp(24.0, track_h);
-                let ratio = self.scroll_rows as f32 / self.max_scroll as f32;
+                let thumb_h = ((vis as f32 / total_rows as f32) * track_h).clamp(24.0, track_h);
+                let ratio = scroll_rows as f32 / self.max_scroll as f32;
                 let thumb_y = list_y + ratio * (track_h - thumb_h);
                 fill_round_rect(rt, rect_f(top_c.right - 7.0, thumb_y, 3.0, thumb_h), 1.5, theme.muted);
             }
@@ -6950,68 +8224,9 @@ impl DashboardView {
         fill_round_rect(rt, bot_c, 10.0, theme.surface);
         stroke_round_rect(rt, bot_c, 10.0, theme.border, 1.0);
 
-        let Some(r) = sel_idx.map(|i| rows[i]) else {
+        let Some((cid, hdr, line_cost, line_tok, line_tools)) = sel_detail else {
             draw_text(rt, "点击上方任意一次调用查看 Token、费用与工具明细", &fonts.ui_reg_center, bot_c, theme.muted);
             return;
-        };
-        let (cid, hdr, line_cost, line_tok, line_tools) = {
-            let s = self.call_session(&r);
-            let t = &s.turns[r.turn_idx];
-            let time = t
-                .timestamp_utc
-                .map(|u| u.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "-".into());
-            let kind = if t.is_checkpoint { " · 上下文压缩" } else { "" };
-            let src_prefix = format_source_tag(s.source, show_multi)
-                .map(|tag| format!("[{tag}] "))
-                .unwrap_or_default();
-            let hdr = format!("调用详情 · {src_prefix}{} · Step #{}{}", self.format_session_title(s), t.step_index, kind);
-            let cost = if t.cost.is_fully_unpriced(1) {
-                "费用 - (未定价)".to_string()
-            } else {
-                format!(
-                    "费用 {} (入{} / 缓{} / 出{})",
-                    fmt_usd_precise(t.cost.total_usd()),
-                    fmt_usd_compact(t.cost.input_plus_write_usd()),
-                    fmt_usd_compact(t.cost.cache_read_usd),
-                    fmt_usd_compact(t.cost.output_usd),
-                )
-            };
-            let mut line_cost = format!("{} · {} · {}", time, t.model, cost);
-            match (t.gen_secs, t.output_tps()) {
-                (Some(g), Some(v)) => {
-                    line_cost.push_str(&format!(" · 生成 {} · {:.0} tok/s", fmt_duration_short(g as u64), v))
-                }
-                (Some(g), None) => line_cost.push_str(&format!(" · 生成 {}", fmt_duration_short(g as u64))),
-                (None, _) => {}
-            }
-            if let Some(g) = r.gap_secs.map(fmt_gap).filter(|g| !g.is_empty()) {
-                line_cost.push_str(&format!(" · 距上一步 {g}"));
-            }
-            if let Some(th) = format_turn_thinking(t) {
-                line_cost.push_str(&format!(" · 思考 {th}"));
-            }
-            let mut line_tok = format!(
-                "总 Token {} · 新输入 {} · 输出 {} · 缓存读 {} ({:.1}%)",
-                fmt_commas(t.total_tokens()),
-                fmt_commas(t.input_tokens),
-                fmt_commas(t.output_tokens),
-                fmt_commas(t.cache_read_tokens),
-                t.cache_hit_rate(),
-            );
-            if t.cache_write_tokens > 0 {
-                line_tok.push_str(&format!(" · 缓存写 {}", fmt_commas(t.cache_write_tokens)));
-            }
-            let ws = self.format_workspace_short(&s.workspace);
-            if !ws.is_empty() {
-                line_tok.push_str(&format!(" · {ws}"));
-            }
-            let line_tools = if t.tool_names.is_empty() {
-                if t.is_checkpoint { "工具   : 无（上下文压缩步骤）".to_string() } else { "工具   : 无（纯回复 / 思考）".to_string() }
-            } else {
-                format!("工具({}): {}", t.tool_names.len(), Self::call_tools_label(t, usize::MAX))
-            };
-            (s.conversation_id.clone(), hdr, line_cost, line_tok, line_tools)
         };
 
         let copied = self.call_copied_until.map(|t| Instant::now() < t).unwrap_or(false);
@@ -7035,7 +8250,7 @@ impl DashboardView {
         &mut self,
         factories: &D2DFactories,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         body: D2D_RECT_F,
         snapshot: &ScanSnapshot,
@@ -7065,12 +8280,14 @@ impl DashboardView {
         let pb_y = chart_c.bottom - 18.0;
         let pw = (pr - pl).max(40.0);
         let ph = (pb_y - pt_y).max(40.0);
-        self.plot_rects.push(rect_f(pl, pt_y, pw, ph));
 
+        let mut fbuf = FmtBuf::new();
         for pct in [0, 50, 100] {
             let y = pb_y - (pct as f32 / 100.0) * ph;
             draw_line(rt, pl, y, pr, y, if pct == 0 { theme.border } else { theme.grid }, 1.0);
-            draw_text(rt, &format!("{pct}%"), &fonts.mono_small_right, rect_f(chart_c.left + 4.0, y - 7.0, 34.0, 14.0), theme.muted);
+            fbuf.clear();
+            let _ = write!(fbuf, "{pct}%");
+            draw_text(rt, fbuf.as_str(), &fonts.mono_small_right, rect_f(chart_c.left + 4.0, y - 7.0, 34.0, 14.0), theme.muted);
         }
 
         if telemetry.history.len() >= 2 {
@@ -7078,6 +8295,14 @@ impl DashboardView {
             let n = telemetry.history.len();
             let dx = pw / (max_pts - 1) as f32;
             let x0 = pl + (max_pts.saturating_sub(n)) as f32 * dx;
+            self.discrete_plots.push(DiscretePlot::TimeSeries {
+                x0,
+                pr,
+                pt_y,
+                pb_y,
+                dx,
+                n,
+            });
             let mut cpu_pts = Vec::with_capacity(n);
             let mut mem_pts = Vec::with_capacity(n);
             for (i, s) in telemetry.history.iter().enumerate() {
@@ -7131,7 +8356,9 @@ impl DashboardView {
         let g1_x = c_left.left + 58.0;
         let g1_y = cy_top + cards_h * 0.5;
         draw_ring_gauge(factories, rt, g1_x, g1_y, 34.0, 5.5, cur.cpu_pct, theme.grid, theme.accent);
-        draw_text(rt, &format!("{:.0}%", cur.cpu_pct), &fonts.mono_kpi_center, rect_f(g1_x - 32.0, g1_y - 12.0, 64.0, 24.0), load_color(theme, cur.cpu_pct, 60.0, 85.0));
+        fbuf.clear();
+        let _ = write!(fbuf, "{:.0}%", cur.cpu_pct);
+        draw_text(rt, fbuf.as_str(), &fonts.mono_kpi_center, rect_f(g1_x - 32.0, g1_y - 12.0, 64.0, 24.0), load_color(theme, cur.cpu_pct, 60.0, 85.0));
         draw_text(rt, "处理器负载", &fonts.ui_section, rect_f(c_left.left + 114.0, cy_top + 26.0, half_w - 130.0, 20.0), theme.text);
         draw_text(rt, &format!("{} 个逻辑核心  ·  1 秒原生 Win32 采样", cur.cpu_cores), &fonts.ui_small, rect_f(c_left.left + 114.0, cy_top + 52.0, half_w - 130.0, 18.0), theme.sub);
         draw_text(rt, "直接调用 GetSystemTimes，无命令行子进程", &fonts.ui_micro, rect_f(c_left.left + 114.0, cy_top + 76.0, half_w - 130.0, 16.0), theme.muted);
@@ -7142,7 +8369,9 @@ impl DashboardView {
         let g2_x = c_right.left + 58.0;
         let g2_y = cy_top + cards_h * 0.5;
         draw_ring_gauge(factories, rt, g2_x, g2_y, 34.0, 5.5, cur.mem_pct, theme.grid, theme.ram);
-        draw_text(rt, &format!("{:.0}%", cur.mem_pct), &fonts.mono_kpi_center, rect_f(g2_x - 32.0, g2_y - 12.0, 64.0, 24.0), load_color(theme, cur.mem_pct, 75.0, 88.0));
+        fbuf.clear();
+        let _ = write!(fbuf, "{:.0}%", cur.mem_pct);
+        draw_text(rt, fbuf.as_str(), &fonts.mono_kpi_center, rect_f(g2_x - 32.0, g2_y - 12.0, 64.0, 24.0), load_color(theme, cur.mem_pct, 75.0, 88.0));
         draw_text(rt, "物理内存占用", &fonts.ui_section, rect_f(c_right.left + 114.0, cy_top + 26.0, half_w - 130.0, 20.0), theme.text);
         draw_text(
             rt,
@@ -7194,21 +8423,60 @@ impl DashboardView {
         );
     }
 
-    // ---------- Minimalist Editorial Table ----------
+    // ---------- Minimalist Editorial Table (Virtualized Row Formatting) ----------
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_table(
+    fn draw_table_virtual<F>(
         &mut self,
         rt: &ID2D1RenderTarget,
-        fonts: &Fonts,
+        fonts: &DashFonts,
         theme: &Theme,
         bounds: D2D_RECT_F,
         cols: &[(&str, f32, bool)],
-        rows: &[Vec<String>],
-        row_actions: Option<&[ClickAction]>,
+        total_rows: usize,
         secondary_from: Option<usize>,
         selected_row: Option<usize>,
-    ) {
+        row_at: F,
+    ) where
+        F: FnMut(usize, &mut Vec<String>) -> Option<ClickAction>,
+    {
+        Self::draw_table_virtual_state(
+            rt,
+            fonts,
+            theme,
+            bounds,
+            cols,
+            total_rows,
+            secondary_from,
+            selected_row,
+            &mut self.scroll_rows,
+            &mut self.max_scroll,
+            &mut self.hit_boxes,
+            self.mouse_dip,
+            self.cost_mode,
+            row_at,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_table_virtual_state<F>(
+        rt: &ID2D1RenderTarget,
+        fonts: &DashFonts,
+        theme: &Theme,
+        bounds: D2D_RECT_F,
+        cols: &[(&str, f32, bool)],
+        total_rows: usize,
+        secondary_from: Option<usize>,
+        selected_row: Option<usize>,
+        scroll_rows: &mut usize,
+        max_scroll: &mut usize,
+        hit_boxes: &mut Vec<HitBox>,
+        mouse_dip: Option<(f32, f32)>,
+        cost_mode: bool,
+        mut row_at: F,
+    ) where
+        F: FnMut(usize, &mut Vec<String>) -> Option<ClickAction>,
+    {
         fill_round_rect(rt, bounds, 10.0, theme.surface);
         stroke_round_rect(rt, bounds, 10.0, theme.border, 1.0);
 
@@ -7230,41 +8498,44 @@ impl DashboardView {
             cx += cw;
         }
 
-        if rows.is_empty() {
+        if total_rows == 0 {
             draw_text(rt, "暂无明细数据", &fonts.ui_reg_center, rect_f(bounds.left, bounds.top + hdr_h, bounds.right - bounds.left, bounds.bottom - bounds.top - hdr_h), theme.muted);
-            self.max_scroll = 0;
+            *max_scroll = 0;
             return;
         }
 
         let row_h = 28.0;
         let body_top = bounds.top + hdr_h + 2.0;
         let vis_rows = (((bounds.bottom - 6.0 - body_top) / row_h).floor() as usize).max(1);
-        self.max_scroll = rows.len().saturating_sub(vis_rows);
-        if self.scroll_rows > self.max_scroll {
-            self.scroll_rows = self.max_scroll;
+        *max_scroll = total_rows.saturating_sub(vis_rows);
+        if *scroll_rows > *max_scroll {
+            *scroll_rows = *max_scroll;
         }
 
-        for (vi, row) in rows.iter().skip(self.scroll_rows).take(vis_rows).enumerate() {
-            let abs_idx = self.scroll_rows + vi;
+        let has_cost_total_col = cols.iter().any(|(t, _, _)| *t == "估算总费");
+        let end_idx = (*scroll_rows + vis_rows).min(total_rows);
+        let mut cells_buf: Vec<String> = Vec::with_capacity(cols.len());
+        for (vi, abs_idx) in (*scroll_rows..end_idx).enumerate() {
+            cells_buf.clear();
+            let maybe_act = row_at(abs_idx, &mut cells_buf);
+            let row = &cells_buf;
             let is_secondary = secondary_from.map(|s| abs_idx >= s).unwrap_or(false);
             let is_sec_boundary = secondary_from == Some(abs_idx) && vi > 0;
             let is_selected = selected_row == Some(abs_idx);
             let ry = body_top + vi as f32 * row_h;
             let rr = rect_f(bounds.left + 8.0, ry, bounds.right - bounds.left - 20.0, row_h - 1.0);
-            let hovered = self.mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
+            let hovered = mouse_dip.map(|(mx, my)| hit_rect(&rr, mx, my)).unwrap_or(false);
             if is_selected {
                 fill_round_rect(rt, rr, 6.0, theme.hover);
                 fill_round_rect(rt, rect_f(rr.left, rr.top + 5.0, 2.5, rr.bottom - rr.top - 10.0), 1.25, theme.accent);
             } else if hovered {
                 fill_round_rect(rt, rr, 6.0, theme.hover);
             }
-            if let Some(acts) = row_actions {
-                if let Some(act) = acts.get(abs_idx) {
-                    self.hit_boxes.push(HitBox {
-                        rect: rr,
-                        action: act.clone(),
-                    });
-                }
+            if let Some(act) = maybe_act {
+                hit_boxes.push(HitBox {
+                    rect: rr,
+                    action: act,
+                });
             }
             if is_sec_boundary {
                 draw_line(rt, bounds.left + 12.0, ry, bounds.right - 12.0, ry, theme.border, 1.0);
@@ -7272,19 +8543,13 @@ impl DashboardView {
                 draw_line(rt, bounds.left + 14.0, ry, bounds.right - 14.0, ry, theme.grid, 0.8);
             }
 
-            let has_cost_total_col = cols.iter().any(|(t, _, _)| *t == "估算总费");
             let mut rx = bounds.left + pad_x;
             for (ci, &(col_title, frac, right_align)) in cols.iter().enumerate() {
                 let cw = inner_w * frac;
                 let cell = row.get(ci).map(String::as_str).unwrap_or("");
-                // Unified 4-tier typographic hierarchy:
-                //   Tier 1 (11.5pt Medium + theme.text): single mode-aware anchor (`总 Token` in Tok mode; `估算总费`/`估算费用` in $ mode)
-                //   Tier 2 (10pt Regular + theme.text or semantic color): active drivers (`新输入`/`输出` or `新入费用`/`输出费用`), `命中率`, `估算费用` (Tok mode), `缓存已省`
-                //   Tier 3 (10pt Regular + theme.sub): supporting operational stats (`输出速度`, `日均`, `总 Token` in $ mode)
-                //   Tier 4 (10pt Regular + theme.muted): quiet metadata (`调用`, `活跃`, `星期`, `缓存读`, `缓存费用`, `峰值Ctx`)
                 let is_headline = !is_secondary
                     && right_align
-                    && if self.cost_mode {
+                    && if cost_mode {
                         col_title == "估算总费" || (!has_cost_total_col && col_title == "估算费用")
                     } else {
                         col_title == "总 Token"
@@ -7322,8 +8587,8 @@ impl DashboardView {
                 ) {
                     theme.muted
                 } else if ci == 0
-                    || (!self.cost_mode && matches!(col_title, "新输入" | "新增输入" | "输出"))
-                    || (self.cost_mode && matches!(col_title, "新入费用" | "输出费用"))
+                    || (!cost_mode && matches!(col_title, "新输入" | "新增输入" | "输出"))
+                    || (cost_mode && matches!(col_title, "新入费用" | "输出费用"))
                 {
                     theme.text
                 } else {
@@ -7347,10 +8612,10 @@ impl DashboardView {
             }
         }
 
-        if self.max_scroll > 0 {
+        if *max_scroll > 0 {
             let track_h = (bounds.bottom - 8.0 - body_top).max(20.0);
-            let thumb_h = ((vis_rows as f32 / rows.len() as f32) * track_h).clamp(24.0, track_h);
-            let ratio = self.scroll_rows as f32 / self.max_scroll as f32;
+            let thumb_h = ((vis_rows as f32 / total_rows as f32) * track_h).clamp(24.0, track_h);
+            let ratio = *scroll_rows as f32 / *max_scroll as f32;
             let thumb_y = body_top + ratio * (track_h - thumb_h);
             fill_round_rect(rt, rect_f(bounds.right - 7.0, thumb_y, 3.0, thumb_h), 1.5, theme.muted);
         }
@@ -7362,19 +8627,19 @@ mod tests {
     use super::*;
     use crate::pricing::CostBreakdown;
     use crate::stats::TurnRecord;
-    use chrono::{TimeZone, Utc};
     use std::collections::BTreeSet;
 
     fn make_session(id: &str, ws: &str, model: &str, ts_ymd: (i32, u32, u32), calls: u64) -> SessionInfo {
         let ts = Utc.with_ymd_and_hms(ts_ymd.0, ts_ymd.1, ts_ymd.2, 10, 0, 0).single();
         let mut counts = TokenCounts::default();
         let mut turns = Vec::new();
+        let model_arc: Arc<str> = Arc::from(model);
         for i in 0..calls {
             counts.add_call(1000, 9000, 0, 500);
             turns.push(TurnRecord {
                 step_index: i as i64,
                 timestamp_utc: ts,
-                model: model.to_string(),
+                model: Arc::clone(&model_arc),
                 is_checkpoint: false,
                 input_tokens: 1000,
                 cache_read_tokens: 9000,
@@ -7382,7 +8647,7 @@ mod tests {
                 cache_write_1h_tokens: 0,
                 output_tokens: 500,
                 reasoning_tokens: 0,
-                tool_names: Vec::new(),
+                tool_names: Box::new([]),
                 thinking_chars: 0,
                 gen_secs: None,
                 cost: CostBreakdown::default(),
@@ -7390,6 +8655,8 @@ mod tests {
         }
         let mut models = BTreeSet::new();
         models.insert(model.to_string());
+        let primary_model = compute_primary_model(&turns);
+        let active_duration_secs = compute_active_duration_secs(&turns);
         SessionInfo {
             conversation_id: id.to_string(),
             title: id.to_string(),
@@ -7399,14 +8666,29 @@ mod tests {
             is_subagent: false,
             parent_id: None,
             parent_title: String::new(),
-            turns,
+            turns: Arc::from(turns),
             counts,
             models,
             first_time: ts.map(|u| u.with_timezone(&Local)),
             last_time: ts.map(|u| u.with_timezone(&Local)),
             last_file_mtime_utc: ts,
             is_running_hint: false,
+            primary_model,
+            active_duration_secs,
+            compaction_count: 0,
+            thinking_turns: 0,
         }
+    }
+
+    fn mutate_turns(s: &mut SessionInfo, f: impl FnOnce(&mut Vec<TurnRecord>)) {
+        let mut turns = s.turns.to_vec();
+        f(&mut turns);
+        s.turns = Arc::from(turns);
+        s.recompute_summary();
+    }
+
+    fn tools_box(names: &[&str]) -> Box<[Arc<str>]> {
+        names.iter().map(|s| Arc::from(*s)).collect::<Vec<_>>().into_boxed_slice()
     }
 
     #[test]
@@ -7469,11 +8751,13 @@ mod tests {
     fn test_model_and_date_filters_count_only_matching_turns() {
         // One session: 3 turns on neon (11/22) + 2 turns on opus (11/21)
         let mut s = make_session("mix", "C:/Users/a/agent-home", "gemini-4-neon-xhigh", (2026, 11, 22), 5);
-        for t in s.turns.iter_mut().skip(3) {
-            t.model = "claude-opus-5-5".into();
-            t.output_tokens = 2_000;
-            t.timestamp_utc = Utc.with_ymd_and_hms(2026, 11, 21, 10, 0, 0).single();
-        }
+        mutate_turns(&mut s, |turns| {
+            for t in turns.iter_mut().skip(3) {
+                t.model = Arc::from("claude-opus-5-5");
+                t.output_tokens = 2_000;
+                t.timestamp_utc = Utc.with_ymd_and_hms(2026, 11, 21, 10, 0, 0).single();
+            }
+        });
         s.models.insert("claude-opus-5-5".into());
         let mut view = DashboardView::new(false, DateScope::All, false, true, false);
         view.cached_sessions = vec![s];
@@ -7484,7 +8768,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].counts.calls, 2);
         assert_eq!(rows[0].counts.output_tokens, 4_000);
-        assert_eq!(rows[0].primary_model, "claude-opus-5-5");
+        assert_eq!(rows[0].primary_model.as_ref(), "claude-opus-5-5");
         let detail = view.session_for_detail("mix").unwrap();
         assert_eq!(detail.turns.len(), 2);
         assert!(view.export_sessions_csv().contains(",2,"));
@@ -7492,7 +8776,7 @@ mod tests {
         view.session_filter = Some(SessionFilter::Date("2026-11-22".into()));
         let rows = view.display_sessions(true);
         assert_eq!(rows[0].counts.calls, 3);
-        assert_eq!(rows[0].primary_model, "gemini-4-neon-xhigh");
+        assert_eq!(rows[0].primary_model.as_ref(), "gemini-4-neon-xhigh");
 
         // Whole-session filters keep every turn
         view.session_filter = Some(SessionFilter::Workspace("C:/Users/a/agent-home".into()));
@@ -7524,8 +8808,10 @@ mod tests {
             2,
         );
         s1.title = "机密支付网关排查".into();
-        s1.turns[0].tool_names = vec!["read_file".into(), "run_command".into()];
-        s1.turns[0].thinking_chars = 420;
+        mutate_turns(&mut s1, |turns| {
+            turns[0].tool_names = tools_box(&["read_file", "run_command"]);
+            turns[0].thinking_chars = 420;
+        });
 
         let mut s2 = make_session(
             "public-uuid-2222",
@@ -7543,7 +8829,7 @@ mod tests {
         let mut view = DashboardView::new(false, DateScope::All, false, true, true);
         view.cached_sessions = sessions;
         view.cached_agg = agg.clone();
-        view.redactor = redactor;
+        view.set_redactor_for_test(redactor);
 
         // Under privacy_mode, raw secret title/workspace cannot be queried (no oracle leak)
         view.search_query = "机密支付".into();
@@ -7615,18 +8901,20 @@ mod tests {
     fn test_call_log_order_gap_search_and_privacy_export() {
         let mut s1 = make_session("secret-uuid-1111", "C:/Users/alice/secret-client", "gemini-4-neon-xhigh", (2026, 11, 22), 3);
         s1.title = "机密支付网关排查".into();
-        for (i, t) in s1.turns.iter_mut().enumerate() {
-            t.timestamp_utc = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, (i as u32) * 20).single();
-        }
-        s1.turns[1].tool_names = vec!["run_command".into(), "read_file".into()];
-        s1.turns[2].output_tokens = 9_000;
+        mutate_turns(&mut s1, |turns| {
+            for (i, t) in turns.iter_mut().enumerate() {
+                t.timestamp_utc = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, (i as u32) * 20).single();
+            }
+            turns[1].tool_names = tools_box(&["run_command", "read_file"]);
+            turns[2].output_tokens = 9_000;
+        });
         let mut s2 = make_session("public-uuid-2222", "C:/Users/alice/notes", "claude-opus-5-5", (2026, 11, 21), 1);
         s2.title = "普通周报整理".into();
 
         let sessions = vec![s1, s2];
         let agg = crate::stats::aggregate_sessions(&sessions);
         let mut view = DashboardView::new(false, DateScope::All, false, true, false);
-        view.redactor = Redactor::build(&sessions, &agg);
+        view.set_redactor_for_test(Redactor::build(&sessions, &agg));
         view.cached_sessions = sessions;
         view.cached_agg = agg;
         view.active_tab = Tab::Calls;
@@ -7682,7 +8970,7 @@ mod tests {
         assert!(!clip.contains("机密支付"));
 
         let mut t = view.cached_sessions[0].turns[1].clone();
-        t.tool_names = vec!["edit_file".into(), "edit_file".into(), "read_file".into(), "edit_file".into()];
+        t.tool_names = tools_box(&["edit_file", "edit_file", "read_file", "edit_file"]);
         assert_eq!(DashboardView::call_tools_label(&t, 3), "edit_file×3, read_file");
         assert_eq!(DashboardView::call_tools_label(&t, 1), "edit_file×3 +1");
     }
@@ -7858,7 +9146,7 @@ mod tests {
 
         // Clipboard output under privacy mode strips title, UUID, workspace, username while preserving model/tokens/cost
         let mut view = DashboardView::new(false, DateScope::All, false, true, true);
-        view.redactor = redactor;
+        view.set_redactor_for_test(redactor);
         let clip_redacted = view.format_session_detail_clipboard(&parent);
         assert!(clip_redacted.contains("会话 #1"));
         assert!(clip_redacted.contains("S-001"));
@@ -8332,7 +9620,7 @@ mod tests {
         let mut view = DashboardView::new(false, DateScope::All, false, true, true);
         view.cached_sessions = sessions;
         view.cached_agg = agg;
-        view.redactor = redactor;
+        view.set_redactor_for_test(redactor);
 
         // SessionFilter::Agent filters display_sessions cleanly
         view.session_filter = Some(SessionFilter::Agent(AgentFamily::Codex));
@@ -8418,9 +9706,11 @@ mod tests {
     fn test_reasoning_tokens_thinking_and_non_agy_gen_secs_formatting() {
         let mut s_codex = make_session("codex-1", "C:/Users/alice/app", "gpt-5.3-codex", (2026, 11, 24), 1);
         s_codex.source = SourceKind::Codex;
-        s_codex.turns[0].reasoning_tokens = 1_250;
-        s_codex.turns[0].thinking_chars = 0;
-        s_codex.turns[0].gen_secs = None;
+        mutate_turns(&mut s_codex, |turns| {
+            turns[0].reasoning_tokens = 1_250;
+            turns[0].thinking_chars = 0;
+            turns[0].gen_secs = None;
+        });
         assert!(s_codex.turns[0].has_thinking());
         assert_eq!(format_turn_thinking(&s_codex.turns[0]).as_deref(), Some("1,250 tok"));
 
@@ -8433,9 +9723,11 @@ mod tests {
         // Antigravity / Claude plaintext thinking shows `X 字`
         let mut s_agy = make_session("agy-1", "C:/Users/alice/app", "gemini-4-neon-xhigh", (2026, 11, 24), 1);
         s_agy.source = SourceKind::Cli;
-        s_agy.turns[0].reasoning_tokens = 0;
-        s_agy.turns[0].thinking_chars = 420;
-        s_agy.turns[0].gen_secs = None;
+        mutate_turns(&mut s_agy, |turns| {
+            turns[0].reasoning_tokens = 0;
+            turns[0].thinking_chars = 420;
+            turns[0].gen_secs = None;
+        });
         assert!(s_agy.turns[0].has_thinking());
         assert_eq!(format_turn_thinking(&s_agy.turns[0]).as_deref(), Some("420 字"));
 
@@ -8455,5 +9747,340 @@ mod tests {
         let agy_clip = view.format_call_detail_clipboard(&s_agy, &s_agy.turns[0], None);
         assert!(agy_clip.contains("纯回复 / 压缩步骤无结束时间"));
         assert!(agy_clip.contains("思考: 420 字"));
+    }
+
+    #[test]
+    fn test_on_hide_releases_caches_and_preserves_prefs() {
+        let s1 = make_session("s1", "C:/Users/a/repo", "gemini-4-neon-xhigh", (2026, 11, 24), 3);
+        let agg = crate::stats::aggregate_sessions(std::slice::from_ref(&s1));
+        let mut view = DashboardView::new(true, DateScope::Days7, true, true, true);
+        view.active_tab = Tab::Sessions;
+        view.cached_sessions = vec![s1];
+        view.cached_agg = agg;
+        view.hit_boxes.push(HitBox {
+            rect: rect_f(0.0, 0.0, 50.0, 20.0),
+            action: ClickAction::Refresh,
+        });
+        view.plot_rects.push(rect_f(10.0, 10.0, 100.0, 50.0));
+        view.discrete_plots.push(DiscretePlot::VerticalBars {
+            plot: rect_f(0.0, 0.0, 100.0, 50.0),
+            n: 5,
+        });
+        let _ = view.display_sessions(true);
+        let _ = view.format_session_id("s1"); // lazily builds redactor
+        assert!(view.redactor_built.get());
+
+        // Populate transient banners, toast timers, and an empty-but-overallocated search_query
+        view.set_banner_status("导出成功", false);
+        view.set_pricing_status("已保存", false);
+        let future = Instant::now() + std::time::Duration::from_secs(5);
+        view.copied_until = Some(future);
+        view.session_copied_until = Some(future);
+        view.resume_cmd_copied_until = Some(future);
+        view.call_copied_until = Some(future);
+        view.search_query = "temporary query that allocates heap".into();
+        view.search_query.clear();
+        assert!(view.search_query.capacity() > 0);
+
+        view.on_hide();
+
+        // Heavy caches, transient banners/timers, and empty search buffer are released and marked dirty
+        assert!(view.cached_sessions.is_empty());
+        assert_eq!(view.cached_sessions.capacity(), 0);
+        assert!(view.pinned_out_of_scope.is_empty());
+        assert!(view.hit_boxes.is_empty());
+        assert!(view.plot_rects.is_empty());
+        assert!(view.discrete_plots.is_empty());
+        assert!(!view.redactor_built.get());
+        assert!(view.surface.is_none());
+        assert!(view.dash_factories.is_none());
+        assert!(view.dirty_filter);
+        assert!(view.banner_status.is_none());
+        assert!(view.pricing_status.is_none());
+        assert!(view.copied_until.is_none());
+        assert!(view.session_copied_until.is_none());
+        assert!(view.resume_cmd_copied_until.is_none());
+        assert!(view.call_copied_until.is_none());
+        assert_eq!(view.search_query.capacity(), 0);
+
+        // User preferences and navigation state stay intact
+        assert!(view.fresh_only);
+        assert_eq!(view.scope, DateScope::Days7);
+        assert!(view.cost_mode);
+        assert!(view.privacy_mode);
+        assert_eq!(view.active_tab, Tab::Sessions);
+    }
+
+    #[test]
+    fn test_compiled_turn_filter_utc_range_parity() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(); // Wednesday of 2026-W48
+        let prev_day = day.pred_opt().unwrap();
+        let next_day = day.succ_opt().unwrap();
+        let (wk_mon, wk_sun) = iso_week_bounds("2026-W48").unwrap();
+        let before_wk = wk_mon.pred_opt().unwrap();
+        let after_wk = wk_sun.succ_opt().unwrap();
+
+        let make_local_ts = |d: NaiveDate, h: u32, m: u32, s: u32| -> DateTime<Utc> {
+            Local
+                .from_local_datetime(&d.and_hms_opt(h, m, s).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let probe_times = [
+            make_local_ts(before_wk, 23, 59, 59),
+            make_local_ts(wk_mon, 0, 0, 0),
+            make_local_ts(prev_day, 23, 59, 59),
+            make_local_ts(day, 0, 0, 0),
+            make_local_ts(day, 12, 34, 56),
+            make_local_ts(day, 23, 59, 59),
+            make_local_ts(next_day, 0, 0, 0),
+            make_local_ts(wk_sun, 23, 59, 59),
+            make_local_ts(after_wk, 0, 0, 0),
+        ];
+
+        let date_f = SessionFilter::Date("2026-11-25".into());
+        let compiled_date = date_f.compile();
+        assert!(matches!(compiled_date, CompiledTurnFilter::UtcRange(..)));
+
+        let week_f = SessionFilter::Week("2026-W48".into());
+        let compiled_week = week_f.compile();
+        assert!(matches!(compiled_week, CompiledTurnFilter::UtcRange(..)));
+
+        let bad_date = SessionFilter::Date("not-a-date".into());
+        let compiled_bad = bad_date.compile();
+        assert!(matches!(compiled_bad, CompiledTurnFilter::Never));
+
+        for ts in probe_times {
+            let turn = TurnRecord {
+                step_index: 0,
+                timestamp_utc: Some(ts),
+                model: Arc::from("m"),
+                is_checkpoint: false,
+                input_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
+                output_tokens: 1,
+                reasoning_tokens: 0,
+                tool_names: Box::new([]),
+                thinking_chars: 0,
+                gen_secs: None,
+                cost: CostBreakdown::default(),
+            };
+            let local_d = ts.with_timezone(&Local).date_naive();
+            assert_eq!(compiled_date.matches_turn(&turn), local_d == day, "date mismatch at {ts}");
+            assert_eq!(
+                compiled_week.matches_turn(&turn),
+                local_d >= wk_mon && local_d <= wk_sun,
+                "week mismatch at {ts}"
+            );
+            assert!(!compiled_bad.matches_turn(&turn));
+        }
+
+        // Turn with timestamp_utc == None never matches Date/Week filters
+        let none_turn = TurnRecord {
+            step_index: 0,
+            timestamp_utc: None,
+            model: Arc::from("m"),
+            is_checkpoint: false,
+            input_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            tool_names: Box::new([]),
+            thinking_chars: 0,
+            gen_secs: None,
+            cost: CostBreakdown::default(),
+        };
+        assert!(!compiled_date.matches_turn(&none_turn));
+        assert!(!compiled_week.matches_turn(&none_turn));
+    }
+
+    #[test]
+    fn test_ensure_filtered_defers_session_rows_cache_off_sessions_tab() {
+        let s1 = make_session("s1", "C:/Users/a/repo", "gemini-4-neon-xhigh", (2026, 11, 25), 2);
+        let s2 = make_session("s2", "C:/Users/a/repo", "claude-opus-4-6", (2026, 11, 25), 3);
+        let sessions = vec![s1, s2];
+        let agg = crate::stats::aggregate_sessions(&sessions);
+        let snap = ScanSnapshot {
+            data_dir: std::path::PathBuf::from("."),
+            data_dirs: Vec::new(),
+            sessions,
+            agg,
+            statusline: None,
+            statusline_changed: false,
+            budget: BudgetConfig::default(),
+            budget_changed: false,
+            budget_path: None,
+            session_meta: HashMap::new(),
+            session_meta_changed: false,
+            session_meta_path: None,
+            archived_sessions_count: 0,
+            archive_enabled: false,
+            archive_path: None,
+            model_rate_labels: HashMap::new(),
+            pricing_rows: Vec::new(),
+            pricing_path: None,
+            custom_pricing_count: 0,
+            pricing_changed: false,
+            skipped_empty: 0,
+            skipped_lines: 0,
+            files_cached: 0,
+            files_reparsed: 0,
+            scan_ms: 0.0,
+            warning: None,
+        };
+
+        // On Tab::Overview, ensure_filtered must NOT eagerly build session_rows_cache
+        let mut view = DashboardView::new(false, DateScope::All, false, true, false);
+        view.active_tab = Tab::Overview;
+        view.selected_session = Some("stale-deleted-id".into());
+        view.ensure_filtered(&snap);
+        assert!(view.session_rows_cache.borrow().is_none());
+        assert!(view.selected_session.is_none());
+
+        // On Tab::Sessions, ensure_filtered populates session_rows_cache and selects first row
+        view.active_tab = Tab::Sessions;
+        view.mark_data_dirty();
+        view.ensure_filtered(&snap);
+        assert!(view.session_rows_cache.borrow().is_some());
+        assert!(view.selected_session.is_some());
+    }
+
+    #[test]
+    fn test_fmt_buf_stack_utf8_truncation_safety() {
+        let mut b = FmtBuf::new();
+        let _ = write!(b, "{:.1}/{:.1} GB", 16.34, 32.0);
+        assert_eq!(b.as_str(), "16.3/32.0 GB");
+        b.clear();
+        let _ = write!(b, "{}", "测".repeat(30)); // 90 bytes > 64-byte stack buf
+        assert!(b.as_str().len() <= 64);
+        assert_eq!(b.as_str().chars().count(), 21); // 21 * 3 = 63 bytes on valid char boundary
+    }
+
+    #[test]
+    fn test_lazy_redactor_builds_only_in_privacy_mode() {
+        let s1 = make_session("uuid-1", "C:/Users/alice/secret", "gemini-4-neon-xhigh", (2026, 11, 24), 2);
+        let agg = crate::stats::aggregate_sessions(std::slice::from_ref(&s1));
+        let mut view = DashboardView::new(false, DateScope::All, false, true, false);
+        view.cached_sessions = vec![s1];
+        view.cached_agg = agg;
+
+        // Non-privacy mode never builds redactor tables
+        assert_eq!(view.format_session_id("uuid-1"), "uuid-1");
+        assert!(!view.redactor_built.get());
+
+        // Flipping privacy_mode lazily builds on first access
+        view.privacy_mode = true;
+        let rid = view.format_session_id("uuid-1");
+        assert!(view.redactor_built.get());
+        assert!(rid.starts_with("S-"));
+
+        // Toggling privacy_mode off clears the redactor immediately
+        let mut human = true;
+        let mut light = false;
+        let _ = view.apply_action(HWND::default(), ClickAction::TogglePrivacyMode, &mut human, &mut light);
+        assert!(!view.privacy_mode);
+        assert!(!view.redactor_built.get());
+    }
+
+    #[test]
+    fn test_discrete_plot_hover_gating() {
+        let mut view = DashboardView::new(false, DateScope::Today, false, true, false);
+        view.discrete_plots.push(DiscretePlot::VerticalBars {
+            plot: rect_f(100.0, 100.0, 100.0, 50.0),
+            n: 4, // slots: [100..125), [125..150), [150..175), [175..200)
+        });
+        view.discrete_plots.push(DiscretePlot::Heatmap(HeatmapGridGeom {
+            gx0: 10.0,
+            gy0: 10.0,
+            cell: 10.0,
+            gap: 2.0,
+            n_weeks: 3,
+        }));
+        view.discrete_plots.push(DiscretePlot::RowRects {
+            bounds: rect_f(300.0, 10.0, 80.0, 45.0),
+            rows: vec![
+                rect_f(300.0, 10.0, 80.0, 20.0),
+                rect_f(300.0, 35.0, 80.0, 20.0),
+            ],
+        });
+        view.discrete_plots.push(DiscretePlot::TimeSeries {
+            x0: 400.0,
+            pr: 490.0,
+            pt_y: 10.0,
+            pb_y: 60.0,
+            dx: 10.0,
+            n: 10,
+        });
+
+        // VerticalBars: entering bar 0 repaints once; moving inside bar 0 skips; entering bar 1 repaints once
+        assert!(view.on_mouse_move(105.0, 120.0));
+        assert!(!view.on_mouse_move(118.0, 130.0));
+        assert!(view.on_mouse_move(130.0, 120.0));
+        assert!(!view.on_mouse_move(145.0, 120.0));
+
+        // Heatmap: entering cell (0,0) repaints; moving inside same cell skips; hitting gap leaves cell
+        assert!(view.on_mouse_move(12.0, 12.0));
+        assert!(!view.on_mouse_move(18.0, 18.0));
+        assert!(view.on_mouse_move(21.0, 15.0)); // in gap -> None
+        assert!(!view.on_mouse_move(21.5, 15.0));
+
+        // RowRects: entering row 0 repaints; moving inside row 0 skips; row 1 repaints
+        assert!(view.on_mouse_move(310.0, 15.0));
+        assert!(!view.on_mouse_move(360.0, 20.0));
+        assert!(view.on_mouse_move(310.0, 40.0));
+
+        // TimeSeries: quantized by dx=10; moving within same sample skips; next sample repaints
+        assert!(view.on_mouse_move(401.0, 30.0));
+        assert!(!view.on_mouse_move(403.0, 35.0));
+        assert!(view.on_mouse_move(412.0, 30.0));
+
+        // Leaving everything repaints once, then on_mouse_leave returns false
+        assert!(view.on_mouse_move(0.0, 0.0));
+        assert!(!view.on_mouse_leave());
+    }
+
+    #[test]
+    fn test_telemetry_tick_repaint_modes() {
+        let mut view = DashboardView::new(false, DateScope::Today, false, true, false);
+        view.dirty_filter = false;
+        view.active_tab = Tab::Overview;
+        view.overview_top = OverviewTopMode::WeeklyCompare;
+
+        let mut tel = SystemTelemetry::new(4);
+        tel.latest.cpu_pct = 24.4;
+        tel.latest.mem_pct = 51.2;
+        tel.latest.mem_used_gb = 16.34;
+        tel.latest.mem_total_gb = 32.0;
+
+        // First tick with no previous sig and no surface falls back to Full
+        assert_eq!(view.on_telemetry_tick(&tel), TelemetryRepaintMode::Full);
+
+        // Once signature is recorded, identical displayed values return Skip
+        view.last_hero_telemetry_sig = Some(HeroTelemetrySig::from_telemetry(&tel));
+        assert_eq!(view.on_telemetry_tick(&tel), TelemetryRepaintMode::Skip);
+
+        // Sub-rounding jitter (24.4 -> 24.1, still "24%"; 16.34 -> 16.32, still "16.3") also returns Skip
+        tel.latest.cpu_pct = 24.1;
+        tel.latest.mem_used_gb = 16.32;
+        assert_eq!(view.on_telemetry_tick(&tel), TelemetryRepaintMode::Skip);
+
+        // Tab::System always requires Full repaint for live 90s waveform
+        view.active_tab = Tab::System;
+        assert_eq!(view.on_telemetry_tick(&tel), TelemetryRepaintMode::Full);
+        view.active_tab = Tab::Overview;
+
+        // Toast expiry forces a Full repaint to clear the banner
+        view.had_active_toast = true;
+        assert_eq!(view.on_telemetry_tick(&tel), TelemetryRepaintMode::Full);
+        view.had_active_toast = false;
+
+        // Visible CPU% change with no retained surface returns Full (caller falls back)
+        tel.latest.cpu_pct = 37.0;
+        assert_eq!(view.on_telemetry_tick(&tel), TelemetryRepaintMode::Full);
     }
 }

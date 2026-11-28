@@ -11,14 +11,13 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use chrono::{Local, Utc};
+use chrono::Utc;
 
-use gauge::pricing::{fmt_cost_compact, PricingCatalog};
+use gauge::pricing::PricingCatalog;
 use gauge::quota::{
-    fmt_countdown, parse_statusline_payload, save_statusline_state, BudgetStore,
-    StatuslineSnapshot,
+    fmt_countdown, parse_statusline_payload_with_width, save_statusline_state, StatuslineSnapshot,
 };
-use gauge::stats::{fmt_compact, IncrementalScanner};
+use gauge::stats::{fmt_compact, scan_antigravity_today_totals, IncrementalScanner};
 
 fn print_config_snippet() {
     let exe_str = std::env::current_exe()
@@ -167,12 +166,15 @@ fn main() {
     let now = Utc::now();
     let mut term_width: usize = 110;
     let parsed_snap = if !trimmed.is_empty() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(tw) = v.get("terminal_width").and_then(|x| x.as_u64()) {
-                term_width = (tw as usize).clamp(40, 300);
+        match parse_statusline_payload_with_width(trimmed, now) {
+            Some((snap, tw)) => {
+                if let Some(w) = tw {
+                    term_width = w;
+                }
+                Some(snap)
             }
+            None => None,
         }
-        parse_statusline_payload(trimmed, now)
     } else {
         None
     };
@@ -186,18 +188,8 @@ fn main() {
     let (today_tokens, today_usd, today_calls) = if skip_scan {
         (0, 0.0, 0)
     } else {
-        let mut scanner = IncrementalScanner::new_multi(
-            IncrementalScanner::default_antigravity_dirs(),
-            PricingCatalog::default_override_path(),
-            None,
-            BudgetStore::default_path(),
-            None,
-            false,
-        );
-        let snap = scanner.scan();
-        let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let tc = snap.agg.by_day.get(&today_key).copied().unwrap_or_default();
-        let _ = fmt_cost_compact(&tc.cost, tc.calls);
+        let pricing = PricingCatalog::new(PricingCatalog::default_override_path());
+        let tc = scan_antigravity_today_totals(&IncrementalScanner::default_antigravity_dirs(), &pricing);
         (tc.total_tokens(), tc.cost.total_usd(), tc.calls)
     };
 
@@ -216,11 +208,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Local};
+    use gauge::stats::SourceKind;
 
     #[test]
     fn test_statusline_render_and_sanitize() {
         let now = Utc::now();
         let raw = r#"{
+            "terminal_width": 88,
             "email": "secret@example.com",
             "cwd": "C:\\Users\\secret\\proj",
             "model": { "display_name": "Gemini 4 Neon" },
@@ -229,12 +224,101 @@ mod tests {
                 "gemini-5h": { "remaining_fraction": 0.72, "reset_in_seconds": 7200 }
             }
         }"#;
-        let snap = parse_statusline_payload(raw, now).unwrap();
+        let (snap, tw) = parse_statusline_payload_with_width(raw, now).unwrap();
+        assert_eq!(tw, Some(88));
         let out = render_statusline(Some(&snap), 1_500_000, 2.35, 12, false, false, 120);
         assert!(out.contains("Gemini 4 Neon"));
         assert!(out.contains("Ctx 35%"));
         assert!(out.contains("Gemini 5h 72%"));
         assert!(out.contains("今日 1.50M ($2.35)"));
         assert!(!out.contains("secret"));
+    }
+
+    #[test]
+    fn test_today_totals_fast_path_parity_with_full_scanner() {
+        let base = std::env::temp_dir().join(format!(
+            "agy_statusline_fast_parity_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let cli_dir = base.join("antigravity-cli");
+        let app_dir = base.join("antigravity");
+
+        let now_utc = Utc::now();
+        let today_ts = now_utc.to_rfc3339();
+        let two_days_ago_ts = (now_utc - Duration::days(2)).to_rfc3339();
+
+        // Session 1 (CLI): multi-day session with an older turn, a today turn, and a today checkpoint
+        // inheriting its model from the prior turn, plus a GENERIC tool output mentioning `_tokens`.
+        let s1_logs = cli_dir
+            .join("brain")
+            .join("sess-multi")
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&s1_logs).unwrap();
+        let s1_jsonl = [
+            format!(
+                r#"{{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"{two_days_ago_ts}","model":"gemini-4-neon-xhigh","input_tokens":50000,"cache_read_tokens":10000,"output_tokens":500}}"#
+            ),
+            format!(
+                r#"{{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"{today_ts}","model":"gemini-4-neon-xhigh","input_tokens":100000,"cache_read_tokens":200000,"output_tokens":1500,"tool_calls":[{{"name":"read_file","args":{{"huge":"blob"}}}}]}}"#
+            ),
+            format!(
+                r#"{{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"{today_ts}","content":"\"input_tokens\":999999"}}"#
+            ),
+            format!(
+                r#"{{"step_index":4,"type":"CHECKPOINT","status":"DONE","created_at":"{today_ts}","input_tokens":20000,"cache_read_tokens":50000,"output_tokens":400}}"#
+            ),
+        ]
+        .join("\n");
+        std::fs::write(s1_logs.join("transcript.jsonl"), format!("{s1_jsonl}\n")).unwrap();
+
+        // Session 2 (App): duplicate cid with fewer turns (CLI must win deduplication), plus a unique App session today.
+        let dup_logs = app_dir
+            .join("brain")
+            .join("sess-multi")
+            .join(".system_generated")
+            .join("logs");
+        let s2_logs = app_dir
+            .join("brain")
+            .join("sess-app-only")
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&dup_logs).unwrap();
+        std::fs::create_dir_all(&s2_logs).unwrap();
+        std::fs::write(
+            dup_logs.join("transcript.jsonl"),
+            format!(
+                r#"{{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"{today_ts}","model":"claude-opus-5-5","input_tokens":999,"cache_read_tokens":0,"output_tokens":111}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            s2_logs.join("transcript.jsonl"),
+            format!(
+                r#"{{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"{today_ts}","model":"claude-opus-5-5","input_tokens":10000,"cache_read_tokens":0,"output_tokens":2000}}"#
+            ),
+        )
+        .unwrap();
+
+        let sources = vec![(SourceKind::Cli, cli_dir), (SourceKind::App, app_dir)];
+        let pricing = PricingCatalog::new(None);
+
+        let fast = scan_antigravity_today_totals(&sources, &pricing);
+        let mut scanner = IncrementalScanner::new_multi(sources, None, None, None, None, false);
+        let snap = scanner.scan();
+        let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let full = snap.agg.by_day.get(&today_key).copied().unwrap_or_default();
+
+        assert_eq!(fast.calls, full.calls);
+        assert_eq!(fast.calls, 3);
+        assert_eq!(fast.input_tokens, full.input_tokens);
+        assert_eq!(fast.cache_read_tokens, full.cache_read_tokens);
+        assert_eq!(fast.cache_write_tokens, full.cache_write_tokens);
+        assert_eq!(fast.output_tokens, full.output_tokens);
+        assert_eq!(fast.peak_context, full.peak_context);
+        assert!((fast.cost.total_usd() - full.cost.total_usd()).abs() < 1e-9);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

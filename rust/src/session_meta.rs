@@ -75,10 +75,10 @@ impl SessionMetaStore {
     /// Also reports `true` if in-process mutations happened since the previous refresh/scan.
     pub fn refresh(&mut self) -> bool {
         let local_changed = std::mem::take(&mut self.changed_since_scan);
-        let Some(path) = self.path.clone() else {
+        let Some(path) = self.path.as_deref() else {
             return local_changed;
         };
-        let sig = regular_file_sig(&path);
+        let sig = regular_file_sig(path);
         if sig == self.sig {
             return local_changed;
         }
@@ -91,7 +91,7 @@ impl SessionMetaStore {
                 local_changed || had
             }
             Some(_) => {
-                if let Ok(mut f) = File::open(&path) {
+                if let Ok(mut f) = File::open(path) {
                     let mut text = String::new();
                     if f.read_to_string(&mut text).is_ok() {
                         if let Some((parsed_entries, parsed_extras)) =

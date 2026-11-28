@@ -8,6 +8,7 @@ budget.json
 archive.json
 pricing.json
 session_meta.json
+terminal.json
 
 # Python caches
 __pycache__/
@@ -16,3 +17,6 @@ __pycache__/
 # OS / editor noise
 Thumbs.db
 .DS_Store
+
+# Local promo video workspace (large media & node_modules)
+promo/

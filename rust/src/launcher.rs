@@ -16,18 +16,22 @@
 //!   - Non-blocking spawns (`Stdio::null()`), never blocks the Win32 UI message loop.
 //!   - Uses `ShellExecuteW(..., "explore", ...)` + `is_dir()` check to avoid accidental execution.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
+use serde_json::{json, Map, Value};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::CREATE_NEW_CONSOLE;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use crate::quota::{atomic_write_json, default_companion_path};
 use crate::stats::{SessionInfo, SourceKind};
 
 const MAX_WT_TITLE_CHARS: usize = 36;
@@ -150,19 +154,165 @@ impl ResumeCapability {
     }
 }
 
+/// User-selectable terminal preset for resuming CLI sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalPreset {
+    #[default]
+    WtPwsh = 0,
+    WtDirect = 1,
+    Pwsh = 2,
+    WezTerm = 3,
+    Alacritty = 4,
+    GitBash = 5,
+    Cmd = 6,
+    Custom = 7,
+}
+
+impl TerminalPreset {
+    pub const ALL: [TerminalPreset; 8] = [
+        TerminalPreset::WtPwsh,
+        TerminalPreset::WtDirect,
+        TerminalPreset::Pwsh,
+        TerminalPreset::WezTerm,
+        TerminalPreset::Alacritty,
+        TerminalPreset::GitBash,
+        TerminalPreset::Cmd,
+        TerminalPreset::Custom,
+    ];
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => TerminalPreset::WtPwsh,
+            1 => TerminalPreset::WtDirect,
+            2 => TerminalPreset::Pwsh,
+            3 => TerminalPreset::WezTerm,
+            4 => TerminalPreset::Alacritty,
+            5 => TerminalPreset::GitBash,
+            6 => TerminalPreset::Cmd,
+            7 => TerminalPreset::Custom,
+            _ => TerminalPreset::WtPwsh,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TerminalPreset::WtPwsh => "wt_pwsh",
+            TerminalPreset::WtDirect => "wt_direct",
+            TerminalPreset::Pwsh => "pwsh",
+            TerminalPreset::WezTerm => "wezterm",
+            TerminalPreset::Alacritty => "alacritty",
+            TerminalPreset::GitBash => "git_bash",
+            TerminalPreset::Cmd => "cmd",
+            TerminalPreset::Custom => "custom",
+        }
+    }
+
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "wt_pwsh" | "wt-pwsh" | "wt_powershell" | "wt-powershell" => Some(TerminalPreset::WtPwsh),
+            "wt_direct" | "wt-direct" | "wt" => Some(TerminalPreset::WtDirect),
+            "pwsh" | "powershell" => Some(TerminalPreset::Pwsh),
+            "wezterm" | "wezterm-gui" => Some(TerminalPreset::WezTerm),
+            "alacritty" => Some(TerminalPreset::Alacritty),
+            "git_bash" | "git-bash" | "gitbash" => Some(TerminalPreset::GitBash),
+            "cmd" | "cmd.exe" => Some(TerminalPreset::Cmd),
+            "custom" => Some(TerminalPreset::Custom),
+            _ => None,
+        }
+    }
+
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            TerminalPreset::WtPwsh => "Windows Terminal (PowerShell)",
+            TerminalPreset::WtDirect => "Windows Terminal (直连 CLI)",
+            TerminalPreset::Pwsh => "PowerShell (独立窗口)",
+            TerminalPreset::WezTerm => "WezTerm",
+            TerminalPreset::Alacritty => "Alacritty",
+            TerminalPreset::GitBash => "Git Bash",
+            TerminalPreset::Cmd => "命令提示符 (cmd)",
+            TerminalPreset::Custom => "自定义 (terminal.json)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CustomTerminalConfig {
+    pub exe: String,
+    pub args: Vec<String>,
+}
+
+/// Effective terminal launch configuration (merged from Registry `UserPrefs` + optional `terminal.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalConfig {
+    pub preset: TerminalPreset,
+    pub wt_profile: Option<String>,
+    pub wt_new_window: bool,
+    pub keep_shell_open: bool,
+    pub custom: Option<CustomTerminalConfig>,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            preset: TerminalPreset::WtPwsh,
+            wt_profile: None,
+            wt_new_window: false,
+            keep_shell_open: true,
+            custom: None,
+        }
+    }
+}
+
+/// Lazily probed availability of built-in terminal executables on this machine (used by context menu).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalAvailability {
+    pub wt: bool,
+    pub pwsh: bool,
+    pub wezterm: bool,
+    pub alacritty: bool,
+    pub git_bash: bool,
+}
+
+impl TerminalAvailability {
+    pub fn is_available(&self, preset: TerminalPreset) -> bool {
+        match preset {
+            TerminalPreset::WtPwsh | TerminalPreset::WtDirect => self.wt,
+            TerminalPreset::Pwsh => self.pwsh,
+            TerminalPreset::WezTerm => self.wezterm,
+            TerminalPreset::Alacritty => self.alacritty,
+            TerminalPreset::GitBash => self.git_bash,
+            TerminalPreset::Cmd | TerminalPreset::Custom => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchBackend {
+    WindowsTerminalPwsh,
     WindowsTerminal,
     Pwsh,
+    WezTerm,
+    Alacritty,
+    GitBash,
     Cmd,
+    Custom,
 }
 
 impl LaunchBackend {
     pub fn label(self) -> &'static str {
         match self {
+            LaunchBackend::WindowsTerminalPwsh => "Windows Terminal (PowerShell)",
             LaunchBackend::WindowsTerminal => "Windows Terminal",
             LaunchBackend::Pwsh => "PowerShell",
+            LaunchBackend::WezTerm => "WezTerm",
+            LaunchBackend::Alacritty => "Alacritty",
+            LaunchBackend::GitBash => "Git Bash",
             LaunchBackend::Cmd => "命令提示符",
+            LaunchBackend::Custom => "自定义终端",
         }
     }
 }
@@ -289,10 +439,45 @@ pub fn normalize_workspace_dir(ws: &str) -> Option<PathBuf> {
 }
 
 fn is_existing_executable_entry(candidate: &Path) -> bool {
-    candidate.is_file()
-        || fs::symlink_metadata(candidate)
-            .map(|m| !m.is_dir())
-            .unwrap_or(false)
+    let Ok(meta) = fs::symlink_metadata(candidate) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return false;
+    }
+    if meta.is_file() {
+        return true;
+    }
+    // Symlink or Windows reparse point (e.g., App Execution Alias such as wt.exe):
+    // reject symlinks pointing to directories, while permitting executable aliases.
+    !fs::metadata(candidate).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+fn exe_path_cache() -> &'static Mutex<HashMap<&'static str, PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_cached_exe(key: &'static str, probe: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    if let Ok(guard) = exe_path_cache().lock() {
+        if let Some(cached) = guard.get(key) {
+            if is_existing_executable_entry(cached) {
+                return Some(cached.clone());
+            }
+        }
+    }
+    let found = probe();
+    if let Ok(mut guard) = exe_path_cache().lock() {
+        match &found {
+            Some(p) => {
+                guard.insert(key, p.clone());
+            }
+            None => {
+                guard.remove(key);
+            }
+        }
+    }
+    found
 }
 
 fn find_exe_in_path(names: &[&str]) -> Option<PathBuf> {
@@ -311,12 +496,21 @@ fn find_exe_in_path(names: &[&str]) -> Option<PathBuf> {
 /// Searches `dirs` in order for `<command_name>.exe`, `<command_name>.cmd`, then `<command_name>.bat`.
 /// Deliberately skips extensionless POSIX scripts (such as npm's Unix shims) and directories.
 pub fn find_cli_in_dirs(command_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    find_cli_in_dir_iter(command_name, dirs.iter().map(PathBuf::as_path))
+}
+
+fn find_cli_in_dir_iter<P, I>(command_name: &str, dirs: I) -> Option<PathBuf>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = P>,
+{
     let candidates = [
         format!("{command_name}.exe"),
         format!("{command_name}.cmd"),
         format!("{command_name}.bat"),
     ];
     for dir in dirs {
+        let dir = dir.as_ref();
         for name in &candidates {
             let candidate = dir.join(name);
             if is_existing_executable_entry(&candidate) {
@@ -329,8 +523,7 @@ pub fn find_cli_in_dirs(command_name: &str, dirs: &[PathBuf]) -> Option<PathBuf>
 
 fn find_cli_in_path(command_name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
-    find_cli_in_dirs(command_name, &dirs)
+    find_cli_in_dir_iter(command_name, std::env::split_paths(&path_var))
 }
 
 fn first_existing_file(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -346,65 +539,67 @@ fn first_existing_file(candidates: &[PathBuf]) -> Option<PathBuf> {
 /// find CLIs even when Explorer inherited an older `PATH`.
 pub fn resolve_cli_exe_for_source(source: SourceKind) -> Option<PathBuf> {
     let spec = resume_cli_spec(source).ok()?;
-    if let Some(found) = find_cli_in_path(spec.command_name) {
-        return Some(found);
-    }
+    resolve_cached_exe(spec.command_name, || {
+        if let Some(found) = find_cli_in_path(spec.command_name) {
+            return Some(found);
+        }
 
-    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
-    let user_profile = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from);
+        let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+        let user_profile = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
 
-    let mut fallbacks = Vec::new();
-    match source {
-        SourceKind::Cli | SourceKind::Custom => {
-            if let Some(local) = &local_app_data {
-                let bin = local.join("agy").join("bin");
-                fallbacks.push(bin.join("agy.exe"));
-                fallbacks.push(bin.join("agy.cmd"));
-                fallbacks.push(bin.join("agy.bat"));
+        let mut fallbacks = Vec::new();
+        match source {
+            SourceKind::Cli | SourceKind::Custom => {
+                if let Some(local) = &local_app_data {
+                    let bin = local.join("agy").join("bin");
+                    fallbacks.push(bin.join("agy.exe"));
+                    fallbacks.push(bin.join("agy.cmd"));
+                    fallbacks.push(bin.join("agy.bat"));
+                }
             }
+            SourceKind::ClaudeCode => {
+                if let Some(home) = &user_profile {
+                    fallbacks.push(home.join(".local").join("bin").join("claude.exe"));
+                }
+                if let Some(local) = &local_app_data {
+                    fallbacks.push(local.join("Programs").join("claude").join("claude.exe"));
+                }
+                if let Some(roaming) = &app_data {
+                    let npm = roaming.join("npm");
+                    fallbacks.push(npm.join("claude.exe"));
+                    fallbacks.push(npm.join("claude.cmd"));
+                    fallbacks.push(npm.join("claude.bat"));
+                }
+            }
+            SourceKind::Codex => {
+                if let Some(roaming) = &app_data {
+                    let npm = roaming.join("npm");
+                    fallbacks.push(npm.join("codex.exe"));
+                    fallbacks.push(npm.join("codex.cmd"));
+                    fallbacks.push(npm.join("codex.bat"));
+                }
+                if let Some(home) = &user_profile {
+                    fallbacks.push(home.join(".local").join("bin").join("codex.exe"));
+                }
+            }
+            SourceKind::GeminiCli => {
+                if let Some(roaming) = &app_data {
+                    let npm = roaming.join("npm");
+                    fallbacks.push(npm.join("gemini.exe"));
+                    fallbacks.push(npm.join("gemini.cmd"));
+                    fallbacks.push(npm.join("gemini.bat"));
+                }
+                if let Some(home) = &user_profile {
+                    fallbacks.push(home.join(".local").join("bin").join("gemini.exe"));
+                }
+            }
+            SourceKind::App | SourceKind::Ide => return None,
         }
-        SourceKind::ClaudeCode => {
-            if let Some(home) = &user_profile {
-                fallbacks.push(home.join(".local").join("bin").join("claude.exe"));
-            }
-            if let Some(local) = &local_app_data {
-                fallbacks.push(local.join("Programs").join("claude").join("claude.exe"));
-            }
-            if let Some(roaming) = &app_data {
-                let npm = roaming.join("npm");
-                fallbacks.push(npm.join("claude.exe"));
-                fallbacks.push(npm.join("claude.cmd"));
-                fallbacks.push(npm.join("claude.bat"));
-            }
-        }
-        SourceKind::Codex => {
-            if let Some(roaming) = &app_data {
-                let npm = roaming.join("npm");
-                fallbacks.push(npm.join("codex.exe"));
-                fallbacks.push(npm.join("codex.cmd"));
-                fallbacks.push(npm.join("codex.bat"));
-            }
-            if let Some(home) = &user_profile {
-                fallbacks.push(home.join(".local").join("bin").join("codex.exe"));
-            }
-        }
-        SourceKind::GeminiCli => {
-            if let Some(roaming) = &app_data {
-                let npm = roaming.join("npm");
-                fallbacks.push(npm.join("gemini.exe"));
-                fallbacks.push(npm.join("gemini.cmd"));
-                fallbacks.push(npm.join("gemini.bat"));
-            }
-            if let Some(home) = &user_profile {
-                fallbacks.push(home.join(".local").join("bin").join("gemini.exe"));
-            }
-        }
-        SourceKind::App | SourceKind::Ide => return None,
-    }
-    first_existing_file(&fallbacks)
+        first_existing_file(&fallbacks)
+    })
 }
 
 /// Resolves `agy` (`.exe`/`.cmd`/`.bat`) via `PATH`, falling back to `%LOCALAPPDATA%\agy\bin`.
@@ -413,30 +608,277 @@ pub fn resolve_agy_exe() -> Option<PathBuf> {
 }
 
 fn resolve_wt_exe() -> Option<PathBuf> {
-    if let Some(found) = find_exe_in_path(&["wt.exe"]) {
-        return Some(found);
-    }
-    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
-    let fallback = PathBuf::from(local_app_data)
-        .join("Microsoft")
-        .join("WindowsApps")
-        .join("wt.exe");
-    if is_existing_executable_entry(&fallback) {
-        Some(fallback)
-    } else {
-        None
-    }
+    resolve_cached_exe("wt", || {
+        if let Some(found) = find_exe_in_path(&["wt.exe"]) {
+            return Some(found);
+        }
+        let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+        let fallback = PathBuf::from(local_app_data)
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("wt.exe");
+        if is_existing_executable_entry(&fallback) {
+            Some(fallback)
+        } else {
+            None
+        }
+    })
 }
 
 fn resolve_pwsh_exe() -> Option<PathBuf> {
-    if let Some(found) = find_exe_in_path(&["pwsh.exe", "powershell.exe"]) {
-        return Some(found);
+    resolve_cached_exe("pwsh", || {
+        if let Some(found) = find_exe_in_path(&["pwsh.exe", "powershell.exe"]) {
+            return Some(found);
+        }
+        let pwsh7 = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        if is_existing_executable_entry(&pwsh7) {
+            return Some(pwsh7);
+        }
+        if let Some(sys_root) = std::env::var_os("SystemRoot") {
+            let win_ps = PathBuf::from(sys_root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if is_existing_executable_entry(&win_ps) {
+                return Some(win_ps);
+            }
+        }
+        None
+    })
+}
+
+fn resolve_wezterm_exe() -> Option<PathBuf> {
+    resolve_cached_exe("wezterm", || {
+        if let Some(found) = find_exe_in_path(&["wezterm.exe", "wezterm-gui.exe"]) {
+            return Some(found);
+        }
+        let mut fallbacks = Vec::new();
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            let dir = PathBuf::from(pf).join("WezTerm");
+            fallbacks.push(dir.join("wezterm.exe"));
+            fallbacks.push(dir.join("wezterm-gui.exe"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let dir = PathBuf::from(local).join("Programs").join("WezTerm");
+            fallbacks.push(dir.join("wezterm.exe"));
+            fallbacks.push(dir.join("wezterm-gui.exe"));
+        }
+        first_existing_file(&fallbacks)
+    })
+}
+
+fn resolve_alacritty_exe() -> Option<PathBuf> {
+    resolve_cached_exe("alacritty", || {
+        if let Some(found) = find_exe_in_path(&["alacritty.exe"]) {
+            return Some(found);
+        }
+        let mut fallbacks = Vec::new();
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            fallbacks.push(PathBuf::from(pf).join("Alacritty").join("alacritty.exe"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            fallbacks.push(
+                PathBuf::from(local)
+                    .join("Programs")
+                    .join("Alacritty")
+                    .join("alacritty.exe"),
+            );
+        }
+        first_existing_file(&fallbacks)
+    })
+}
+
+fn resolve_git_bash_exe() -> Option<PathBuf> {
+    resolve_cached_exe("git-bash", || {
+        if let Some(found) = find_exe_in_path(&["git-bash.exe"]) {
+            return Some(found);
+        }
+        let mut fallbacks = Vec::new();
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            fallbacks.push(PathBuf::from(pf).join("Git").join("git-bash.exe"));
+        }
+        if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
+            fallbacks.push(PathBuf::from(pf86).join("Git").join("git-bash.exe"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            fallbacks.push(
+                PathBuf::from(local)
+                    .join("Programs")
+                    .join("Git")
+                    .join("git-bash.exe"),
+            );
+        }
+        first_existing_file(&fallbacks)
+    })
+}
+
+/// Lazily probes availability of built-in terminal executables (backed by `EXE_CACHE`).
+/// Only call on context-menu open, never on timers.
+pub fn probe_terminal_availability() -> TerminalAvailability {
+    TerminalAvailability {
+        wt: resolve_wt_exe().is_some(),
+        pwsh: resolve_pwsh_exe().is_some(),
+        wezterm: resolve_wezterm_exe().is_some(),
+        alacritty: resolve_alacritty_exe().is_some(),
+        git_bash: resolve_git_bash_exe().is_some(),
     }
-    let pwsh7 = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
-    if pwsh7.is_file() {
-        return Some(pwsh7);
+}
+
+/// Default path for optional companion `terminal.json` beside `gauge.exe`.
+pub fn default_terminal_config_path() -> Option<PathBuf> {
+    default_companion_path("terminal.json")
+}
+
+/// Parses optional `terminal.json` content and overlays present fields onto `base`.
+pub fn parse_terminal_json(raw: &str, base: &TerminalConfig) -> Result<TerminalConfig, String> {
+    let val: Value =
+        serde_json::from_str(raw).map_err(|e| format!("terminal.json 解析失败: {e}"))?;
+    let Some(obj) = val.as_object() else {
+        return Err("terminal.json 根节点必须为 JSON 对象".to_string());
+    };
+    let mut cfg = base.clone();
+    if let Some(preset_str) = obj.get("preset").and_then(Value::as_str) {
+        if let Some(p) = TerminalPreset::parse_str(preset_str) {
+            cfg.preset = p;
+        }
     }
-    None
+    if let Some(prof) = obj.get("wt_profile").and_then(Value::as_str) {
+        let trimmed = prof.trim();
+        cfg.wt_profile = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(nw) = obj.get("wt_new_window").and_then(Value::as_bool) {
+        cfg.wt_new_window = nw;
+    }
+    if let Some(ko) = obj.get("keep_shell_open").and_then(Value::as_bool) {
+        cfg.keep_shell_open = ko;
+    }
+    if let Some(custom_obj) = obj.get("custom").and_then(Value::as_object) {
+        let exe = custom_obj
+            .get("exe")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let args: Vec<String> = custom_obj
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !exe.trim().is_empty() {
+            cfg.custom = Some(CustomTerminalConfig { exe, args });
+        } else {
+            cfg.custom = None;
+        }
+    }
+    Ok(cfg)
+}
+
+/// Loads `terminal.json` from `path` (if present & non-symlink) and merges onto `base`.
+pub fn load_terminal_config_from(path: &Path, base: TerminalConfig) -> TerminalConfig {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return base;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return base;
+    }
+    match fs::read_to_string(path) {
+        Ok(raw) => parse_terminal_json(&raw, &base).unwrap_or(base),
+        Err(_) => base,
+    }
+}
+
+/// Loads optional `terminal.json` beside `gauge.exe` lazily on demand and overlays onto `base`.
+pub fn load_effective_terminal_config(base: TerminalConfig) -> TerminalConfig {
+    match default_terminal_config_path() {
+        Some(path) => load_terminal_config_from(&path, base),
+        None => base,
+    }
+}
+
+/// When `terminal.json` already exists beside `gauge.exe`, updates its `preset`, `wt_new_window`,
+/// and `keep_shell_open` keys atomically while preserving `wt_profile`, `custom`, and any unknown keys.
+/// Does nothing if `terminal.json` does not exist.
+pub fn sync_ui_prefs_to_terminal_json_if_exists(
+    path: &Path,
+    preset: TerminalPreset,
+    wt_new_window: bool,
+    keep_shell_open: bool,
+) -> Result<(), String> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Ok(());
+    }
+    let mut map: Map<String, Value> = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    map.insert("preset".to_string(), Value::String(preset.as_str().to_string()));
+    map.insert("wt_new_window".to_string(), Value::Bool(wt_new_window));
+    map.insert("keep_shell_open".to_string(), Value::Bool(keep_shell_open));
+    let body = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|e| format!("序列化 terminal.json 失败: {e}"))?;
+    atomic_write_json(path, &format!("{body}\n"))
+}
+
+/// Creates a clean template `terminal.json` inside `dir` ONLY if one does not already exist,
+/// returning its path. Never overwrites existing user configuration.
+pub fn ensure_default_terminal_json(dir: &Path, current: &TerminalConfig) -> Result<PathBuf, String> {
+    let path = dir.join("terminal.json");
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err("拒绝使用符号链接 terminal.json".to_string());
+        }
+        if meta.is_file() {
+            return Ok(path);
+        }
+    }
+    let custom_exe = current
+        .custom
+        .as_ref()
+        .map(|c| c.exe.as_str())
+        .unwrap_or("");
+    let custom_args: Vec<String> = current
+        .custom
+        .as_ref()
+        .filter(|c| !c.args.is_empty())
+        .map(|c| c.args.clone())
+        .unwrap_or_else(|| {
+            vec![
+                "--working-directory".to_string(),
+                "{dir}".to_string(),
+                "-e".to_string(),
+                "{pwsh}".to_string(),
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                "{cmd}".to_string(),
+            ]
+        });
+    let doc = json!({
+        "preset": current.preset.as_str(),
+        "wt_profile": current.wt_profile.as_deref().unwrap_or(""),
+        "wt_new_window": current.wt_new_window,
+        "keep_shell_open": current.keep_shell_open,
+        "custom": {
+            "exe": custom_exe,
+            "args": custom_args,
+        }
+    });
+    let body = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("序列化 terminal.json 模板失败: {e}"))?;
+    atomic_write_json(&path, &format!("{body}\n"))?;
+    Ok(path)
 }
 
 fn user_home_dir() -> PathBuf {
@@ -452,6 +894,11 @@ fn user_home_dir() -> PathBuf {
 /// Wraps text in PowerShell single-quoted literal syntax (`'` escaped as `''`).
 pub fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Wraps text in POSIX sh/bash single-quoted literal syntax (`'` escaped as `'\''`).
+pub fn posix_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn is_cmd_safe_path_str(exe_str: &str) -> bool {
@@ -582,6 +1029,36 @@ fn escape_wt_token(s: &str) -> String {
     s.replace(';', r"\;")
 }
 
+fn sanitize_wt_profile(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    Some(escape_wt_token(trimmed))
+}
+
+fn build_pwsh_command_str(exe_str: &str, resume_arg: &str, cid: &str) -> String {
+    format!("& {} {} {}", ps_single_quote(exe_str), resume_arg, cid)
+}
+
+fn build_pwsh_args_inner(
+    spec: ResumeCliSpec,
+    exe_str: &str,
+    cid: &str,
+    keep_shell_open: bool,
+) -> Vec<String> {
+    let cmd = build_pwsh_command_str(exe_str, spec.resume_arg, cid);
+    let mut args = Vec::with_capacity(4);
+    args.push("-NoLogo".to_string());
+    if keep_shell_open {
+        args.push("-NoExit".to_string());
+    }
+    args.push("-Command".to_string());
+    args.push(cmd);
+    args
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_wt_args_inner(
     spec: ResumeCliSpec,
     cli_exe: &Path,
@@ -589,36 +1066,40 @@ fn build_wt_args_inner(
     cid: &str,
     work_dir: &Path,
     tab_title: Option<&str>,
-    shim_shell_exe: Option<&Path>,
+    shell_exe: Option<&Path>,
+    wrap_in_pwsh: bool,
+    wt_profile: Option<&str>,
+    wt_new_window: bool,
+    keep_shell_open: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-w".to_string(),
-        "0".to_string(),
+        if wt_new_window { "new" } else { "0" }.to_string(),
         "new-tab".to_string(),
-        "-d".to_string(),
-        escape_wt_dir_arg(work_dir),
     ];
+    if let Some(prof) = wt_profile.and_then(sanitize_wt_profile) {
+        args.push("-p".to_string());
+        args.push(prof);
+    }
+    args.push("-d".to_string());
+    args.push(escape_wt_dir_arg(work_dir));
     if let Some(title) = tab_title.and_then(sanitize_wt_title) {
         args.push("--title".to_string());
         args.push(title);
     }
     args.push("--".to_string());
-    if is_batch_shim(cli_exe) {
-        // Windows Terminal cannot spawn `.cmd`/`.bat` shims directly via CreateProcessW;
-        // wrap via PowerShell single-quoted call operator so paths with spaces, `(x86)`,
-        // apostrophes, or `;` work safely with zero cmd quote-stripping or injection issues.
-        let shell_token = shim_shell_exe
+    if wrap_in_pwsh || is_batch_shim(cli_exe) {
+        // Launch inside PowerShell so `$PROFILE` loads, batch `.cmd`/`.bat` shims work safely
+        // with zero cmd quote-stripping issues, and `keep_shell_open` controls `-NoExit`.
+        let shell_token = shell_exe
             .map(|p| escape_wt_token(&p.to_string_lossy()))
             .unwrap_or_else(|| "powershell.exe".to_string());
-        let ps_cmd = format!(
-            "& {} {} {}",
-            ps_single_quote(exe_str),
-            spec.resume_arg,
-            cid
-        );
+        let ps_cmd = build_pwsh_command_str(exe_str, spec.resume_arg, cid);
         args.push(shell_token);
         args.push("-NoLogo".to_string());
-        args.push("-NoExit".to_string());
+        if keep_shell_open {
+            args.push("-NoExit".to_string());
+        }
         args.push("-Command".to_string());
         args.push(escape_wt_token(&ps_cmd));
     } else {
@@ -629,8 +1110,43 @@ fn build_wt_args_inner(
     args
 }
 
-/// Builds the argument vector for `wt.exe` to resume a session of `source` in `work_dir`.
-/// Handles both native `.exe` binaries and Windows `.cmd`/`.bat` shims safely.
+/// Builds the argument vector for `wt.exe` under `TerminalPreset::WtPwsh` (PowerShell inside
+/// Windows Terminal, with optional `-p <profile>`, `-w new`/`-w 0`, and optional `-NoExit`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_wt_pwsh_args_for_source(
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    work_dir: &Path,
+    tab_title: Option<&str>,
+    pwsh_exe: Option<&Path>,
+    wt_profile: Option<&str>,
+    wt_new_window: bool,
+    keep_shell_open: bool,
+) -> Result<Vec<String>, String> {
+    if !validate_conversation_id(cid) {
+        return Err("无效的会话 ID".to_string());
+    }
+    let spec = resume_cli_spec(source)
+        .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
+    let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
+    Ok(build_wt_args_inner(
+        spec,
+        cli_exe,
+        &exe_str,
+        cid,
+        work_dir,
+        tab_title,
+        pwsh_exe,
+        true,
+        wt_profile,
+        wt_new_window,
+        keep_shell_open,
+    ))
+}
+
+/// Builds the argument vector for `wt.exe` to resume a session of `source` in `work_dir`
+/// (direct `.exe` mode; still wraps `.cmd`/`.bat` shims in PowerShell safely).
 pub fn build_wt_args_for_source(
     source: SourceKind,
     cli_exe: &Path,
@@ -645,7 +1161,7 @@ pub fn build_wt_args_for_source(
         .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
     let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
     Ok(build_wt_args_inner(
-        spec, cli_exe, &exe_str, cid, work_dir, tab_title, None,
+        spec, cli_exe, &exe_str, cid, work_dir, tab_title, None, false, None, false, true,
     ))
 }
 
@@ -662,15 +1178,27 @@ pub fn build_wt_args(
         resume_arg: "--conversation",
     };
     let exe_str = agy_exe.to_string_lossy();
-    build_wt_args_inner(spec, agy_exe, &exe_str, cid, work_dir, tab_title, None)
+    build_wt_args_inner(
+        spec, agy_exe, &exe_str, cid, work_dir, tab_title, None, false, None, false, true,
+    )
 }
 
-/// Builds the argument vector for `pwsh.exe` / `powershell.exe` fallback launch for `source`.
+/// Builds the argument vector for `pwsh.exe` / `powershell.exe` launch for `source`.
 /// Safely single-quotes both `.exe` and `.cmd`/`.bat` paths.
 pub fn build_pwsh_args_for_source(
     source: SourceKind,
     cli_exe: &Path,
     cid: &str,
+) -> Result<Vec<String>, String> {
+    build_pwsh_args_for_source_with_opts(source, cli_exe, cid, true)
+}
+
+/// Builds the argument vector for `pwsh.exe` / `powershell.exe` with configurable `-NoExit`.
+pub fn build_pwsh_args_for_source_with_opts(
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    keep_shell_open: bool,
 ) -> Result<Vec<String>, String> {
     if !validate_conversation_id(cid) {
         return Err("无效的会话 ID".to_string());
@@ -678,33 +1206,247 @@ pub fn build_pwsh_args_for_source(
     let spec = resume_cli_spec(source)
         .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
     let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
-    let cmd = format!(
-        "& {} {} {}",
-        ps_single_quote(&exe_str),
-        spec.resume_arg,
-        cid
-    );
-    Ok(vec![
-        "-NoLogo".to_string(),
-        "-NoExit".to_string(),
-        "-Command".to_string(),
-        cmd,
-    ])
+    Ok(build_pwsh_args_inner(spec, &exe_str, cid, keep_shell_open))
 }
 
 /// Builds the argument vector for `pwsh.exe` / `powershell.exe` fallback launch for Antigravity CLI.
 pub fn build_pwsh_args(agy_exe: &Path, cid: &str) -> Vec<String> {
-    let cmd = format!(
-        "& {} --conversation {}",
-        ps_single_quote(&agy_exe.to_string_lossy()),
+    let spec = ResumeCliSpec {
+        source: SourceKind::Cli,
+        command_name: "agy",
+        resume_arg: "--conversation",
+    };
+    build_pwsh_args_inner(spec, &agy_exe.to_string_lossy(), cid, true)
+}
+
+fn build_sub_shell_or_cli_argv(
+    spec: ResumeCliSpec,
+    cli_exe: &Path,
+    exe_str: &str,
+    cid: &str,
+    pwsh_exe: Option<&Path>,
+    keep_shell_open: bool,
+) -> Vec<String> {
+    if keep_shell_open || is_batch_shim(cli_exe) {
+        let shell_bin = pwsh_exe
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "powershell.exe".to_string());
+        let mut argv = vec![shell_bin];
+        argv.extend(build_pwsh_args_inner(spec, exe_str, cid, keep_shell_open));
+        argv
+    } else {
+        vec![
+            exe_str.to_string(),
+            spec.resume_arg.to_string(),
+            cid.to_string(),
+        ]
+    }
+}
+
+/// Builds the argument vector for `wezterm start --cwd <dir> -- <pwsh_or_cli ...>`.
+pub fn build_wezterm_args_for_source(
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    work_dir: &Path,
+    pwsh_exe: Option<&Path>,
+    keep_shell_open: bool,
+) -> Result<Vec<String>, String> {
+    if !validate_conversation_id(cid) {
+        return Err("无效的会话 ID".to_string());
+    }
+    let spec = resume_cli_spec(source)
+        .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
+    let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
+    let mut args = vec![
+        "start".to_string(),
+        "--cwd".to_string(),
+        work_dir.to_string_lossy().into_owned(),
+        "--".to_string(),
+    ];
+    args.extend(build_sub_shell_or_cli_argv(
+        spec,
+        cli_exe,
+        &exe_str,
+        cid,
+        pwsh_exe,
+        keep_shell_open,
+    ));
+    Ok(args)
+}
+
+/// Builds the argument vector for `alacritty --working-directory <dir> -e <pwsh_or_cli ...>`.
+pub fn build_alacritty_args_for_source(
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    work_dir: &Path,
+    pwsh_exe: Option<&Path>,
+    keep_shell_open: bool,
+) -> Result<Vec<String>, String> {
+    if !validate_conversation_id(cid) {
+        return Err("无效的会话 ID".to_string());
+    }
+    let spec = resume_cli_spec(source)
+        .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
+    let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
+    let mut args = vec![
+        "--working-directory".to_string(),
+        work_dir.to_string_lossy().into_owned(),
+        "-e".to_string(),
+    ];
+    args.extend(build_sub_shell_or_cli_argv(
+        spec,
+        cli_exe,
+        &exe_str,
+        cid,
+        pwsh_exe,
+        keep_shell_open,
+    ));
+    Ok(args)
+}
+
+/// Builds the argument vector for `git-bash.exe --cd=<dir> -c "<quoted_cmd>[; exec bash]"`.
+/// Safely POSIX-single-quotes the executable path so spaces, `$()`, backticks, quotes, or `;`
+/// cannot inject shell commands.
+pub fn build_git_bash_args_for_source(
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    work_dir: &Path,
+    keep_shell_open: bool,
+) -> Result<Vec<String>, String> {
+    if !validate_conversation_id(cid) {
+        return Err("无效的会话 ID".to_string());
+    }
+    let spec = resume_cli_spec(source)
+        .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
+    let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
+    let exe_posix = exe_str.replace('\\', "/");
+    let cd_dir = work_dir.to_string_lossy().replace('\\', "/");
+    let base_cmd = format!(
+        "{} {} {}",
+        posix_single_quote(&exe_posix),
+        spec.resume_arg,
         cid
     );
-    vec![
-        "-NoLogo".to_string(),
-        "-NoExit".to_string(),
-        "-Command".to_string(),
-        cmd,
-    ]
+    let bash_cmd = if keep_shell_open {
+        format!("{base_cmd}; exec bash")
+    } else {
+        base_cmd
+    };
+    Ok(vec![
+        format!("--cd={cd_dir}"),
+        "-c".to_string(),
+        bash_cmd,
+    ])
+}
+
+struct CustomTemplateVars<'a> {
+    dir: &'a str,
+    exe: &'a str,
+    arg: &'a str,
+    cid: &'a str,
+    title: &'a str,
+    cmd: &'a str,
+    pwsh: &'a str,
+}
+
+fn expand_custom_arg_template(tpl: &str, vars: &CustomTemplateVars<'_>) -> String {
+    // Single-pass scanner so substituted values containing `{cid}` / `{dir}` are never re-expanded.
+    let mut out = String::with_capacity(tpl.len() + 32);
+    let mut rest = tpl;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        let matched = [
+            ("{dir}", vars.dir),
+            ("{exe}", vars.exe),
+            ("{arg}", vars.arg),
+            ("{cid}", vars.cid),
+            ("{title}", vars.title),
+            ("{cmd}", vars.cmd),
+            ("{pwsh}", vars.pwsh),
+        ]
+        .into_iter()
+        .find(|(tok, _)| rest.starts_with(tok));
+        if let Some((tok, val)) = matched {
+            out.push_str(val);
+            rest = &rest[tok.len()..];
+        } else {
+            out.push('{');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolves and validates a custom terminal executable + expands `custom.args` placeholders
+/// (`{dir}`, `{exe}`, `{arg}`, `{cid}`, `{title}`, `{cmd}`, `{pwsh}`) for direct `Command::args`
+/// execution with zero shell concatenation.
+#[allow(clippy::too_many_arguments)]
+pub fn build_custom_terminal_launch(
+    custom: &CustomTerminalConfig,
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    work_dir: &Path,
+    tab_title: Option<&str>,
+    pwsh_exe: Option<&Path>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if !validate_conversation_id(cid) {
+        return Err("无效的会话 ID，拒绝启动终端".to_string());
+    }
+    let spec = resume_cli_spec(source)
+        .map_err(|_| format!("{} 会话暂不支持通过终端 CLI 恢复", source.label_short()))?;
+    let exe_str = validate_exe_path_for_shell(cli_exe, false, spec.command_name)?;
+
+    if custom.exe.chars().any(char::is_control) {
+        return Err("terminal.json 中 custom.exe 包含控制字符".to_string());
+    }
+    let raw_exe = custom.exe.trim();
+    if raw_exe.is_empty() {
+        return Err("terminal.json 中 custom.exe 为空".to_string());
+    }
+    let resolved_custom_exe = {
+        let direct = PathBuf::from(raw_exe);
+        if direct.components().count() > 1 || direct.is_absolute() {
+            if is_existing_executable_entry(&direct) {
+                direct
+            } else {
+                return Err(format!("自定义终端可执行文件不存在或为目录: {raw_exe}"));
+            }
+        } else if let Some(in_path) = find_exe_in_path(&[raw_exe]) {
+            in_path
+        } else if is_existing_executable_entry(&direct) {
+            direct
+        } else {
+            return Err(format!("未在 PATH 中找到自定义终端可执行文件: {raw_exe}"));
+        }
+    };
+
+    let dir_str = work_dir.to_string_lossy().into_owned();
+    let title_str = tab_title.and_then(sanitize_wt_title).unwrap_or_default();
+    let cmd_str = build_pwsh_command_str(&exe_str, spec.resume_arg, cid);
+    let pwsh_str = pwsh_exe
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "powershell.exe".to_string());
+    let vars = CustomTemplateVars {
+        dir: &dir_str,
+        exe: &exe_str,
+        arg: spec.resume_arg,
+        cid,
+        title: &title_str,
+        cmd: &cmd_str,
+        pwsh: &pwsh_str,
+    };
+    let expanded: Vec<String> = custom
+        .args
+        .iter()
+        .map(|tpl| expand_custom_arg_template(tpl, &vars))
+        .collect();
+    Ok((resolved_custom_exe, expanded))
 }
 
 /// Builds the raw command string passed inside outer quotes after `cmd.exe /D /K` via
@@ -746,14 +1488,74 @@ fn resolve_launch_dir(ws: Option<&Path>) -> (PathBuf, bool) {
     }
 }
 
-/// Non-blockingly spawns a terminal window/tab to resume a session of `source` (`agy`, `claude`,
-/// `codex`, or `gemini`) in `ws`. Falls back to `%USERPROFILE%` when `ws` is missing or deleted
-/// (`workspace_fallback = true`). Fallback chain: `wt.exe` -> `pwsh.exe`/`powershell.exe` -> `cmd.exe /D /K`.
-pub fn launch_resume_session_for_source(
+fn spawn_wt(wt_args: &[String]) -> bool {
+    let spawn_with = |program: &OsStr| {
+        Command::new(program)
+            .args(wt_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    };
+    if let Some(wt_exe) = resolve_wt_exe() {
+        if spawn_with(wt_exe.as_os_str()) {
+            return true;
+        }
+    }
+    // App Execution Alias fallback: try bare `wt.exe` via CreateProcessW PATH resolution.
+    spawn_with(OsStr::new("wt.exe"))
+}
+
+fn spawn_pwsh_console(
+    pwsh_exe: &Path,
+    used_dir: &Path,
+    pwsh_args: &[String],
+) -> bool {
+    Command::new(pwsh_exe)
+        .current_dir(used_dir)
+        .args(pwsh_args)
+        .creation_flags(CREATE_NEW_CONSOLE.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+fn spawn_cmd_console(
+    source: SourceKind,
+    cli_exe: &Path,
+    cid: &str,
+    used_dir: &Path,
+    keep_shell_open: bool,
+) -> Result<(), String> {
+    let raw_inner = build_cmd_k_raw_arg_for_source(source, cli_exe, cid)?;
+    let cmd_raw = format!("\"{}\"", raw_inner);
+    let mode_flag = if keep_shell_open { "/K" } else { "/C" };
+    Command::new("cmd.exe")
+        .current_dir(used_dir)
+        .arg("/D")
+        .arg(mode_flag)
+        .raw_arg(OsStr::new(&cmd_raw))
+        .creation_flags(CREATE_NEW_CONSOLE.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("启动终端失败: {e}"))?;
+    Ok(())
+}
+
+/// Non-blockingly spawns the configured terminal backend to resume a session of `source`
+/// (`agy`, `claude`, `codex`, or `gemini`) in `ws`. Falls back to `%USERPROFILE%` when `ws`
+/// is missing or deleted (`workspace_fallback = true`).
+pub fn launch_resume_session_with_config(
     source: SourceKind,
     cid: &str,
     ws: Option<&Path>,
     tab_title: Option<&str>,
+    config: &TerminalConfig,
 ) -> Result<LaunchOutcome, String> {
     if !validate_conversation_id(cid) {
         return Err("无效的会话 ID，拒绝启动终端".to_string());
@@ -767,78 +1569,252 @@ pub fn launch_resume_session_for_source(
         )
     })?;
     let exe_str = validate_exe_path_for_shell(&cli_exe, false, spec.command_name)?;
+    fn get_pwsh<'a>(slot: &'a mut Option<Option<PathBuf>>) -> Option<&'a Path> {
+        slot.get_or_insert_with(resolve_pwsh_exe).as_deref()
+    }
     let (used_dir, workspace_fallback) = resolve_launch_dir(ws);
-    let pwsh_exe = resolve_pwsh_exe();
+    let mut pwsh_exe_slot: Option<Option<PathBuf>> = None;
 
-    if let Some(wt_exe) = resolve_wt_exe() {
-        let wt_args = build_wt_args_inner(
-            spec,
-            &cli_exe,
-            &exe_str,
-            cid,
-            &used_dir,
-            tab_title,
-            pwsh_exe.as_deref(),
-        );
-        if Command::new(&wt_exe)
-            .args(&wt_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok()
-        {
-            return Ok(LaunchOutcome {
-                backend: LaunchBackend::WindowsTerminal,
+    match config.preset {
+        TerminalPreset::WtPwsh => {
+            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let wt_args = build_wt_args_inner(
+                spec,
+                &cli_exe,
+                &exe_str,
+                cid,
+                &used_dir,
+                tab_title,
+                pwsh_opt,
+                true,
+                config.wt_profile.as_deref(),
+                config.wt_new_window,
+                config.keep_shell_open,
+            );
+            if spawn_wt(&wt_args) {
+                return Ok(LaunchOutcome {
+                    backend: LaunchBackend::WindowsTerminalPwsh,
+                    used_dir,
+                    workspace_fallback,
+                });
+            }
+            if let Some(pwsh) = get_pwsh(&mut pwsh_exe_slot) {
+                let pwsh_args = build_pwsh_args_inner(spec, &exe_str, cid, config.keep_shell_open);
+                if spawn_pwsh_console(pwsh, &used_dir, &pwsh_args) {
+                    return Ok(LaunchOutcome {
+                        backend: LaunchBackend::Pwsh,
+                        used_dir,
+                        workspace_fallback,
+                    });
+                }
+            }
+            spawn_cmd_console(source, &cli_exe, cid, &used_dir, config.keep_shell_open)?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::Cmd,
                 used_dir,
                 workspace_fallback,
-            });
+            })
         }
-    }
-
-    if let Some(pwsh) = pwsh_exe {
-        let pwsh_args = build_pwsh_args_for_source(source, &cli_exe, cid)?;
-        if Command::new(&pwsh)
-            .current_dir(&used_dir)
-            .args(&pwsh_args)
-            .creation_flags(CREATE_NEW_CONSOLE.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok()
-        {
-            return Ok(LaunchOutcome {
-                backend: LaunchBackend::Pwsh,
+        TerminalPreset::WtDirect => {
+            let shim_shell = if is_batch_shim(&cli_exe) {
+                get_pwsh(&mut pwsh_exe_slot)
+            } else {
+                None
+            };
+            let wt_args = build_wt_args_inner(
+                spec,
+                &cli_exe,
+                &exe_str,
+                cid,
+                &used_dir,
+                tab_title,
+                shim_shell,
+                false,
+                config.wt_profile.as_deref(),
+                config.wt_new_window,
+                config.keep_shell_open,
+            );
+            if spawn_wt(&wt_args) {
+                return Ok(LaunchOutcome {
+                    backend: LaunchBackend::WindowsTerminal,
+                    used_dir,
+                    workspace_fallback,
+                });
+            }
+            if let Some(pwsh) = get_pwsh(&mut pwsh_exe_slot) {
+                let pwsh_args = build_pwsh_args_inner(spec, &exe_str, cid, config.keep_shell_open);
+                if spawn_pwsh_console(pwsh, &used_dir, &pwsh_args) {
+                    return Ok(LaunchOutcome {
+                        backend: LaunchBackend::Pwsh,
+                        used_dir,
+                        workspace_fallback,
+                    });
+                }
+            }
+            spawn_cmd_console(source, &cli_exe, cid, &used_dir, config.keep_shell_open)?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::Cmd,
                 used_dir,
                 workspace_fallback,
-            });
+            })
+        }
+        TerminalPreset::Pwsh => {
+            let pwsh_args = build_pwsh_args_inner(spec, &exe_str, cid, config.keep_shell_open);
+            if let Some(pwsh) = get_pwsh(&mut pwsh_exe_slot) {
+                if spawn_pwsh_console(pwsh, &used_dir, &pwsh_args) {
+                    return Ok(LaunchOutcome {
+                        backend: LaunchBackend::Pwsh,
+                        used_dir,
+                        workspace_fallback,
+                    });
+                }
+            }
+            if spawn_pwsh_console(Path::new("powershell.exe"), &used_dir, &pwsh_args) {
+                return Ok(LaunchOutcome {
+                    backend: LaunchBackend::Pwsh,
+                    used_dir,
+                    workspace_fallback,
+                });
+            }
+            spawn_cmd_console(source, &cli_exe, cid, &used_dir, config.keep_shell_open)?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::Cmd,
+                used_dir,
+                workspace_fallback,
+            })
+        }
+        TerminalPreset::WezTerm => {
+            let wez = resolve_wezterm_exe().ok_or_else(|| {
+                "未检测到 WezTerm，请安装或在右键「恢复终端」中切换其他终端".to_string()
+            })?;
+            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let args = build_wezterm_args_for_source(
+                source,
+                &cli_exe,
+                cid,
+                &used_dir,
+                pwsh_opt,
+                config.keep_shell_open,
+            )?;
+            Command::new(&wez)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("启动 WezTerm 失败: {e}"))?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::WezTerm,
+                used_dir,
+                workspace_fallback,
+            })
+        }
+        TerminalPreset::Alacritty => {
+            let ala = resolve_alacritty_exe().ok_or_else(|| {
+                "未检测到 Alacritty，请安装或在右键「恢复终端」中切换其他终端".to_string()
+            })?;
+            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let args = build_alacritty_args_for_source(
+                source,
+                &cli_exe,
+                cid,
+                &used_dir,
+                pwsh_opt,
+                config.keep_shell_open,
+            )?;
+            Command::new(&ala)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("启动 Alacritty 失败: {e}"))?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::Alacritty,
+                used_dir,
+                workspace_fallback,
+            })
+        }
+        TerminalPreset::GitBash => {
+            let gb = resolve_git_bash_exe().ok_or_else(|| {
+                "未检测到 Git Bash，请安装 Git for Windows 或在右键「恢复终端」中切换其他终端"
+                    .to_string()
+            })?;
+            let args = build_git_bash_args_for_source(
+                source,
+                &cli_exe,
+                cid,
+                &used_dir,
+                config.keep_shell_open,
+            )?;
+            Command::new(&gb)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("启动 Git Bash 失败: {e}"))?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::GitBash,
+                used_dir,
+                workspace_fallback,
+            })
+        }
+        TerminalPreset::Cmd => {
+            spawn_cmd_console(source, &cli_exe, cid, &used_dir, config.keep_shell_open)?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::Cmd,
+                used_dir,
+                workspace_fallback,
+            })
+        }
+        TerminalPreset::Custom => {
+            let custom = config.custom.as_ref().ok_or_else(|| {
+                "请先在 terminal.json 中配置 custom.exe（右键托盘 -> 恢复终端 -> 打开 / 生成 terminal.json）"
+                    .to_string()
+            })?;
+            let pwsh_opt = get_pwsh(&mut pwsh_exe_slot);
+            let (custom_exe, args) = build_custom_terminal_launch(
+                custom,
+                source,
+                &cli_exe,
+                cid,
+                &used_dir,
+                tab_title,
+                pwsh_opt,
+            )?;
+            Command::new(&custom_exe)
+                .current_dir(&used_dir)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("启动自定义终端失败: {e}"))?;
+            Ok(LaunchOutcome {
+                backend: LaunchBackend::Custom,
+                used_dir,
+                workspace_fallback,
+            })
         }
     }
-
-    let raw_inner = build_cmd_k_raw_arg_for_source(source, &cli_exe, cid)?;
-    let cmd_raw = format!("\"{}\"", raw_inner);
-    Command::new("cmd.exe")
-        .current_dir(&used_dir)
-        .arg("/D")
-        .arg("/K")
-        .raw_arg(OsStr::new(&cmd_raw))
-        .creation_flags(CREATE_NEW_CONSOLE.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("启动终端失败: {e}"))?;
-
-    Ok(LaunchOutcome {
-        backend: LaunchBackend::Cmd,
-        used_dir,
-        workspace_fallback,
-    })
 }
 
-/// Convenience wrapper launching the matching agent CLI directly from `SessionInfo`.
-pub fn launch_resume_for_session(session: &SessionInfo) -> Result<LaunchOutcome, String> {
+/// Non-blockingly spawns a terminal window/tab using the default `TerminalConfig` (`WtPwsh`).
+pub fn launch_resume_session_for_source(
+    source: SourceKind,
+    cid: &str,
+    ws: Option<&Path>,
+    tab_title: Option<&str>,
+) -> Result<LaunchOutcome, String> {
+    launch_resume_session_with_config(source, cid, ws, tab_title, &TerminalConfig::default())
+}
+
+/// Convenience wrapper launching the matching agent CLI directly from `SessionInfo` with `config`.
+pub fn launch_resume_for_session_with_config(
+    session: &SessionInfo,
+    config: &TerminalConfig,
+) -> Result<LaunchOutcome, String> {
     if session.is_archived {
         return Err(BlockedReason::ArchivedOnly.message_cn().to_string());
     }
@@ -846,12 +1822,18 @@ pub fn launch_resume_for_session(session: &SessionInfo) -> Result<LaunchOutcome,
         return Err(BlockedReason::SubagentOnly.message_cn().to_string());
     }
     let ws = normalize_workspace_path_str(&session.workspace).map(PathBuf::from);
-    launch_resume_session_for_source(
+    launch_resume_session_with_config(
         session.source,
         &session.conversation_id,
         ws.as_deref(),
         Some(&session.title),
+        config,
     )
+}
+
+/// Convenience wrapper launching the matching agent CLI directly from `SessionInfo` with default config.
+pub fn launch_resume_for_session(session: &SessionInfo) -> Result<LaunchOutcome, String> {
+    launch_resume_for_session_with_config(session, &TerminalConfig::default())
 }
 
 /// Non-blockingly spawns a terminal window/tab to resume `agy --conversation <cid>` in `ws`.
@@ -893,10 +1875,44 @@ pub fn open_workspace_folder(hwnd: HWND, ws: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Opens a local file (e.g., `terminal.json`) with the user's default editor via `ShellExecuteW`,
+/// falling back to `"edit"` or opening its parent folder in Explorer if unassociated.
+pub fn open_file_in_shell(hwnd: HWND, path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("文件不存在，无法打开".to_string());
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    for verb in [w!("open"), w!("edit")] {
+        let res = unsafe {
+            ShellExecuteW(
+                hwnd,
+                verb,
+                PCWSTR(wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (res.0 as isize) > 32 {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = open_workspace_folder(hwnd, &parent.to_string_lossy());
+        return Ok(());
+    }
+    Err("打开 terminal.json 失败".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::TokenCounts;
+    use crate::stats::{intern_str, TokenCounts};
     use std::collections::BTreeSet;
 
     fn mk_session(
@@ -915,9 +1931,13 @@ mod tests {
             is_subagent,
             parent_id: parent_id.map(String::from),
             parent_title: String::new(),
-            turns: Vec::new(),
+            turns: Vec::new().into(),
             counts: TokenCounts::default(),
             models: BTreeSet::new(),
+            primary_model: intern_str("-"),
+            active_duration_secs: 0,
+            compaction_count: 0,
+            thinking_turns: 0,
             first_time: None,
             last_time: None,
             last_file_mtime_utc: None,
@@ -1347,5 +2367,315 @@ mod tests {
         assert!(build_wt_args_for_source(SourceKind::App, agy, cid, Path::new(r"C:\"), None).is_err());
         assert!(build_pwsh_args_for_source(SourceKind::Ide, agy, cid).is_err());
         assert!(build_cmd_k_raw_arg_for_source(SourceKind::App, agy, cid).is_err());
+    }
+
+    #[test]
+    fn test_wt_pwsh_and_builtin_terminal_builders_and_quoting() {
+        let cid = "8c1095e2-1558-4a06-bfde-446204f978aa";
+        let agy = Path::new(r"C:\Program Files\O'Brien;Dir\agy.exe");
+        let claude_cmd = Path::new(r"C:\Users\Alice Smith\AppData\Roaming\npm\claude.cmd");
+        let pwsh7 = Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        let ws = Path::new(r"C:\Users\alice\my proj");
+
+        // 1) WtPwsh default: -w 0, -p <profile>, -NoLogo, -NoExit, escaped `;` and `'`
+        let wt_keep = build_wt_pwsh_args_for_source(
+            SourceKind::Cli,
+            agy,
+            cid,
+            ws,
+            Some("Work; Tab"),
+            Some(pwsh7),
+            Some("PowerShell (proxy);bad"),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            wt_keep,
+            vec![
+                "-w",
+                "0",
+                "new-tab",
+                "-p",
+                r"PowerShell (proxy)\;bad",
+                "-d",
+                r"C:\Users\alice\my proj",
+                "--title",
+                "Work Tab",
+                "--",
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                &format!("& 'C:\\Program Files\\O''Brien\\;Dir\\agy.exe' --conversation {cid}"),
+            ]
+        );
+
+        // 2) WtPwsh with wt_new_window=true, no profile, keep_shell_open=false (omits -NoExit!)
+        let wt_close = build_wt_pwsh_args_for_source(
+            SourceKind::ClaudeCode,
+            claude_cmd,
+            cid,
+            Path::new(r"C:\"),
+            None,
+            Some(pwsh7),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wt_close,
+            vec![
+                "-w",
+                "new",
+                "new-tab",
+                "-d",
+                r"C:\.",
+                "--",
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "-NoLogo",
+                "-Command",
+                &format!("& 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm\\claude.cmd' --resume {cid}"),
+            ]
+        );
+        assert!(!wt_close.iter().any(|a| a == "-NoExit"));
+        assert!(!wt_close.iter().any(|a| a == "-p"));
+
+        // 3) Standalone pwsh with keep_shell_open=false omits -NoExit
+        let ps_noexit_off =
+            build_pwsh_args_for_source_with_opts(SourceKind::Cli, agy, cid, false).unwrap();
+        assert_eq!(ps_noexit_off[0], "-NoLogo");
+        assert_eq!(ps_noexit_off[1], "-Command");
+        assert!(!ps_noexit_off.iter().any(|a| a == "-NoExit"));
+
+        // 4) WezTerm: keep_shell_open=true wraps in pwsh; false + native .exe runs CLI directly
+        let wez_keep = build_wezterm_args_for_source(
+            SourceKind::Codex,
+            agy,
+            cid,
+            ws,
+            Some(pwsh7),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            wez_keep,
+            vec![
+                "start",
+                "--cwd",
+                r"C:\Users\alice\my proj",
+                "--",
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                &format!("& 'C:\\Program Files\\O''Brien;Dir\\agy.exe' resume {cid}"),
+            ]
+        );
+        let wez_direct = build_wezterm_args_for_source(
+            SourceKind::Cli,
+            agy,
+            cid,
+            ws,
+            Some(pwsh7),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wez_direct,
+            vec![
+                "start",
+                "--cwd",
+                r"C:\Users\alice\my proj",
+                "--",
+                r"C:\Program Files\O'Brien;Dir\agy.exe",
+                "--conversation",
+                cid,
+            ]
+        );
+
+        // 5) Alacritty: --working-directory <dir> -e <pwsh_or_cli ...>
+        let ala = build_alacritty_args_for_source(
+            SourceKind::GeminiCli,
+            claude_cmd,
+            cid,
+            ws,
+            Some(pwsh7),
+            false,
+        )
+        .unwrap();
+        // `.cmd` shim still wraps in pwsh even when keep_shell_open=false (without -NoExit)
+        assert_eq!(
+            ala,
+            vec![
+                "--working-directory",
+                r"C:\Users\alice\my proj",
+                "-e",
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                "-NoLogo",
+                "-Command",
+                &format!("& 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm\\claude.cmd' --resume {cid}"),
+            ]
+        );
+
+        // 6) Git Bash: strict POSIX single-quoting prevents $(...) / backtick / quote injection
+        assert_eq!(posix_single_quote("a'b$(id)`x`"), r"'a'\''b$(id)`x`'");
+        let weird_exe = Path::new(r"C:\Users\O'Brien $(calc)\agy.exe");
+        let gb_keep = build_git_bash_args_for_source(SourceKind::Cli, weird_exe, cid, ws, true).unwrap();
+        assert_eq!(
+            gb_keep,
+            vec![
+                "--cd=C:/Users/alice/my proj",
+                "-c",
+                &format!("'C:/Users/O'\\''Brien $(calc)/agy.exe' --conversation {cid}; exec bash"),
+            ]
+        );
+        let gb_close = build_git_bash_args_for_source(SourceKind::Cli, weird_exe, cid, ws, false).unwrap();
+        assert!(!gb_close[2].contains("exec bash"));
+        assert!(build_git_bash_args_for_source(SourceKind::Cli, weird_exe, "bad;rm", ws, true).is_err());
+    }
+
+    #[test]
+    fn test_custom_terminal_template_expansion_security_and_terminal_json_roundtrip() {
+        let base = std::env::temp_dir().join(format!("gauge_term_cfg_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let fake_term = base.join("myterm.exe");
+        fs::write(&fake_term, "MZ").unwrap();
+        let fake_cli = base.join("agy.exe");
+        fs::write(&fake_cli, "MZ").unwrap();
+        let fake_dir = base.join("dir_not_exe");
+        fs::create_dir_all(&fake_dir).unwrap();
+        let pwsh7 = Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        let cid = "11111111-2222-3333-4444-555555555555";
+
+        // Single-pass template expansion: `{dir}` containing literal `{cid}` must NOT re-expand!
+        let ws_tricky = Path::new(r"C:\work\{cid}\proj");
+        let custom = CustomTerminalConfig {
+            exe: fake_term.to_string_lossy().into_owned(),
+            args: vec![
+                "--cwd".to_string(),
+                "{dir}".to_string(),
+                "--title={title}".to_string(),
+                "--".to_string(),
+                "{pwsh}".to_string(),
+                "-Command".to_string(),
+                "{cmd}".to_string(),
+                "{exe}".to_string(),
+                "{arg}".to_string(),
+                "{cid}".to_string(),
+            ],
+        };
+        let (exe_out, args_out) = build_custom_terminal_launch(
+            &custom,
+            SourceKind::Cli,
+            &fake_cli,
+            cid,
+            ws_tricky,
+            Some("My; Title"),
+            Some(pwsh7),
+        )
+        .unwrap();
+        assert_eq!(exe_out, fake_term);
+        assert_eq!(args_out[0], "--cwd");
+        assert_eq!(args_out[1], r"C:\work\{cid}\proj");
+        assert_eq!(args_out[2], "--title=My Title");
+        assert_eq!(args_out[4], r"C:\Program Files\PowerShell\7\pwsh.exe");
+        assert_eq!(
+            args_out[6],
+            format!("& '{}' --conversation {cid}", fake_cli.to_string_lossy())
+        );
+        assert_eq!(args_out[7], fake_cli.to_string_lossy());
+        assert_eq!(args_out[8], "--conversation");
+        assert_eq!(args_out[9], cid);
+
+        // Security rejections: bad cid, control chars in exe, missing exe, directory as exe
+        assert!(build_custom_terminal_launch(
+            &custom,
+            SourceKind::Cli,
+            &fake_cli,
+            "--evil",
+            ws_tricky,
+            None,
+            Some(pwsh7)
+        )
+        .is_err());
+        let bad_ctrl = CustomTerminalConfig {
+            exe: format!("{}\n", fake_term.to_string_lossy()),
+            args: vec![],
+        };
+        assert!(build_custom_terminal_launch(&bad_ctrl, SourceKind::Cli, &fake_cli, cid, ws_tricky, None, None).is_err());
+        let missing = CustomTerminalConfig {
+            exe: base.join("nope.exe").to_string_lossy().into_owned(),
+            args: vec![],
+        };
+        assert!(build_custom_terminal_launch(&missing, SourceKind::Cli, &fake_cli, cid, ws_tricky, None, None).is_err());
+        let is_dir = CustomTerminalConfig {
+            exe: fake_dir.to_string_lossy().into_owned(),
+            args: vec![],
+        };
+        assert!(build_custom_terminal_launch(&is_dir, SourceKind::Cli, &fake_cli, cid, ws_tricky, None, None).is_err());
+
+        // `ensure_default_terminal_json` creates valid template & round-trips cleanly
+        let def_cfg = TerminalConfig::default();
+        assert_eq!(def_cfg.preset, TerminalPreset::WtPwsh);
+        assert!(!def_cfg.wt_new_window);
+        assert!(def_cfg.keep_shell_open);
+        let cfg_path = ensure_default_terminal_json(&base, &def_cfg).unwrap();
+        assert!(cfg_path.is_file());
+        let loaded = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(loaded.preset, TerminalPreset::WtPwsh);
+        assert_eq!(loaded.wt_profile, None);
+        assert!(!loaded.wt_new_window);
+        assert!(loaded.keep_shell_open);
+        assert_eq!(loaded.custom, None); // empty custom.exe yields None
+
+        // Overlay custom + wt_profile + UI sync preserves wt_profile & custom!
+        let custom_json = json!({
+            "preset": "custom",
+            "wt_profile": "PowerShell (proxy)",
+            "wt_new_window": true,
+            "keep_shell_open": false,
+            "custom": {
+                "exe": fake_term.to_string_lossy(),
+                "args": ["-d", "{dir}", "{exe}", "{arg}", "{cid}"]
+            }
+        });
+        fs::write(&cfg_path, serde_json::to_string_pretty(&custom_json).unwrap()).unwrap();
+        let parsed = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(parsed.preset, TerminalPreset::Custom);
+        assert_eq!(parsed.wt_profile.as_deref(), Some("PowerShell (proxy)"));
+        assert!(parsed.wt_new_window);
+        assert!(!parsed.keep_shell_open);
+        assert_eq!(parsed.custom.as_ref().map(|c| c.args.len()), Some(5));
+
+        sync_ui_prefs_to_terminal_json_if_exists(&cfg_path, TerminalPreset::WtPwsh, false, true).unwrap();
+        let synced = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(synced.preset, TerminalPreset::WtPwsh);
+        assert!(!synced.wt_new_window);
+        assert!(synced.keep_shell_open);
+        assert_eq!(synced.wt_profile.as_deref(), Some("PowerShell (proxy)"));
+        assert!(synced.custom.is_some());
+
+        // `ensure_default_terminal_json` must NOT overwrite an existing file
+        let _ = ensure_default_terminal_json(&base, &TerminalConfig::default()).unwrap();
+        let kept = load_terminal_config_from(&cfg_path, TerminalConfig::default());
+        assert_eq!(kept.wt_profile.as_deref(), Some("PowerShell (proxy)"));
+
+        // `sync_ui_prefs_to_terminal_json_if_exists` does NOT create file when absent
+        let absent = base.join("sub").join("terminal.json");
+        sync_ui_prefs_to_terminal_json_if_exists(&absent, TerminalPreset::WezTerm, true, false).unwrap();
+        assert!(!absent.exists());
+
+        // Preset u8 & string roundtrip
+        for p in TerminalPreset::ALL {
+            assert_eq!(TerminalPreset::from_u8(p.to_u8()), p);
+            assert_eq!(TerminalPreset::parse_str(p.as_str()), Some(p));
+        }
+        assert_eq!(TerminalPreset::from_u8(255), TerminalPreset::WtPwsh);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

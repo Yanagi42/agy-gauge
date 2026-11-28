@@ -2,11 +2,15 @@
 //! smart system font detection (Segoe UI Variable / Maple Mono / JetBrains Mono), radial arc gauges,
 //! smooth area waveforms, and minimal interactive charts.
 
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::mem::{size_of, zeroed};
 use std::ptr;
 
-use windows::core::{w, Result, PCWSTR};
+use windows::core::{w, Interface, Result, PCWSTR};
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
@@ -15,7 +19,8 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1LinearGradientBrush,
-    ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT,
+    ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT,
     D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_CLIP,
     D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
     D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
@@ -169,9 +174,257 @@ pub fn load_color(t: &Theme, pct: f32, warn: f32, high: f32) -> D2D1_COLOR_F {
     }
 }
 
+const UTF16_STACK_CAP: usize = 128;
+const MEASURE_CACHE_MAX: usize = 512;
+
+#[inline]
+fn with_utf16<R>(text: &str, f: impl FnOnce(&[u16]) -> R) -> R {
+    let mut stack = [0u16; UTF16_STACK_CAP];
+    let mut len = 0usize;
+    let mut overflow = false;
+    for unit in text.encode_utf16() {
+        if len < UTF16_STACK_CAP {
+            stack[len] = unit;
+            len += 1;
+        } else {
+            overflow = true;
+            break;
+        }
+    }
+    if !overflow {
+        f(&stack[..len])
+    } else {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        f(&wide)
+    }
+}
+
+#[derive(Default)]
+struct MeasureCache {
+    by_fmt: HashMap<usize, HashMap<String, f32>>,
+    total: usize,
+}
+
+impl MeasureCache {
+    #[inline]
+    fn get(&self, fmt_key: usize, text: &str) -> Option<f32> {
+        self.by_fmt.get(&fmt_key).and_then(|m| m.get(text)).copied()
+    }
+
+    fn insert(&mut self, fmt_key: usize, text: &str, width: f32) {
+        if self.total >= MEASURE_CACHE_MAX {
+            self.by_fmt.clear();
+            self.total = 0;
+        }
+        let inner = self.by_fmt.entry(fmt_key).or_default();
+        if inner.insert(text.to_string(), width).is_none() {
+            self.total += 1;
+        }
+    }
+
+    fn clear_and_shrink(&mut self) {
+        self.by_fmt.clear();
+        self.by_fmt.shrink_to_fit();
+        self.total = 0;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GradKey {
+    y0: u32,
+    y1: u32,
+    c0: [u32; 4],
+    c1: [u32; 4],
+}
+
+impl GradKey {
+    #[inline]
+    fn new(y0: f32, y1: f32, c0: D2D1_COLOR_F, c1: D2D1_COLOR_F) -> Self {
+        Self {
+            y0: y0.to_bits(),
+            y1: y1.to_bits(),
+            c0: [c0.r.to_bits(), c0.g.to_bits(), c0.b.to_bits(), c0.a.to_bits()],
+            c1: [c1.r.to_bits(), c1.g.to_bits(), c1.b.to_bits(), c1.a.to_bits()],
+        }
+    }
+}
+
+/// Tiny 2-slot linear gradient cache bound to a single `ID2D1DCRenderTarget`.
+/// Must be cleared before dropping the owning render target.
+#[derive(Default)]
+struct GradCache {
+    slots: [Option<(GradKey, ID2D1LinearGradientBrush)>; 2],
+    next_evict: usize,
+}
+
+impl GradCache {
+    fn get(&self, key: GradKey) -> Option<ID2D1LinearGradientBrush> {
+        for slot in &self.slots {
+            if let Some((k, b)) = slot {
+                if *k == key {
+                    return Some(b.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, key: GradKey, brush: ID2D1LinearGradientBrush) {
+        for slot in &mut self.slots {
+            if slot.is_none() {
+                *slot = Some((key, brush));
+                return;
+            }
+        }
+        let idx = self.next_evict % self.slots.len();
+        self.slots[idx] = Some((key, brush));
+        self.next_evict = (idx + 1) % self.slots.len();
+    }
+
+    fn clear(&mut self) {
+        self.slots = [None, None];
+        self.next_evict = 0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RingArcKey {
+    radius_bits: u32,
+    start_bits: u32,
+    sweep_half_deg: u16,
+}
+
+impl RingArcKey {
+    #[inline]
+    fn new(radius: f32, start_rad: f32, sweep_rad: f32) -> (Self, f32) {
+        let half_deg = (sweep_rad.to_degrees() * 2.0).round().clamp(1.0, 719.0) as u16;
+        let q_sweep = (half_deg as f32 * 0.5).to_radians();
+        (
+            Self {
+                radius_bits: radius.to_bits(),
+                start_bits: start_rad.to_bits(),
+                sweep_half_deg: half_deg,
+            },
+            q_sweep,
+        )
+    }
+}
+
+/// Tiny 2-slot centered ring-arc geometry cache bound to a `D2DFactories` (Hero CPU + RAM rings).
+/// Automatically torn down when `dash_factories` drops on dashboard hide.
+#[derive(Default)]
+struct RingArcCache {
+    slots: [Option<(RingArcKey, ID2D1PathGeometry)>; 2],
+    next_evict: usize,
+}
+
+impl RingArcCache {
+    fn get(&self, key: RingArcKey) -> Option<ID2D1PathGeometry> {
+        for slot in &self.slots {
+            if let Some((k, g)) = slot {
+                if *k == key {
+                    return Some(g.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, key: RingArcKey, geo: ID2D1PathGeometry) {
+        for slot in &mut self.slots {
+            if slot.is_none() {
+                *slot = Some((key, geo));
+                return;
+            }
+        }
+        let idx = self.next_evict % self.slots.len();
+        self.slots[idx] = Some((key, geo));
+        self.next_evict = (idx + 1) % self.slots.len();
+    }
+
+    fn clear(&mut self) {
+        self.slots = [None, None];
+        self.next_evict = 0;
+    }
+}
+
+struct ActiveBrushScope {
+    rt_ptr: usize,
+    solid: ID2D1SolidColorBrush,
+    grads: GradCache,
+}
+
+thread_local! {
+    static ACTIVE_BRUSHES: RefCell<Option<ActiveBrushScope>> = const { RefCell::new(None) };
+}
+
+struct BrushScopeGuard<'a> {
+    grad_owner: &'a RefCell<GradCache>,
+}
+
+impl Drop for BrushScopeGuard<'_> {
+    fn drop(&mut self) {
+        ACTIVE_BRUSHES.with(|tls| {
+            if let Some(active) = tls.borrow_mut().take() {
+                *self.grad_owner.borrow_mut() = active.grads;
+            }
+        });
+    }
+}
+
+fn enter_brush_scope<'a>(
+    base: &ID2D1RenderTarget,
+    solid: &Option<ID2D1SolidColorBrush>,
+    grad_owner: &'a RefCell<GradCache>,
+) -> Option<BrushScopeGuard<'a>> {
+    let solid = solid.as_ref()?.clone();
+    let grads = std::mem::take(&mut *grad_owner.borrow_mut());
+    let rt_ptr = base.as_raw() as usize;
+    ACTIVE_BRUSHES.with(|tls| {
+        *tls.borrow_mut() = Some(ActiveBrushScope {
+            rt_ptr,
+            solid,
+            grads,
+        });
+    });
+    Some(BrushScopeGuard { grad_owner })
+}
+
+#[inline]
+fn with_solid_brush(
+    rt: &ID2D1RenderTarget,
+    color: D2D1_COLOR_F,
+    f: impl FnOnce(&ID2D1SolidColorBrush),
+) {
+    let rt_ptr = rt.as_raw() as usize;
+    let mut f = Some(f);
+    ACTIVE_BRUSHES.with(|tls| {
+        let borrow = tls.borrow();
+        if let Some(active) = borrow.as_ref() {
+            if active.rt_ptr == rt_ptr {
+                unsafe { active.solid.SetColor(&color) };
+                if let Some(cb) = f.take() {
+                    cb(&active.solid);
+                }
+            }
+        }
+    });
+    if let Some(cb) = f {
+        if let Some(b) = unsafe { rt.CreateSolidColorBrush(&color, None).ok() } {
+            cb(&b);
+        }
+    }
+}
+
 pub struct D2DFactories {
     pub d2d: ID2D1Factory,
     pub dwrite: IDWriteFactory,
+    stroke_round_cap: Option<ID2D1StrokeStyle>,
+    stroke_round_cap_join: Option<ID2D1StrokeStyle>,
+    brand_track_geo: Option<ID2D1PathGeometry>,
+    brand_reading_geo: Option<ID2D1PathGeometry>,
+    measure_cache: RefCell<MeasureCache>,
+    ring_arc_cache: RefCell<RingArcCache>,
 }
 
 impl D2DFactories {
@@ -179,8 +432,93 @@ impl D2DFactories {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            Ok(Self { d2d, dwrite })
+
+            let sp_cap = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                ..Default::default()
+            };
+            let stroke_round_cap = d2d.CreateStrokeStyle(&sp_cap, None).ok();
+
+            let sp_cap_join = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                ..Default::default()
+            };
+            let stroke_round_cap_join = d2d.CreateStrokeStyle(&sp_cap_join, None).ok();
+
+            let brand_track_geo = Self::build_centered_arc_geo(&d2d, 3.85, 0.75 * PI, 1.5 * PI);
+            let brand_reading_geo =
+                Self::build_centered_arc_geo(&d2d, 3.85, 0.75 * PI, 193.0_f32.to_radians());
+
+            Ok(Self {
+                d2d,
+                dwrite,
+                stroke_round_cap,
+                stroke_round_cap_join,
+                brand_track_geo,
+                brand_reading_geo,
+                measure_cache: RefCell::new(MeasureCache::default()),
+                ring_arc_cache: RefCell::new(RingArcCache::default()),
+            })
         }
+    }
+
+    fn get_or_build_ring_arc(
+        &self,
+        radius: f32,
+        start_rad: f32,
+        sweep_rad: f32,
+    ) -> Option<ID2D1PathGeometry> {
+        let (key, q_sweep) = RingArcKey::new(radius, start_rad, sweep_rad);
+        if let Some(geo) = self.ring_arc_cache.borrow().get(key) {
+            return Some(geo);
+        }
+        let geo = Self::build_centered_arc_geo(&self.d2d, radius, start_rad, q_sweep)?;
+        self.ring_arc_cache.borrow_mut().insert(key, geo.clone());
+        Some(geo)
+    }
+
+    fn build_centered_arc_geo(
+        d2d: &ID2D1Factory,
+        radius: f32,
+        start_rad: f32,
+        sweep_rad: f32,
+    ) -> Option<ID2D1PathGeometry> {
+        let end_rad = start_rad + sweep_rad;
+        let sx = radius * start_rad.cos();
+        let sy = radius * start_rad.sin();
+        let ex = radius * end_rad.cos();
+        let ey = radius * end_rad.sin();
+        unsafe {
+            let geo = d2d.CreatePathGeometry().ok()?;
+            let sink = geo.Open().ok()?;
+            sink.BeginFigure(pt(sx, sy), D2D1_FIGURE_BEGIN_HOLLOW);
+            let seg = D2D1_ARC_SEGMENT {
+                point: pt(ex, ey),
+                size: D2D_SIZE_F {
+                    width: radius,
+                    height: radius,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: if sweep_rad > PI {
+                    D2D1_ARC_SIZE_LARGE
+                } else {
+                    D2D1_ARC_SIZE_SMALL
+                },
+            };
+            sink.AddArc(&seg);
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            sink.Close().ok()?;
+            Some(geo)
+        }
+    }
+
+    pub fn clear_measure_cache(&self) {
+        self.measure_cache.borrow_mut().clear_and_shrink();
+        self.ring_arc_cache.borrow_mut().clear();
     }
 
     fn get_font_collection(&self) -> Option<IDWriteFontCollection> {
@@ -249,24 +587,35 @@ impl D2DFactories {
     }
 
     pub fn measure_text_width(&self, text: &str, fmt: &IDWriteTextFormat) -> f32 {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        if wide.is_empty() {
+        if text.is_empty() {
             return 0.0;
         }
-        unsafe {
-            if let Ok(layout) = self.dwrite.CreateTextLayout(&wide, fmt, 1000.0, 100.0) {
-                let mut m: DWRITE_TEXT_METRICS = zeroed();
-                if layout.GetMetrics(&mut m).is_ok() {
-                    return m.widthIncludingTrailingWhitespace.ceil();
+        let fmt_key = fmt.as_raw() as usize;
+        if let Some(cached) = self.measure_cache.borrow().get(fmt_key, text) {
+            return cached;
+        }
+        let measured = with_utf16(text, |wide| {
+            if wide.is_empty() {
+                return 0.0;
+            }
+            unsafe {
+                if let Ok(layout) = self.dwrite.CreateTextLayout(wide, fmt, 1000.0, 100.0) {
+                    let mut m: DWRITE_TEXT_METRICS = zeroed();
+                    if layout.GetMetrics(&mut m).is_ok() {
+                        return m.widthIncludingTrailingWhitespace.ceil();
+                    }
                 }
             }
-        }
-        (text.chars().count() as f32 * 7.5).ceil()
+            (text.chars().count() as f32 * 7.5).ceil()
+        });
+        self.measure_cache.borrow_mut().insert(fmt_key, text, measured);
+        measured
     }
 }
 
-/// Editorial typography palette with automatic preference for Segoe UI Variable & Maple/JetBrains Mono.
-pub struct Fonts {
+/// Lazily-created dashboard typography palette (released immediately on dashboard hide so
+/// pill-only mode never loads or retains the 17 dashboard `IDWriteTextFormat` + UI font family).
+pub struct DashFonts {
     pub ui_brand: IDWriteTextFormat,
     pub ui_section: IDWriteTextFormat,
     pub ui_tab: IDWriteTextFormat,
@@ -284,30 +633,10 @@ pub struct Fonts {
     pub mono_small: IDWriteTextFormat,
     pub mono_small_center: IDWriteTextFormat,
     pub mono_small_right: IDWriteTextFormat,
-    pub pill_tok: IDWriteTextFormat,
-    pub pill_num: IDWriteTextFormat,
-    pub pill_micro: IDWriteTextFormat,
 }
 
-impl Fonts {
-    pub fn new(f: &D2DFactories) -> Result<Self> {
-        let coll = f.get_font_collection();
-        let ui = D2DFactories::pick_from_collection(
-            coll.as_ref(),
-            &[w!("Segoe UI Variable Text"), w!("Segoe UI Variable"), w!("Microsoft YaHei UI")],
-            w!("Microsoft YaHei UI"),
-        );
-        let mono = D2DFactories::pick_from_collection(
-            coll.as_ref(),
-            &[
-                w!("Maple Mono Normal NF CN"),
-                w!("JetBrainsMonoNL Nerd Font"),
-                w!("Cascadia Mono"),
-                w!("Consolas"),
-            ],
-            w!("Consolas"),
-        );
-
+impl DashFonts {
+    fn new(f: &D2DFactories, ui: PCWSTR, mono: PCWSTR) -> Result<Self> {
         Ok(Self {
             ui_brand: f.make_format(ui, 14.5, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
             ui_section: f.make_format(ui, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
@@ -326,11 +655,93 @@ impl Fonts {
             mono_small: f.make_format(mono, 10.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
             mono_small_center: f.make_format(mono, 9.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
             mono_small_right: f.make_format(mono, 10.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true)?,
-            pill_tok: f.make_format(mono, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
-            pill_num: f.make_format(mono, 10.5, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
-            pill_micro: f.make_format(ui, 9.0, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
         })
     }
+}
+
+/// Editorial typography palette: eagerly allocates ONLY the 2 monospace formats used by the
+/// floating pill; the 17 dashboard formats (`DashFonts`) are lazily created on first dashboard
+/// render and released when the dashboard hides.
+pub struct Fonts {
+    pub pill_tok: IDWriteTextFormat,
+    pub pill_num: IDWriteTextFormat,
+    mono_family: PCWSTR,
+    ui_family: Cell<Option<PCWSTR>>,
+    dash: RefCell<Option<DashFonts>>,
+}
+
+impl Fonts {
+    pub fn new(f: &D2DFactories) -> Result<Self> {
+        let coll = f.get_font_collection();
+        let mono = D2DFactories::pick_from_collection(
+            coll.as_ref(),
+            &[
+                w!("Maple Mono Normal NF CN"),
+                w!("JetBrainsMonoNL Nerd Font"),
+                w!("Cascadia Mono"),
+                w!("Consolas"),
+            ],
+            w!("Consolas"),
+        );
+
+        Ok(Self {
+            pill_tok: f.make_format(mono, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
+            pill_num: f.make_format(mono, 10.5, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false)?,
+            mono_family: mono,
+            ui_family: Cell::new(None),
+            dash: RefCell::new(None),
+        })
+    }
+
+    /// Lazily initializes dashboard typography on first dashboard render and passes `&DashFonts`
+    /// to `f_draw`. Caches the resolved static UI font family name across reopens so
+    /// `GetSystemFontCollection` is called at most once.
+    pub fn with_dash<R>(
+        &self,
+        factories: &D2DFactories,
+        f_draw: impl FnOnce(&DashFonts) -> R,
+    ) -> Result<R> {
+        if self.dash.borrow().is_none() {
+            let ui = match self.ui_family.get() {
+                Some(cached) => cached,
+                None => {
+                    let coll = factories.get_font_collection();
+                    let picked = D2DFactories::pick_from_collection(
+                        coll.as_ref(),
+                        &[
+                            w!("Segoe UI Variable Text"),
+                            w!("Segoe UI Variable"),
+                            w!("Microsoft YaHei UI"),
+                        ],
+                        w!("Microsoft YaHei UI"),
+                    );
+                    self.ui_family.set(Some(picked));
+                    picked
+                }
+            };
+            let built = DashFonts::new(factories, ui, self.mono_family)?;
+            *self.dash.borrow_mut() = Some(built);
+        }
+        let borrow = self.dash.borrow();
+        Ok(f_draw(borrow.as_ref().expect("dashboard fonts initialized")))
+    }
+
+    /// Releases the 17 dashboard `IDWriteTextFormat` + ellipsis trimming COM objects when hidden.
+    pub fn release_dashboard_fonts(&mut self) {
+        *self.dash.get_mut() = None;
+    }
+}
+
+unsafe fn create_bgra_dib(dc: HDC, width_px: i32, height_px: i32) -> Result<HBITMAP> {
+    let mut bi: BITMAPINFO = zeroed();
+    bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = width_px;
+    bi.bmiHeader.biHeight = -height_px;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut std::ffi::c_void = ptr::null_mut();
+    CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0)
 }
 
 /// Per-pixel-alpha software Direct2D surface for the floating pill (zero GPU heap!).
@@ -339,6 +750,8 @@ pub struct LayeredSurface {
     bmp: HBITMAP,
     old_obj: HGDIOBJ,
     rt: Option<ID2D1DCRenderTarget>,
+    solid_brush: Option<ID2D1SolidColorBrush>,
+    grad_cache: RefCell<GradCache>,
     width_px: i32,
     height_px: i32,
     dpi: f32,
@@ -353,16 +766,7 @@ impl LayeredSurface {
             if dc.is_invalid() {
                 return Err(windows::core::Error::from_win32());
             }
-            let mut bi: BITMAPINFO = zeroed();
-            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-            bi.bmiHeader.biWidth = w;
-            bi.bmiHeader.biHeight = -h;
-            bi.bmiHeader.biPlanes = 1;
-            bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB.0;
-
-            let mut bits: *mut std::ffi::c_void = ptr::null_mut();
-            let bmp = match CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let bmp = match create_bgra_dib(dc, w, h) {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = DeleteDC(dc);
@@ -392,17 +796,48 @@ impl LayeredSurface {
             };
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            let solid_brush = rt.CreateSolidColorBrush(&rgba(0, 0, 0, 1.0), None).ok();
 
             Ok(Self {
                 dc,
                 bmp,
                 old_obj,
                 rt: Some(rt),
+                solid_brush,
+                grad_cache: RefCell::new(GradCache::default()),
                 width_px: w,
                 height_px: h,
                 dpi,
             })
         }
+    }
+
+    /// Resizes the backing DIB and/or updates DPI in place while keeping the existing
+    /// `ID2D1DCRenderTarget`, `HDC`, and cached brushes alive.
+    #[allow(dead_code)]
+    pub fn resize(&mut self, width_px: i32, height_px: i32, dpi: f32) -> Result<()> {
+        let w = width_px.max(1);
+        let h = height_px.max(1);
+        if self.width_px == w && self.height_px == h && (self.dpi - dpi).abs() < 0.5 {
+            return Ok(());
+        }
+        unsafe {
+            if (self.dpi - dpi).abs() >= 0.5 {
+                if let Some(rt) = &self.rt {
+                    rt.SetDpi(dpi, dpi);
+                }
+                self.dpi = dpi;
+            }
+            if self.width_px != w || self.height_px != h {
+                let new_bmp = create_bgra_dib(self.dc, w, h)?;
+                let prev = SelectObject(self.dc, new_bmp);
+                let _ = DeleteObject(prev);
+                self.bmp = new_bmp;
+                self.width_px = w;
+                self.height_px = h;
+            }
+        }
+        Ok(())
     }
 
     pub fn size_px(&self) -> (i32, i32) {
@@ -431,7 +866,10 @@ impl LayeredSurface {
             rt.BeginDraw();
             rt.Clear(Some(&rgba(0, 0, 0, 0.0)));
             let base: ID2D1RenderTarget = windows::core::Interface::cast(rt)?;
-            draw_fn(&base);
+            {
+                let _brush_guard = enter_brush_scope(&base, &self.solid_brush, &self.grad_cache);
+                draw_fn(&base);
+            }
             rt.EndDraw(None, None)?;
 
             let dst_pt = POINT { x, y };
@@ -464,7 +902,10 @@ impl LayeredSurface {
 
 impl Drop for LayeredSurface {
     fn drop(&mut self) {
-        // Release Direct2D DC render target before tearing down the backing GDI DC/bitmap.
+        // Release all brushes bound to `rt` BEFORE releasing the Direct2D DC render target
+        // and tearing down the backing GDI DC/bitmap.
+        self.grad_cache.get_mut().clear();
+        self.solid_brush.take();
         self.rt.take();
         unsafe {
             let _ = SelectObject(self.dc, self.old_obj);
@@ -480,6 +921,8 @@ pub struct WindowSurface {
     bmp: HBITMAP,
     old_obj: HGDIOBJ,
     rt: Option<ID2D1DCRenderTarget>,
+    solid_brush: Option<ID2D1SolidColorBrush>,
+    grad_cache: RefCell<GradCache>,
     width_px: i32,
     height_px: i32,
     dpi: f32,
@@ -494,16 +937,7 @@ impl WindowSurface {
             if dc.is_invalid() {
                 return Err(windows::core::Error::from_win32());
             }
-            let mut bi: BITMAPINFO = zeroed();
-            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-            bi.bmiHeader.biWidth = w;
-            bi.bmiHeader.biHeight = -h;
-            bi.bmiHeader.biPlanes = 1;
-            bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB.0;
-
-            let mut bits: *mut std::ffi::c_void = ptr::null_mut();
-            let bmp = match CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let bmp = match create_bgra_dib(dc, w, h) {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = DeleteDC(dc);
@@ -533,17 +967,47 @@ impl WindowSurface {
             };
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            let solid_brush = rt.CreateSolidColorBrush(&rgba(0, 0, 0, 1.0), None).ok();
 
             Ok(Self {
                 dc,
                 bmp,
                 old_obj,
                 rt: Some(rt),
+                solid_brush,
+                grad_cache: RefCell::new(GradCache::default()),
                 width_px: w,
                 height_px: h,
                 dpi,
             })
         }
+    }
+
+    /// Resizes the backing DIB and/or updates DPI in place while reusing the existing
+    /// `ID2D1DCRenderTarget`, `HDC`, and cached brushes.
+    pub fn resize(&mut self, width_px: i32, height_px: i32, dpi: f32) -> Result<()> {
+        let w = width_px.max(1);
+        let h = height_px.max(1);
+        if self.width_px == w && self.height_px == h && (self.dpi - dpi).abs() < 0.5 {
+            return Ok(());
+        }
+        unsafe {
+            if (self.dpi - dpi).abs() >= 0.5 {
+                if let Some(rt) = &self.rt {
+                    rt.SetDpi(dpi, dpi);
+                }
+                self.dpi = dpi;
+            }
+            if self.width_px != w || self.height_px != h {
+                let new_bmp = create_bgra_dib(self.dc, w, h)?;
+                let prev = SelectObject(self.dc, new_bmp);
+                let _ = DeleteObject(prev);
+                self.bmp = new_bmp;
+                self.width_px = w;
+                self.height_px = h;
+            }
+        }
+        Ok(())
     }
 
     pub fn matches(&self, width_px: i32, height_px: i32, dpi: f32) -> bool {
@@ -567,7 +1031,10 @@ impl WindowSurface {
             rt.BindDC(self.dc, &sub)?;
             rt.BeginDraw();
             let base: ID2D1RenderTarget = windows::core::Interface::cast(rt)?;
-            draw_fn(&base);
+            {
+                let _brush_guard = enter_brush_scope(&base, &self.solid_brush, &self.grad_cache);
+                draw_fn(&base);
+            }
             rt.EndDraw(None, None)?;
 
             if let Some(hdc) = target_hdc {
@@ -576,11 +1043,62 @@ impl WindowSurface {
             Ok(())
         }
     }
+
+    /// Renders strictly inside `clip_dip` over the retained DIB and blits ONLY that dirty
+    /// rectangle to `target_hdc` (used for 1s Hero Block 4 CPU/RAM updates on non-System tabs).
+    pub fn render_clip_and_blit<F>(
+        &self,
+        target_hdc: Option<HDC>,
+        clip_dip: D2D_RECT_F,
+        draw_fn: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&ID2D1RenderTarget),
+    {
+        unsafe {
+            let Some(rt) = &self.rt else {
+                return Ok(());
+            };
+            let sub = RECT {
+                left: 0,
+                top: 0,
+                right: self.width_px,
+                bottom: self.height_px,
+            };
+            rt.BindDC(self.dc, &sub)?;
+            rt.BeginDraw();
+            let base: ID2D1RenderTarget = windows::core::Interface::cast(rt)?;
+            base.PushAxisAlignedClip(&clip_dip, D2D1_ANTIALIAS_MODE_ALIASED);
+            {
+                let _brush_guard = enter_brush_scope(&base, &self.solid_brush, &self.grad_cache);
+                draw_fn(&base);
+            }
+            base.PopAxisAlignedClip();
+            rt.EndDraw(None, None)?;
+
+            if let Some(hdc) = target_hdc {
+                let scale = self.dpi / 96.0;
+                let px_l = ((clip_dip.left * scale).floor() as i32 - 1).clamp(0, self.width_px);
+                let px_t = ((clip_dip.top * scale).floor() as i32 - 1).clamp(0, self.height_px);
+                let px_r = ((clip_dip.right * scale).ceil() as i32 + 1).clamp(px_l, self.width_px);
+                let px_b = ((clip_dip.bottom * scale).ceil() as i32 + 1).clamp(px_t, self.height_px);
+                let bw = px_r - px_l;
+                let bh = px_b - px_t;
+                if bw > 0 && bh > 0 {
+                    let _ = BitBlt(hdc, px_l, px_t, bw, bh, self.dc, px_l, px_t, SRCCOPY);
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 impl Drop for WindowSurface {
     fn drop(&mut self) {
-        // Release Direct2D DC render target before tearing down the backing GDI DC/bitmap.
+        // Release all brushes bound to `rt` BEFORE releasing the Direct2D DC render target
+        // and tearing down the backing GDI DC/bitmap.
+        self.grad_cache.get_mut().clear();
+        self.solid_brush.take();
         self.rt.take();
         unsafe {
             let _ = SelectObject(self.dc, self.old_obj);
@@ -609,8 +1127,21 @@ pub fn hit_rect(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
     x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
 
+#[allow(dead_code)]
 pub fn brush(rt: &ID2D1RenderTarget, color: D2D1_COLOR_F) -> Option<ID2D1SolidColorBrush> {
-    unsafe { rt.CreateSolidColorBrush(&color, None).ok() }
+    let rt_ptr = rt.as_raw() as usize;
+    let cached = ACTIVE_BRUSHES.with(|tls| {
+        let borrow = tls.borrow();
+        borrow.as_ref().and_then(|active| {
+            if active.rt_ptr == rt_ptr {
+                unsafe { active.solid.SetColor(&color) };
+                Some(active.solid.clone())
+            } else {
+                None
+            }
+        })
+    });
+    cached.or_else(|| unsafe { rt.CreateSolidColorBrush(&color, None).ok() })
 }
 
 pub fn linear_v_brush(
@@ -620,7 +1151,22 @@ pub fn linear_v_brush(
     c0: D2D1_COLOR_F,
     c1: D2D1_COLOR_F,
 ) -> Option<ID2D1LinearGradientBrush> {
-    unsafe {
+    let rt_ptr = rt.as_raw() as usize;
+    let key = GradKey::new(y0, y1, c0, c1);
+    let cached = ACTIVE_BRUSHES.with(|tls| {
+        let borrow = tls.borrow();
+        borrow.as_ref().and_then(|active| {
+            if active.rt_ptr == rt_ptr {
+                active.grads.get(key)
+            } else {
+                None
+            }
+        })
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    let created = unsafe {
         let stops = [
             D2D1_GRADIENT_STOP { position: 0.0, color: c0 },
             D2D1_GRADIENT_STOP { position: 1.0, color: c1 },
@@ -632,19 +1178,33 @@ pub fn linear_v_brush(
             startPoint: pt(0.0, y0),
             endPoint: pt(0.0, y1),
         };
-        rt.CreateLinearGradientBrush(&props, None, &coll).ok()
-    }
+        rt.CreateLinearGradientBrush(&props, None, &coll).ok()?
+    };
+    ACTIVE_BRUSHES.with(|tls| {
+        if let Some(active) = tls.borrow_mut().as_mut() {
+            if active.rt_ptr == rt_ptr {
+                active.grads.insert(key, created.clone());
+            }
+        }
+    });
+    Some(created)
+}
+
+pub fn fill_rect(rt: &ID2D1RenderTarget, r: D2D_RECT_F, color: D2D1_COLOR_F) {
+    with_solid_brush(rt, color, |b| unsafe {
+        rt.FillRectangle(&r, b);
+    });
 }
 
 pub fn fill_round_rect(rt: &ID2D1RenderTarget, r: D2D_RECT_F, radius: f32, color: D2D1_COLOR_F) {
-    if let Some(b) = brush(rt, color) {
-        let rr = D2D1_ROUNDED_RECT {
-            rect: r,
-            radiusX: radius,
-            radiusY: radius,
-        };
-        unsafe { rt.FillRoundedRectangle(&rr, &b) };
-    }
+    let rr = D2D1_ROUNDED_RECT {
+        rect: r,
+        radiusX: radius,
+        radiusY: radius,
+    };
+    with_solid_brush(rt, color, |b| unsafe {
+        rt.FillRoundedRectangle(&rr, b);
+    });
 }
 
 pub fn stroke_round_rect(
@@ -654,42 +1214,42 @@ pub fn stroke_round_rect(
     color: D2D1_COLOR_F,
     width: f32,
 ) {
-    if let Some(b) = brush(rt, color) {
-        let rr = D2D1_ROUNDED_RECT {
-            rect: r,
-            radiusX: radius,
-            radiusY: radius,
-        };
-        unsafe { rt.DrawRoundedRectangle(&rr, &b, width, None) };
-    }
+    let rr = D2D1_ROUNDED_RECT {
+        rect: r,
+        radiusX: radius,
+        radiusY: radius,
+    };
+    with_solid_brush(rt, color, |b| unsafe {
+        rt.DrawRoundedRectangle(&rr, b, width, None);
+    });
 }
 
 pub fn fill_circle(rt: &ID2D1RenderTarget, cx: f32, cy: f32, r: f32, color: D2D1_COLOR_F) {
-    if let Some(b) = brush(rt, color) {
-        let ell = D2D1_ELLIPSE {
-            point: pt(cx, cy),
-            radiusX: r,
-            radiusY: r,
-        };
-        unsafe { rt.FillEllipse(&ell, &b) };
-    }
+    let ell = D2D1_ELLIPSE {
+        point: pt(cx, cy),
+        radiusX: r,
+        radiusY: r,
+    };
+    with_solid_brush(rt, color, |b| unsafe {
+        rt.FillEllipse(&ell, b);
+    });
 }
 
 pub fn stroke_circle(rt: &ID2D1RenderTarget, cx: f32, cy: f32, r: f32, color: D2D1_COLOR_F, width: f32) {
-    if let Some(b) = brush(rt, color) {
-        let ell = D2D1_ELLIPSE {
-            point: pt(cx, cy),
-            radiusX: r,
-            radiusY: r,
-        };
-        unsafe { rt.DrawEllipse(&ell, &b, width, None) };
-    }
+    let ell = D2D1_ELLIPSE {
+        point: pt(cx, cy),
+        radiusX: r,
+        radiusY: r,
+    };
+    with_solid_brush(rt, color, |b| unsafe {
+        rt.DrawEllipse(&ell, b, width, None);
+    });
 }
 
 pub fn draw_line(rt: &ID2D1RenderTarget, x0: f32, y0: f32, x1: f32, y1: f32, color: D2D1_COLOR_F, width: f32) {
-    if let Some(b) = brush(rt, color) {
-        unsafe { rt.DrawLine(pt(x0, y0), pt(x1, y1), &b, width, None) };
-    }
+    with_solid_brush(rt, color, |b| unsafe {
+        rt.DrawLine(pt(x0, y0), pt(x1, y1), b, width, None);
+    });
 }
 
 pub fn draw_text(
@@ -702,19 +1262,18 @@ pub fn draw_text(
     if text.is_empty() {
         return;
     }
-    if let Some(b) = brush(rt, color) {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
+    with_utf16(text, |wide| {
+        with_solid_brush(rt, color, |b| unsafe {
             rt.DrawText(
-                &wide,
+                wide,
                 fmt,
                 &r,
-                &b,
+                b,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
-        }
-    }
+        });
+    });
 }
 
 /// Draws an anti-aliased rounded-cap circular arc given start and sweep angles in radians
@@ -738,37 +1297,23 @@ pub fn draw_arc_rad(
         stroke_circle(rt, cx, cy, radius, color, stroke_w);
         return;
     }
-    let end_rad = start_rad + sweep_rad;
-    let sx = cx + radius * start_rad.cos();
-    let sy = cy + radius * start_rad.sin();
-    let ex = cx + radius * end_rad.cos();
-    let ey = cy + radius * end_rad.sin();
-
-    unsafe {
-        if let Ok(geo) = factories.d2d.CreatePathGeometry() {
-            if let Ok(sink) = geo.Open() {
-                sink.BeginFigure(pt(sx, sy), D2D1_FIGURE_BEGIN_HOLLOW);
-                let seg = D2D1_ARC_SEGMENT {
-                    point: pt(ex, ey),
-                    size: D2D_SIZE_F { width: radius, height: radius },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                    arcSize: if sweep_rad > PI { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
-                };
-                sink.AddArc(&seg);
-                sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                if sink.Close().is_ok() {
-                    if let Some(b) = brush(rt, color) {
-                        let sp = D2D1_STROKE_STYLE_PROPERTIES {
-                            startCap: D2D1_CAP_STYLE_ROUND,
-                            endCap: D2D1_CAP_STYLE_ROUND,
-                            ..Default::default()
-                        };
-                        let style = factories.d2d.CreateStrokeStyle(&sp, None).ok();
-                        rt.DrawGeometry(&geo, &b, stroke_w, style.as_ref());
-                    }
-                }
-            }
+    if let Some(geo) = factories.get_or_build_ring_arc(radius, start_rad, sweep_rad) {
+        unsafe {
+            let mut prev = Matrix3x2::default();
+            rt.GetTransform(&mut prev);
+            let shifted = Matrix3x2 {
+                M11: prev.M11,
+                M12: prev.M12,
+                M21: prev.M21,
+                M22: prev.M22,
+                M31: prev.M31 + cx * prev.M11 + cy * prev.M21,
+                M32: prev.M32 + cx * prev.M12 + cy * prev.M22,
+            };
+            rt.SetTransform(&shifted);
+            with_solid_brush(rt, color, |b| {
+                rt.DrawGeometry(&geo, b, stroke_w, factories.stroke_round_cap.as_ref());
+            });
+            rt.SetTransform(&prev);
         }
     }
 }
@@ -832,43 +1377,45 @@ pub fn draw_brand_dial_icon(
     // 2) Warm paper dial face
     fill_circle(rt, cx, cy, 5.5, rgb(246, 244, 237));
 
-    // 3) 270 deg track arc: 135 deg -> 45 deg clockwise
-    let start_rad = 0.75 * PI; // 135 deg
-    draw_arc_rad(
-        factories,
-        rt,
-        cx,
-        cy,
-        3.85,
-        1.45,
-        start_rad,
-        1.5 * PI, // 270 deg
-        rgb(210, 206, 195),
-    );
-
-    // 4) Primary reading arc (~71.5%): 135 deg -> -32 deg (193 deg sweep)
-    let sweep_reading = 193.0_f32.to_radians();
-    draw_arc_rad(factories, rt, cx, cy, 3.85, 1.45, start_rad, sweep_reading, arc_col);
+    // 3-4) 270 deg track arc + primary reading arc using prebuilt static geometries
+    if let (Some(track_geo), Some(read_geo)) = (&factories.brand_track_geo, &factories.brand_reading_geo) {
+        unsafe {
+            let mut prev = Matrix3x2::default();
+            rt.GetTransform(&mut prev);
+            let shifted = Matrix3x2 {
+                M11: prev.M11,
+                M12: prev.M12,
+                M21: prev.M21,
+                M22: prev.M22,
+                M31: prev.M31 + cx * prev.M11 + cy * prev.M21,
+                M32: prev.M32 + cx * prev.M12 + cy * prev.M22,
+            };
+            rt.SetTransform(&shifted);
+            with_solid_brush(rt, rgb(210, 206, 195), |b| {
+                rt.DrawGeometry(track_geo, b, 1.45, factories.stroke_round_cap.as_ref());
+            });
+            with_solid_brush(rt, arc_col, |b| {
+                rt.DrawGeometry(read_geo, b, 1.45, factories.stroke_round_cap.as_ref());
+            });
+            rt.SetTransform(&prev);
+        }
+    } else {
+        let start_rad = 0.75 * PI;
+        draw_arc_rad(factories, rt, cx, cy, 3.85, 1.45, start_rad, 1.5 * PI, rgb(210, 206, 195));
+        draw_arc_rad(factories, rt, cx, cy, 3.85, 1.45, start_rad, 193.0_f32.to_radians(), arc_col);
+    }
 
     // 5) Deep ink pointer + hub + core dot
     let ink = rgb(26, 26, 28);
-    unsafe {
-        if let Some(b) = brush(rt, ink) {
-            let sp = D2D1_STROKE_STYLE_PROPERTIES {
-                startCap: D2D1_CAP_STYLE_ROUND,
-                endCap: D2D1_CAP_STYLE_ROUND,
-                ..Default::default()
-            };
-            let style = factories.d2d.CreateStrokeStyle(&sp, None).ok();
-            rt.DrawLine(
-                pt(cx, cy + 0.2),
-                pt(cx + 2.33, cy - 1.26),
-                &b,
-                1.05,
-                style.as_ref(),
-            );
-        }
-    }
+    with_solid_brush(rt, ink, |b| unsafe {
+        rt.DrawLine(
+            pt(cx, cy + 0.2),
+            pt(cx + 2.33, cy - 1.26),
+            b,
+            1.05,
+            factories.stroke_round_cap.as_ref(),
+        );
+    });
     fill_circle(rt, cx, cy + 0.2, 1.15, ink);
     fill_circle(rt, cx, cy + 0.2, 0.45, core_col);
 
@@ -918,16 +1465,9 @@ pub fn draw_area_series(
                 }
                 sink.EndFigure(D2D1_FIGURE_END_OPEN);
                 if sink.Close().is_ok() {
-                    if let Some(b) = brush(rt, line_col) {
-                        let sp = D2D1_STROKE_STYLE_PROPERTIES {
-                            startCap: D2D1_CAP_STYLE_ROUND,
-                            endCap: D2D1_CAP_STYLE_ROUND,
-                            lineJoin: D2D1_LINE_JOIN_ROUND,
-                            ..Default::default()
-                        };
-                        let style = factories.d2d.CreateStrokeStyle(&sp, None).ok();
-                        rt.DrawGeometry(&line_geo, &b, stroke_w, style.as_ref());
-                    }
+                    with_solid_brush(rt, line_col, |b| {
+                        rt.DrawGeometry(&line_geo, b, stroke_w, factories.stroke_round_cap_join.as_ref());
+                    });
                 }
             }
         }
@@ -942,20 +1482,31 @@ pub enum BarUnit {
 
 #[derive(Debug, Clone)]
 pub struct BarItem {
-    pub label: String,
+    pub label: Cow<'static, str>,
     pub cache: f64,
     pub input: f64,
     pub output: f64,
     pub marker: bool,
-    pub tooltip: Vec<String>,
+}
+
+/// Computes the exact X-axis label stride used by `draw_editorial_bars`, so callers with
+/// hundreds of bars (e.g., long sessions) can skip allocating unused intermediate labels.
+#[inline]
+pub fn editorial_bar_label_stride(plot_bounds: D2D_RECT_F, n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let plot_w = (plot_bounds.right - plot_bounds.left - 66.0).max(40.0);
+    (((40.0 * n as f32) / plot_w).ceil() as usize).max(1)
 }
 
 /// Editorial minimalist stacked bar chart supporting Total vs Fresh-Only (non-cached)
-/// and both Token and USD display units.
+/// and both Token and USD display units. Tooltips are constructed lazily only for the
+/// single hovered bar index. Returns `(slot_rects, inner_plot_rect)`.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_editorial_bars(
+pub fn draw_editorial_bars<F>(
     rt: &ID2D1RenderTarget,
-    fonts: &Fonts,
+    fonts: &DashFonts,
     theme: &Theme,
     plot_bounds: D2D_RECT_F,
     items: &[BarItem],
@@ -963,10 +1514,14 @@ pub fn draw_editorial_bars(
     unit: BarUnit,
     mouse_pos: Option<(f32, f32)>,
     empty_msg: &str,
-) -> Vec<D2D_RECT_F> {
+    tooltip_fn: F,
+) -> (Vec<D2D_RECT_F>, Option<D2D_RECT_F>)
+where
+    F: FnOnce(usize) -> Vec<String>,
+{
     if items.is_empty() {
         draw_text(rt, empty_msg, &fonts.ui_reg_center, plot_bounds, theme.muted);
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let pad_l = 54.0;
@@ -979,6 +1534,12 @@ pub fn draw_editorial_bars(
     let plot_b = plot_bounds.bottom - pad_b;
     let plot_w = (plot_r - plot_l).max(40.0);
     let plot_h = (plot_b - plot_t).max(36.0);
+    let inner_plot = D2D_RECT_F {
+        left: plot_l,
+        top: plot_t,
+        right: plot_l + plot_w,
+        bottom: plot_t + plot_h,
+    };
 
     let bar_val = |it: &BarItem| -> f64 {
         if fresh_only {
@@ -1027,7 +1588,7 @@ pub fn draw_editorial_bars(
     } else {
         (slot_w * 0.72).clamp(1.0, (slot_w - 0.5).max(1.0))
     };
-    let label_every = (((40.0 * n as f32) / plot_w).ceil() as usize).max(1);
+    let label_every = editorial_bar_label_stride(plot_bounds, n);
     let mut slot_rects = Vec::with_capacity(n);
 
     let mut hover_idx: Option<usize> = None;
@@ -1081,8 +1642,8 @@ pub fn draw_editorial_bars(
                 let r = rect_f(x0, ny, bar_w, (cur_y - ny).max(1.0));
                 if Some(s_idx) == last_nz {
                     fill_round_rect(rt, r, (bar_w * 0.24).min(3.5), col);
-                } else if let Some(b) = brush(rt, col) {
-                    unsafe { rt.FillRectangle(&r, &b) };
+                } else {
+                    fill_rect(rt, r, col);
                 }
                 cur_y = ny;
             }
@@ -1109,9 +1670,9 @@ pub fn draw_editorial_bars(
         }
     }
 
-    // Crisp editorial floating tooltip
+    // Crisp editorial floating tooltip (built lazily only for the hovered bar)
     if let Some(idx) = hover_idx {
-        let lines = &items[idx].tooltip;
+        let lines = tooltip_fn(idx);
         if !lines.is_empty() {
             let line_h = 16.0;
             let max_units: f32 = lines
@@ -1149,7 +1710,7 @@ pub fn draw_editorial_bars(
             }
         }
     }
-    slot_rects
+    (slot_rects, Some(inner_plot))
 }
 
 /// Tactile quota / budget horizontal bar with an optional pace tick mark showing elapsed time fraction.
@@ -1188,24 +1749,37 @@ pub struct HeatmapDay {
     pub month_label: Option<String>,
     pub value: f64,
     pub calls: u64,
-    pub tooltip: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HeatmapGridGeom {
+    pub gx0: f32,
+    pub gy0: f32,
+    pub cell: f32,
+    pub gap: f32,
+    pub n_weeks: usize,
 }
 
 /// Editorial GitHub-style 7-row (Mon..Sun) activity calendar heatmap in restrained terracotta tones.
-/// Returns `(cell_rect, date_key)` for every non-empty day cell so callers can wire drill-down clicks.
+/// Tooltips are built lazily only for the hovered day index.
+/// Returns `((cell_rect, date_key) for every non-empty day cell, grid geometry for discrete hover)`.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_activity_heatmap(
+pub fn draw_activity_heatmap<F>(
     rt: &ID2D1RenderTarget,
-    fonts: &Fonts,
+    fonts: &DashFonts,
     theme: &Theme,
     bounds: D2D_RECT_F,
     n_weeks: usize,
     days: &[HeatmapDay],
     mouse_pos: Option<(f32, f32)>,
-) -> Vec<(D2D_RECT_F, String)> {
+    tooltip_fn: F,
+) -> (Vec<(D2D_RECT_F, String)>, Option<HeatmapGridGeom>)
+where
+    F: FnOnce(usize) -> Vec<String>,
+{
     if n_weeks == 0 || days.is_empty() {
         draw_text(rt, "暂无活跃记录", &fonts.ui_reg_center, bounds, theme.muted);
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let left_lbl_w = 24.0;
@@ -1222,6 +1796,13 @@ pub fn draw_activity_heatmap(
     let grid_h = 7.0 * cell + 6.0 * gap;
     let gx0 = bounds.left + left_lbl_w + ((avail_w - grid_w) * 0.5).max(0.0);
     let gy0 = bounds.top + top_lbl_h + ((avail_h - grid_h) * 0.5).max(0.0);
+    let geom = HeatmapGridGeom {
+        gx0,
+        gy0,
+        cell,
+        gap,
+        n_weeks,
+    };
 
     // Weekday row labels (Mon / Wed / Fri / Sun)
     for (row, lbl) in [(0usize, "一"), (2, "三"), (4, "五"), (6, "日")] {
@@ -1261,10 +1842,10 @@ pub fn draw_activity_heatmap(
 
     let mut drawn_month_x: f32 = -100.0;
     let mut click_cells = Vec::new();
-    let mut hovered: Option<(D2D_RECT_F, &HeatmapDay)> = None;
+    let mut hovered: Option<(D2D_RECT_F, usize)> = None;
     let rad = (cell * 0.22).clamp(2.0, 4.0);
 
-    for d in days {
+    for (idx, d) in days.iter().enumerate() {
         let cx = gx0 + d.week_col as f32 * (cell + gap);
         let cy = gy0 + d.weekday_idx as f32 * (cell + gap);
         if let Some(ref ml) = d.month_label {
@@ -1278,7 +1859,7 @@ pub fn draw_activity_heatmap(
         fill_round_rect(rt, cr, rad, level_color(d.value));
         if is_hov {
             stroke_round_rect(rt, cr, rad, theme.text, 1.2);
-            hovered = Some((cr, d));
+            hovered = Some((cr, idx));
         }
         if d.calls > 0 {
             click_cells.push((cr, d.date_key.clone()));
@@ -1309,9 +1890,9 @@ pub fn draw_activity_heatmap(
         theme.muted,
     );
 
-    // Floating editorial tooltip
-    if let Some((cr, d)) = hovered {
-        let lines = &d.tooltip;
+    // Floating editorial tooltip (built lazily only for hovered day)
+    if let Some((cr, idx)) = hovered {
+        let lines = tooltip_fn(idx);
         if !lines.is_empty() {
             let line_h = 15.5;
             let max_units: f32 = lines
@@ -1342,5 +1923,85 @@ pub fn draw_activity_heatmap(
         }
     }
 
-    click_cells
+    (click_cells, Some(geom))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_utf16_stack_and_heap_paths() {
+        assert_eq!(with_utf16("", |s| s.to_vec()), Vec::<u16>::new());
+        let short = "Gauge 仪表盘 123";
+        let expected_short: Vec<u16> = short.encode_utf16().collect();
+        assert!(expected_short.len() < UTF16_STACK_CAP);
+        assert_eq!(with_utf16(short, |s| s.to_vec()), expected_short);
+
+        let long = "a".repeat(UTF16_STACK_CAP + 37);
+        let expected_long: Vec<u16> = long.encode_utf16().collect();
+        assert_eq!(with_utf16(&long, |s| s.to_vec()), expected_long);
+    }
+
+    #[test]
+    fn test_measure_cache_hit_bounded_evict_and_clear() {
+        let mut cache = MeasureCache::default();
+        assert_eq!(cache.get(1, "hello"), None);
+        cache.insert(1, "hello", 42.0);
+        assert_eq!(cache.get(1, "hello"), Some(42.0));
+        assert_eq!(cache.get(2, "hello"), None);
+
+        // Fill up to MEASURE_CACHE_MAX and verify inserting one more resets cleanly
+        for i in 0..MEASURE_CACHE_MAX {
+            cache.insert(1, &format!("k{i}"), i as f32);
+        }
+        assert!(cache.total <= MEASURE_CACHE_MAX);
+        cache.insert(1, "overflow-entry", 99.0);
+        assert_eq!(cache.get(1, "overflow-entry"), Some(99.0));
+        assert!(cache.total <= MEASURE_CACHE_MAX);
+
+        cache.clear_and_shrink();
+        assert_eq!(cache.total, 0);
+        assert_eq!(cache.get(1, "overflow-entry"), None);
+    }
+
+    #[test]
+    fn test_ring_arc_key_quantization_and_2slot_cache() {
+        let (k1, q1) = RingArcKey::new(17.0, -PI * 0.5, 0.25 * 2.0 * PI);
+        let (k2, _) = RingArcKey::new(17.0, -PI * 0.5, 0.2504 * 2.0 * PI);
+        let (k3, _) = RingArcKey::new(17.0, -PI * 0.5, 0.50 * 2.0 * PI);
+        assert_eq!(k1, k2);
+        assert_ne!(k1, k3);
+        assert!((q1.to_degrees() - 90.0).abs() < 0.01);
+
+        // Exercise actual D2D centered geometry cache (hit, 2-slot capacity, FIFO eviction, clear)
+        if let Ok(fac) = D2DFactories::new() {
+            let g1 = fac.get_or_build_ring_arc(17.0, -PI * 0.5, 0.25 * 2.0 * PI).expect("arc1");
+            let g1_hit = fac.get_or_build_ring_arc(17.0, -PI * 0.5, 0.2503 * 2.0 * PI).expect("arc1 hit");
+            assert_eq!(g1.as_raw(), g1_hit.as_raw());
+
+            let g2 = fac.get_or_build_ring_arc(17.0, -PI * 0.5, 0.60 * 2.0 * PI).expect("arc2");
+            assert_ne!(g1.as_raw(), g2.as_raw());
+            // Both slots warm (CPU + RAM rings coexist without evicting each other)
+            let g1_again = fac.get_or_build_ring_arc(17.0, -PI * 0.5, 0.25 * 2.0 * PI).expect("arc1 still cached");
+            let g2_again = fac.get_or_build_ring_arc(17.0, -PI * 0.5, 0.60 * 2.0 * PI).expect("arc2 still cached");
+            assert_eq!(g1.as_raw(), g1_again.as_raw());
+            assert_eq!(g2.as_raw(), g2_again.as_raw());
+
+            // 3rd distinct arc evicts slot 0 cleanly
+            let _g3 = fac.get_or_build_ring_arc(34.0, -PI * 0.5, 0.80 * 2.0 * PI).expect("arc3");
+            assert!(fac.ring_arc_cache.borrow().slots.iter().all(|s| s.is_some()));
+
+            fac.clear_measure_cache();
+            assert!(fac.ring_arc_cache.borrow().slots.iter().all(|s| s.is_none()));
+        }
+    }
+
+    #[test]
+    fn test_editorial_bar_label_stride() {
+        let bounds = rect_f(0.0, 0.0, 566.0, 200.0); // plot_w = 500
+        assert_eq!(editorial_bar_label_stride(bounds, 0), 1);
+        assert_eq!(editorial_bar_label_stride(bounds, 10), 1);
+        assert_eq!(editorial_bar_label_stride(bounds, 500), 40);
+    }
 }

@@ -18,20 +18,22 @@ mod telemetry;
 pub use gauge::{archive, launcher, pricing, quota, session_meta, stats};
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{Local, NaiveDate, Timelike, Utc};
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint,
-    InvalidateRect, SetBkColor, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, FF_MODERN, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, GetDC,
+    InvalidateRect, ReleaseDC, SetBkColor, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_MODERN, FW_NORMAL, HBRUSH, HDC, HFONT,
+    HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -46,21 +48,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
     LoadImageW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
-    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HICON, HMENU,
+    SetCursor, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, HCURSOR, HICON, HMENU,
     HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON,
-    LR_DEFAULTCOLOR, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, SM_CXICON, SM_CXSMICON,
+    LR_DEFAULTCOLOR, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SM_CXICON, SM_CXSMICON,
     SM_CYICON, SM_CYSMICON, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE,
     SW_SHOW, SW_SHOWNOACTIVATE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPOS,
     WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WM_SETICON,
-    WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_POWERBROADCAST, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 const WM_APP_SYNC_META: u32 = WM_APP_TRAY + 1;
+const WM_APP_FILES_CHANGED: u32 = WM_APP_TRAY + 2;
 const RES_ICON_NORMAL: u16 = 1;
 const RES_ICON_WARN: u16 = 2;
 const RES_ICON_CRIT: u16 = 3;
@@ -101,33 +106,40 @@ const CMD_EXPORT_CALLS_CSV: u32 = 6105;
 use d2d::{theme_for, D2DFactories, Fonts};
 use dashboard::{
     fmt_relative_time_cn, BreakdownMode, ClickAction, DailyViewMode, DashboardView, ModelViewMode,
-    OverviewTopMode, Tab, WeeklyMode,
+    OverviewTopMode, Tab, TelemetryRepaintMode, WeeklyMode,
 };
 use pill::{
     show_context_menu, PillRenderer, QuickSessionMenuItem, CMD_MONITOR_BASE, CMD_OPEN_DETAIL,
     CMD_OPEN_SESSIONS_TAB, CMD_PILL_ITEMS_RESET, CMD_PILL_ITEM_BASE, CMD_QUICK_RESUME_BASE,
-    CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TOGGLE_AUTOSTART, CMD_TOGGLE_HIDE_FULLSCREEN,
-    CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_NOTIFICATIONS, CMD_TOGGLE_PILL_VISIBLE,
-    CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST, CMD_TOGGLE_TRAY_HOVER,
+    CMD_QUIT, CMD_REDOCK, CMD_REFRESH, CMD_TERMINAL_OPEN_CONFIG, CMD_TERMINAL_PRESET_BASE,
+    CMD_TERMINAL_TOGGLE_KEEP_OPEN, CMD_TERMINAL_TOGGLE_NEW_WIN, CMD_TOGGLE_AUTOSTART,
+    CMD_TOGGLE_HIDE_FULLSCREEN, CMD_TOGGLE_HUMAN, CMD_TOGGLE_LIGHT, CMD_TOGGLE_NOTIFICATIONS,
+    CMD_TOGGLE_PILL_VISIBLE, CMD_TOGGLE_PRIVACY, CMD_TOGGLE_TOPMOST, CMD_TOGGLE_TRAY_HOVER,
 };
 use pricing::ModelRate;
-use stats::{DateScope, IncrementalScanner, ScanSnapshot};
+use stats::{DateScope, IncrementalScanner, ScanDelta, ScanHints, ScanSnapshot};
 use telemetry::{
     apply_pill_topmost, apply_win11_frame, broadcast_prefs_sync, clamp_pos_to_monitors,
-    clamp_pos_to_work_area, copy_text_to_clipboard, dpi_for_point, enable_dpi_awareness,
-    get_work_area, guard_topmost_windowpos, inspect_pill_topmost_health, is_autostart_enabled,
-    is_cursor_in_tray_hover_zone, is_other_app_fullscreen, load_user_prefs,
-    monitor_index_for_point, prompt_save_file, read_self_private_mb, read_self_working_set_mb,
-    register_taskbar_created_msg, save_user_prefs, set_autostart_enabled,
-    set_self_tray_icon_taskbar_promoted, to_wide_null, trim_self_working_set, wide_pcwstr,
-    window_dpi_scale, SingleInstanceGuard, SystemTelemetry, TopmostHealth, TrayIcon, TrayPinResult,
-    UserPrefs, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT, PILL_ITEM_CPU, PILL_ITEM_RAM,
-    PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS, WM_APP_TRAY,
+    clamp_pos_to_work_area, compact_heap_and_trim_working_set, copy_text_to_clipboard,
+    dpi_for_point, enable_dpi_awareness, get_work_area, guard_topmost_windowpos,
+    inspect_pill_topmost_health, invalidate_monitors_cache, is_autostart_enabled,
+    is_cursor_in_tray_hover_zone, load_user_prefs, monitor_index_for_point,
+    parse_console_display_state, prompt_save_file, read_self_private_mb, read_self_working_set_mb,
+    register_session_notifications, register_taskbar_created_msg, save_user_prefs,
+    set_autostart_enabled, set_coalesced_timer, set_self_tray_icon_taskbar_promoted, to_wide_null,
+    unregister_session_notifications, wide_pcwstr, window_dpi_scale, ConsoleDisplayPowerGuard,
+    DirWatcher, FullscreenProbe, SingleInstanceGuard, SystemTelemetry, TopmostHealth, TrayIcon,
+    TrayPinResult, UserPrefs, WatcherHints, PILL_ITEMS_ALL_MASK, PILL_ITEMS_DEFAULT,
+    PILL_ITEM_CPU, PILL_ITEM_QUOTA, PILL_ITEM_RAM, PILL_ITEM_TOTAL, WM_APP_SYNC_PREFS,
+    WM_APP_TRAY,
 };
 
 const TIMER_TELEMETRY: usize = 1;
 const TIMER_TOKENS: usize = 2;
 const TIMER_TRAY_HOVER: usize = 3;
+const TIMER_PILL_SURFACE_IDLE: usize = 4;
+const TIMER_FILES_DEBOUNCE: usize = 5;
+const TIMER_POST_HIDE_COMPACT: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditTarget {
@@ -412,6 +424,7 @@ impl PricingEditControls {
         dpi: f32,
         light: bool,
         rect_dip: Option<D2D_RECT_F>,
+        initial_query: &str,
     ) {
         let Some(r) = rect_dip else {
             if self.search_visible && !self.search_edit.0.is_null() {
@@ -425,9 +438,13 @@ impl PricingEditControls {
             }
             return;
         };
+        let newly_created = self.search_edit.0.is_null();
         self.ensure_search_created(parent, dpi, light);
         if self.search_edit.0.is_null() {
             return;
+        }
+        if newly_created && !initial_query.is_empty() {
+            self.set_search_text(initial_query);
         }
         let scale = dpi / 96.0;
         let tuple = (
@@ -554,6 +571,24 @@ impl PricingEditControls {
         }
     }
 
+    /// Destroys all hidden child `EDIT` HWNDs when the dashboard hides so USER handles are
+    /// reclaimed immediately; controls are lazily recreated (with `search_query` restored) on reopen.
+    fn destroy_all_edits(&mut self, parent: HWND) {
+        unsafe {
+            let foc = GetFocus();
+            let had_focus = !foc.0.is_null() && self.all_hwnds().contains(&foc);
+            if had_focus && !parent.0.is_null() {
+                let _ = SetFocus(parent);
+            }
+            for h in self.all_hwnds() {
+                if !h.0.is_null() {
+                    let _ = DestroyWindow(h);
+                }
+            }
+        }
+        self.reset_handles();
+    }
+
     fn reset_handles(&mut self) {
         self.edits = [HWND::default(); 5];
         self.search_edit = HWND::default();
@@ -569,6 +604,27 @@ impl PricingEditControls {
         self.date_visible = false;
         self.date_initialized = false;
         self.last_date_rects_px = [(0, 0, 0, 0); 2];
+    }
+
+    /// Releases GDI `HFONT` and `HBRUSH` while the dashboard is hidden after detaching `HFONT`
+    /// from any hidden child `EDIT` controls so no control ever references a deleted font.
+    fn release_gdi(&mut self) {
+        unsafe {
+            if !self.font.0.is_null() {
+                for h in self.all_hwnds() {
+                    if !h.0.is_null() {
+                        let _ = SendMessageW(h, WM_SETFONT, WPARAM(0), LPARAM(0));
+                    }
+                }
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+                self.font = HFONT::default();
+                self.font_dpi = 0;
+            }
+            if !self.bg_brush.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.bg_brush.0));
+                self.bg_brush = HBRUSH::default();
+            }
+        }
     }
 
     fn read_hwnd_text(h: HWND) -> String {
@@ -757,13 +813,14 @@ fn system_icon_metrics_for_dpi(dpi: u32) -> ((i32, i32), (i32, i32)) {
     }
 }
 
-/// Owns HiDPI tray icons (Normal/Warn/Critical) and per-window dashboard icons safely without
-/// ever destroying `WNDCLASSEXW` class icons or double-freeing fallback handles.
+/// Owns HiDPI tray icons (Normal eagerly; Warn/Critical loaded lazily on first alert) and
+/// per-window dashboard icons safely without ever destroying `WNDCLASSEXW` class icons or
+/// double-freeing fallback handles.
 struct AppIcons {
     class_sm_fallback: HICON,
     tray_normal: HICON,
-    tray_warn: HICON,
-    tray_crit: HICON,
+    tray_warn: Option<HICON>,
+    tray_crit: Option<HICON>,
     tray_dpi: u32,
     owned_tray: Vec<HICON>,
     dash_big: Option<HICON>,
@@ -773,19 +830,29 @@ struct AppIcons {
 
 impl AppIcons {
     fn new(class_sm_fallback: HICON, sys_dpi: u32) -> Self {
-        let mut icons = Self {
+        let dpi = sys_dpi.max(96);
+        let mut owned_tray = Vec::new();
+        // Reuse the already-loaded class small icon for normal state at initial system DPI;
+        // defer Warn/Critical HICON loading until an alert actually fires (saves 2 USER + 4 GDI handles).
+        let tray_normal = if !class_sm_fallback.0.is_null() {
+            class_sm_fallback
+        } else {
+            let (_, (sm_w, sm_h)) = system_icon_metrics_for_dpi(dpi);
+            let h = load_res_icon(RES_ICON_NORMAL, sm_w, sm_h);
+            Self::push_owned_unique(&mut owned_tray, h);
+            h
+        };
+        Self {
             class_sm_fallback,
-            tray_normal: class_sm_fallback,
-            tray_warn: class_sm_fallback,
-            tray_crit: class_sm_fallback,
-            tray_dpi: 0,
-            owned_tray: Vec::new(),
+            tray_normal,
+            tray_warn: None,
+            tray_crit: None,
+            tray_dpi: dpi,
+            owned_tray,
             dash_big: None,
             dash_sm: None,
             dash_dpi: 0,
-        };
-        icons.reload_tray_for_dpi(sys_dpi);
-        icons
+        }
     }
 
     fn push_owned_unique(list: &mut Vec<HICON>, h: HICON) {
@@ -802,22 +869,15 @@ impl AppIcons {
         let fallback = self.class_sm_fallback;
         let (_, (sm_w, sm_h)) = system_icon_metrics_for_dpi(dpi);
         let normal_raw = load_res_icon(RES_ICON_NORMAL, sm_w, sm_h);
-        let warn_raw = load_res_icon(RES_ICON_WARN, sm_w, sm_h);
-        let crit_raw = load_res_icon(RES_ICON_CRIT, sm_w, sm_h);
-
         let new_normal = if !normal_raw.0.is_null() { normal_raw } else { fallback };
-        let new_warn = if !warn_raw.0.is_null() { warn_raw } else { new_normal };
-        let new_crit = if !crit_raw.0.is_null() { crit_raw } else { new_normal };
 
         let mut new_owned = Vec::new();
         Self::push_owned_unique(&mut new_owned, normal_raw);
-        Self::push_owned_unique(&mut new_owned, warn_raw);
-        Self::push_owned_unique(&mut new_owned, crit_raw);
 
         let old_owned = std::mem::replace(&mut self.owned_tray, new_owned);
         self.tray_normal = new_normal;
-        self.tray_warn = new_warn;
-        self.tray_crit = new_crit;
+        self.tray_warn = None;
+        self.tray_crit = None;
         self.tray_dpi = dpi;
 
         for h in old_owned {
@@ -830,11 +890,31 @@ impl AppIcons {
         true
     }
 
-    fn tray_for_severity(&self, sev: quota::AlertSeverity) -> HICON {
+    fn tray_for_severity(&mut self, sev: quota::AlertSeverity) -> HICON {
         match sev {
-            quota::AlertSeverity::Critical => self.tray_crit,
-            quota::AlertSeverity::Warn => self.tray_warn,
             quota::AlertSeverity::Normal => self.tray_normal,
+            quota::AlertSeverity::Warn => {
+                if let Some(h) = self.tray_warn {
+                    return h;
+                }
+                let (_, (sm_w, sm_h)) = system_icon_metrics_for_dpi(self.tray_dpi);
+                let raw = load_res_icon(RES_ICON_WARN, sm_w, sm_h);
+                Self::push_owned_unique(&mut self.owned_tray, raw);
+                let icon = if !raw.0.is_null() { raw } else { self.tray_normal };
+                self.tray_warn = Some(icon);
+                icon
+            }
+            quota::AlertSeverity::Critical => {
+                if let Some(h) = self.tray_crit {
+                    return h;
+                }
+                let (_, (sm_w, sm_h)) = system_icon_metrics_for_dpi(self.tray_dpi);
+                let raw = load_res_icon(RES_ICON_CRIT, sm_w, sm_h);
+                Self::push_owned_unique(&mut self.owned_tray, raw);
+                let icon = if !raw.0.is_null() { raw } else { self.tray_normal };
+                self.tray_crit = Some(icon);
+                icon
+            }
         }
     }
 
@@ -931,11 +1011,14 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 fn build_quick_session_menu_items(snapshot: &ScanSnapshot) -> Vec<QuickSessionMenuItem> {
     let now = Local::now();
     let show_multi = snapshot.has_non_antigravity();
+    // O(N) direct filter: avoids O(N^2) parent lookups inside `classify_resume_capability` for subagents.
     let mut cands: Vec<(bool, Option<chrono::DateTime<Local>>, &stats::SessionInfo)> = snapshot
         .sessions
         .iter()
         .filter(|s| {
-            launcher::classify_resume_capability(s, &snapshot.sessions).is_direct_resumable()
+            !s.is_archived
+                && !s.is_subagent
+                && launcher::is_cli_resumable_source(s.source)
                 && launcher::validate_conversation_id(&s.conversation_id)
         })
         .map(|s| {
@@ -972,16 +1055,38 @@ fn build_quick_session_menu_items(snapshot: &ScanSnapshot) -> Vec<QuickSessionMe
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrayAlertSig {
+    tray_hover_mode: bool,
+    notifications_enabled: bool,
+    tray_dpi: u32,
+    today_date: NaiveDate,
+    today_tokens: u64,
+    today_calls: u64,
+    today_usd_bits: u64,
+    week_usd_bits: u64,
+    budget_daily_bits: u64,
+    budget_weekly_bits: u64,
+    budget_warn_bits: u64,
+    budget_crit_bits: u64,
+    quota_warn_bits: u64,
+    quota_crit_bits: u64,
+    statusline_sig: Option<(i64, i64, usize, u64)>,
+}
+
 struct AppState {
     factories: D2DFactories,
     fonts: Fonts,
     icons: AppIcons,
     scanner: IncrementalScanner,
     snapshot: ScanSnapshot,
+    snapshot_gen: u64,
     telemetry: SystemTelemetry,
 
     pill_hwnd: HWND,
     pill_renderer: PillRenderer,
+    pill_dpi: f32,
+    tray_hover_dpi: f32,
     pill_pos: (i32, i32),
     custom_pos: Option<(i32, i32)>,
     drag_down: bool,
@@ -1012,6 +1117,9 @@ struct AppState {
     date_scope: DateScope,
     pill_items: u32,
     monitor_index: usize,
+    terminal_preset: launcher::TerminalPreset,
+    terminal_new_window: bool,
+    terminal_keep_open: bool,
     last_total_tokens: u64,
     recent_activity_until: Option<Instant>,
     tray: Option<TrayIcon>,
@@ -1019,6 +1127,28 @@ struct AppState {
     fired_alerts: HashSet<String>,
     last_tray_tip: String,
     self_test_mode: bool,
+
+    cursor_arrow: HCURSOR,
+    cursor_hand: HCURSOR,
+    cached_today_date: NaiveDate,
+    cached_today_key: String,
+    cached_alert_severity: quota::AlertSeverity,
+    next_midnight_check: Instant,
+    last_running_expire_check: Instant,
+    last_tray_alert_sig: Option<TrayAlertSig>,
+    last_quota_minute: i64,
+    fullscreen_probe: FullscreenProbe,
+    last_topmost_check: Instant,
+    tray_hover_last_rect_refresh: Instant,
+    telemetry_timer_ms: u32,
+    tokens_timer_ms: u32,
+    session_locked: bool,
+    display_off: bool,
+    files_debounce_armed: bool,
+    last_scan_at: Instant,
+    dir_watcher: Option<DirWatcher>,
+    wts_registered_hwnd: HWND,
+    power_guard: Option<ConsoleDisplayPowerGuard>,
 
     dash_owner_hwnd: Option<HWND>,
     dash_hwnd: Option<HWND>,
@@ -1097,6 +1227,16 @@ fn open_or_focus_dashboard_safe() {
     .flatten();
 
     if let Some((hwnd, light, moved_mon, fallback_rect)) = local_info {
+        with_app(|app| {
+            app.cancel_post_hide_compact();
+            if app.telemetry_timer_ms == 0 {
+                app.telemetry.sample();
+            }
+            if app.dash_view.as_ref().is_some_and(|v| v.active_tab == Tab::System) {
+                app.telemetry.refresh_self_private_mb();
+            }
+            app.sync_timers();
+        });
         unsafe {
             let th = theme_for(light);
             apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
@@ -1139,7 +1279,10 @@ fn open_or_focus_dashboard_safe() {
 fn create_dashboard_window_local() {
     let existing = with_app(|app| app.dash_hwnd).flatten();
     if let Some(hwnd) = existing {
-        with_app(|app| app.dash_visible = true);
+        with_app(|app| {
+            app.cancel_post_hide_compact();
+            app.dash_visible = true;
+        });
         unsafe {
             let cmd = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
             let _ = ShowWindow(hwnd, cmd);
@@ -1203,6 +1346,7 @@ fn create_dashboard_window_local() {
             apply_win11_frame(hwnd, th.is_dark, th.caption_colorref);
             let win_dpi = (window_dpi_scale(hwnd) * 96.0).round() as u32;
             with_app(|app| {
+                app.cancel_post_hide_compact();
                 app.icons.apply_dashboard_icons_for_dpi(hwnd, win_dpi);
                 app.dash_hwnd = Some(hwnd);
                 app.dash_view = Some(DashboardView::new(
@@ -1214,6 +1358,10 @@ fn create_dashboard_window_local() {
                 ));
                 app.dash_visible = true;
                 app.dash_monitor_index = mon_idx;
+                if app.telemetry_timer_ms == 0 {
+                    app.telemetry.sample();
+                }
+                app.sync_timers();
             });
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
@@ -1239,22 +1387,27 @@ fn open_dashboard_to_sessions_tab_safe() {
 }
 
 fn hide_dashboard_safe() {
-    let (hwnd, dash_only) = with_app(|app| {
+    let (hwnd, dash_only, pill_hwnd, self_test) = with_app(|app| {
         app.dash_visible = false;
         if let Some(dh) = app.dash_hwnd {
-            app.pricing_edits.hide_all(dh);
+            app.pricing_edits.destroy_all_edits(dh);
         }
+        app.pricing_edits.release_gdi();
+        // Drop DashFonts COM objects strictly BEFORE view.on_hide() drops dash_factories.
+        app.fonts.release_dashboard_fonts();
         if let Some(view) = &mut app.dash_view {
             view.mouse_dip = None;
             view.pricing_focused_field = None;
             view.search_focused = false;
             view.custom_date_focused = None;
-            // Genuinely free the large offscreen DIB + D2D DCRenderTarget while hidden
-            view.invalidate_surface();
+            // Release offscreen DIB, isolated dashboard D2D/WARP factory, cloned session caches & redactor.
+            view.on_hide();
         }
-        (app.dash_hwnd, app.dashboard_only)
+        app.factories.clear_measure_cache();
+        app.sync_timers();
+        (app.dash_hwnd, app.dashboard_only, app.pill_hwnd, app.self_test_mode)
     })
-    .unwrap_or((None, false));
+    .unwrap_or((None, false, HWND::default(), false));
 
     if dash_only {
         destroy_dashboard_safe();
@@ -1271,16 +1424,25 @@ fn hide_dashboard_safe() {
         if let Some((ph, true)) = pill_top {
             apply_pill_topmost(ph, true, false);
         }
-        trim_self_working_set();
+        compact_heap_and_trim_working_set();
+        // Arm a one-shot delayed compaction after async WARP/DWrite worker teardown settles.
+        if !self_test && !pill_hwnd.0.is_null() {
+            set_coalesced_timer(pill_hwnd, TIMER_POST_HIDE_COMPACT, 2_000, 250);
+        }
     }
 }
 
 fn destroy_dashboard_safe() {
     let (hwnd, owner_hwnd, dash_only) = with_app(|app| {
         app.dash_visible = false;
+        app.cancel_post_hide_compact();
+        app.fonts.release_dashboard_fonts();
         app.dash_view = None;
         app.pricing_edits.reset_handles();
+        app.pricing_edits.release_gdi();
         app.icons.clear_dashboard_icons();
+        app.factories.clear_measure_cache();
+        app.sync_timers();
         (app.dash_hwnd.take(), app.dash_owner_hwnd.take(), app.dashboard_only)
     })
     .unwrap_or((None, None, false));
@@ -1313,6 +1475,7 @@ fn set_pill_topmost_safe(top: bool, persist: bool) {
     let hwnd = with_app(|app| {
         app.topmost = top;
         app.topmost_unyielding_blocker = None;
+        app.sync_timers();
         if persist {
             app.persist_and_sync(app.pill_hwnd);
         }
@@ -1411,6 +1574,9 @@ impl AppState {
             pill_metric: 0,
             pill_items: self.pill_items,
             custom_pos: self.custom_pos,
+            terminal_preset: self.terminal_preset.to_u8(),
+            terminal_new_window: self.terminal_new_window,
+            terminal_keep_open: self.terminal_keep_open,
         }
     }
 
@@ -1452,6 +1618,9 @@ impl AppState {
         self.date_scope = DateScope::from_u8(p.date_scope);
         self.pill_items = p.pill_items;
         self.custom_pos = p.custom_pos;
+        self.terminal_preset = launcher::TerminalPreset::from_u8(p.terminal_preset);
+        self.terminal_new_window = p.terminal_new_window;
+        self.terminal_keep_open = p.terminal_keep_open;
         if let Some(view) = &mut self.dash_view {
             view.cost_mode = p.cost_mode;
             view.group_subagents = p.group_subagents;
@@ -1479,6 +1648,162 @@ impl AppState {
         self.topmost || (self.tray_hover_mode && self.tray_hover_shown)
     }
 
+    fn timer_owner_hwnd(&self) -> HWND {
+        if self.dashboard_only {
+            self.dash_hwnd.unwrap_or_default()
+        } else {
+            self.pill_hwnd
+        }
+    }
+
+    fn cancel_post_hide_compact(&self) {
+        if !self.pill_hwnd.0.is_null() {
+            unsafe {
+                let _ = KillTimer(self.pill_hwnd, TIMER_POST_HIDE_COMPACT);
+            }
+        }
+    }
+
+    fn has_active_running_session(&self) -> bool {
+        self.snapshot
+            .sessions
+            .iter()
+            .any(|s| s.is_running_hint && !s.is_archived)
+    }
+
+    fn compute_next_midnight_check(now_inst: Instant, now_local: chrono::DateTime<Local>) -> Instant {
+        let secs_since_midnight =
+            now_local.hour() * 3600 + now_local.minute() * 60 + now_local.second();
+        let secs_until_midnight = 86_400u32.saturating_sub(secs_since_midnight);
+        let step = if secs_until_midnight <= 35 {
+            1
+        } else {
+            30.min(secs_until_midnight.saturating_sub(30).max(1))
+        };
+        now_inst + Duration::from_secs(step as u64)
+    }
+
+    fn ensure_today_key(&mut self) -> bool {
+        let now_inst = Instant::now();
+        if now_inst < self.next_midnight_check {
+            return false;
+        }
+        let now_local = Local::now();
+        self.next_midnight_check = Self::compute_next_midnight_check(now_inst, now_local);
+        let today = now_local.date_naive();
+        if today != self.cached_today_date {
+            self.cached_today_date = today;
+            self.cached_today_key = today.format("%Y-%m-%d").to_string();
+            self.snapshot_gen = self.snapshot_gen.wrapping_add(1);
+            let wk = stats::iso_week_key(today);
+            let tk = self.cached_today_key.clone();
+            self.fired_alerts
+                .retain(|k| k.contains(&tk) || k.contains(&wk));
+            return true;
+        }
+        false
+    }
+
+    /// Reconciles `TIMER_TELEMETRY` and `TIMER_TOKENS` intervals against current visibility,
+    /// pill display items, session activity, lock state, and monitor power state using Windows
+    /// coalescable timers (`SetCoalescableTimer`).
+    fn sync_timers(&mut self) {
+        if self.self_test_mode {
+            return;
+        }
+        let hwnd = self.timer_owner_hwnd();
+        if hwnd.0.is_null() {
+            return;
+        }
+
+        let paused_power = self.session_locked || self.display_off;
+        let pill_vis = self.should_pill_be_visible();
+        let pill_needs_cpu = (self.pill_items & PILL_ITEM_CPU) != 0;
+        let pill_needs_ram = (self.pill_items & PILL_ITEM_RAM) != 0;
+        let pill_needs_sys = pill_needs_cpu || pill_needs_ram;
+        let recent_active = self
+            .recent_activity_until
+            .is_some_and(|t| Instant::now() < t);
+        let has_running = self.has_active_running_session();
+
+        let desired_tel_ms: u32 = if paused_power {
+            0
+        } else if self.dash_visible {
+            1000
+        } else if pill_vis && pill_needs_cpu {
+            1000
+        } else if pill_vis && pill_needs_ram {
+            2000
+        } else if self.fullscreen_hidden && !self.tray_hover_mode && self.pill_visible && self.hide_on_fullscreen {
+            // Lightweight guard so exiting fullscreen restores the pill promptly without sampling telemetry.
+            2000
+        } else if pill_vis && !pill_needs_sys {
+            if self.hide_on_fullscreen
+                || self.is_pill_effectively_topmost()
+                || self.tray_pin_retries > 0
+                || recent_active
+                || has_running
+            {
+                3000
+            } else {
+                0
+            }
+        } else if self.tray_pin_retries > 0 {
+            1000
+        } else {
+            0
+        };
+
+        if desired_tel_ms != self.telemetry_timer_ms {
+            if desired_tel_ms == 0 {
+                unsafe {
+                    let _ = KillTimer(hwnd, TIMER_TELEMETRY);
+                }
+            } else {
+                let tol = match desired_tel_ms {
+                    0..=1000 => 250,
+                    1001..=2000 => 500,
+                    _ => 1000,
+                };
+                set_coalesced_timer(hwnd, TIMER_TELEMETRY, desired_tel_ms, tol);
+            }
+            self.telemetry_timer_ms = desired_tel_ms;
+        }
+
+        // Health-aware safety fallback polling alongside instant `DirWatcher` targeted hints:
+        // Healthy watcher: 30s active / 60s idle / 60s hidden or locked (running hints expire every 10s with 0 syscalls).
+        // Unhealthy/unavailable watcher: 3s active / 15s idle / 30s hidden or locked.
+        let watcher_healthy = self.dir_watcher.as_ref().is_some_and(DirWatcher::is_healthy);
+        let desired_tok_ms: u32 = if watcher_healthy {
+            if paused_power {
+                60_000
+            } else if self.dash_visible || has_running || recent_active {
+                30_000
+            } else {
+                60_000
+            }
+        } else if paused_power {
+            30_000
+        } else if self.dash_visible || has_running || recent_active {
+            3_000
+        } else if !pill_vis {
+            30_000
+        } else {
+            15_000
+        };
+
+        if desired_tok_ms != self.tokens_timer_ms {
+            let tol = match desired_tok_ms {
+                0..=3000 => 500,
+                3001..=15000 => 2000,
+                15001..=30000 => 5000,
+                _ => 10_000,
+            };
+            set_coalesced_timer(hwnd, TIMER_TOKENS, desired_tok_ms, tol);
+            self.tokens_timer_ms = desired_tok_ms;
+        }
+    }
+
     fn redraw_pill(&mut self) {
         if self.pill_hwnd.0.is_null() || !self.should_pill_be_visible() {
             return;
@@ -1488,10 +1813,10 @@ impl AppState {
         } else {
             None
         };
-        let dpi = if let Some(ir) = flyout_anchor {
-            dpi_for_point((ir.left + ir.right) / 2, (ir.top + ir.bottom) / 2)
+        let dpi = if flyout_anchor.is_some() {
+            self.tray_hover_dpi
         } else {
-            window_dpi_scale(self.pill_hwnd) * 96.0
+            self.pill_dpi
         };
         let recent = self
             .recent_activity_until
@@ -1510,6 +1835,9 @@ impl AppState {
             self.dash_visible,
             recent,
             self.pill_items,
+            &self.cached_today_key,
+            self.cached_alert_severity,
+            self.snapshot_gen,
             &self.snapshot,
             &self.telemetry,
         ) {
@@ -1522,16 +1850,30 @@ impl AppState {
             return;
         }
         let rect_changed = self.tray_hover_icon_rect != Some(icon_rect);
+        if rect_changed || self.tray_hover_dpi <= 0.0 {
+            self.tray_hover_dpi =
+                dpi_for_point((icon_rect.left + icon_rect.right) / 2, (icon_rect.top + icon_rect.bottom) / 2);
+        }
         self.tray_hover_icon_rect = Some(icon_rect);
         self.tray_hover_leave_since = None;
+        self.tray_hover_last_rect_refresh = Instant::now();
         if !self.tray_hover_shown {
             self.tray_hover_shown = true;
+            unsafe {
+                let _ = KillTimer(self.pill_hwnd, TIMER_PILL_SURFACE_IDLE);
+            }
+            if self.telemetry_timer_ms == 0
+                && (self.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) != 0
+            {
+                self.telemetry.sample();
+            }
             self.redraw_pill();
             unsafe {
                 let _ = ShowWindow(self.pill_hwnd, SW_SHOWNOACTIVATE);
                 apply_pill_topmost(self.pill_hwnd, true, true);
-                let _ = SetTimer(self.pill_hwnd, TIMER_TRAY_HOVER, 100, None);
             }
+            set_coalesced_timer(self.pill_hwnd, TIMER_TRAY_HOVER, 125, 25);
+            self.sync_timers();
         } else if rect_changed {
             self.redraw_pill();
         }
@@ -1549,7 +1891,12 @@ impl AppState {
                 let _ = KillTimer(self.pill_hwnd, TIMER_TRAY_HOVER);
                 let _ = ShowWindow(self.pill_hwnd, SW_HIDE);
             }
+            // Release the layered D2D surface + DIB after 20s idle in tray-hover mode.
+            if !self.self_test_mode {
+                set_coalesced_timer(self.pill_hwnd, TIMER_PILL_SURFACE_IDLE, 20_000, 2000);
+            }
         }
+        self.sync_timers();
     }
 
     fn tick_tray_hover_guard(&mut self) {
@@ -1571,8 +1918,18 @@ impl AppState {
                 return;
             }
         }
-        if let Some(fresh_rect) = self.tray.as_ref().and_then(TrayIcon::get_rect) {
-            self.tray_hover_icon_rect = Some(fresh_rect);
+        // Throttle Shell_NotifyIconGetRect Explorer RPC to at most 1 Hz while flyout is open.
+        if self.tray_hover_last_rect_refresh.elapsed() >= Duration::from_secs(1) {
+            if let Some(fresh_rect) = self.tray.as_ref().and_then(TrayIcon::get_rect) {
+                if self.tray_hover_icon_rect != Some(fresh_rect) {
+                    self.tray_hover_dpi = dpi_for_point(
+                        (fresh_rect.left + fresh_rect.right) / 2,
+                        (fresh_rect.top + fresh_rect.bottom) / 2,
+                    );
+                    self.tray_hover_icon_rect = Some(fresh_rect);
+                }
+            }
+            self.tray_hover_last_rect_refresh = Instant::now();
         }
         let Some(icon_rect) = self.tray_hover_icon_rect else {
             self.hide_tray_hover_flyout();
@@ -1617,30 +1974,48 @@ impl AppState {
         }
     }
 
-    fn apply_pill_visibility(&mut self) {
+    /// Returns `true` if `redraw_pill()` was already performed during a hidden -> visible transition.
+    fn apply_pill_visibility(&mut self) -> bool {
         if self.dashboard_only || self.pill_hwnd.0.is_null() {
-            return;
+            return false;
         }
         let should_show = self.should_pill_be_visible();
+        let mut redrew = false;
         unsafe {
             let currently_visible = IsWindowVisible(self.pill_hwnd).as_bool();
             if should_show && !currently_visible {
+                let _ = KillTimer(self.pill_hwnd, TIMER_PILL_SURFACE_IDLE);
+                if self.telemetry_timer_ms == 0
+                    && (self.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) != 0
+                {
+                    self.telemetry.sample();
+                }
                 self.redraw_pill();
+                redrew = true;
                 let _ = ShowWindow(self.pill_hwnd, SW_SHOWNOACTIVATE);
                 if self.is_pill_effectively_topmost() {
                     apply_pill_topmost(self.pill_hwnd, true, true);
                 }
             } else if !should_show && currently_visible {
                 let _ = ShowWindow(self.pill_hwnd, SW_HIDE);
+                if !self.tray_hover_mode {
+                    let _ = KillTimer(self.pill_hwnd, TIMER_PILL_SURFACE_IDLE);
+                    if self.pill_renderer.release_surface() {
+                        compact_heap_and_trim_working_set();
+                    }
+                }
             }
         }
+        self.sync_timers();
+        redrew
     }
 
     fn check_fullscreen_guard(&mut self) {
         if self.dashboard_only || self.self_test_mode || self.tray_hover_mode || !self.pill_visible {
             return;
         }
-        let want_hidden = self.hide_on_fullscreen && is_other_app_fullscreen();
+        let want_hidden =
+            self.hide_on_fullscreen && self.fullscreen_probe.check(Instant::now());
         if want_hidden != self.fullscreen_hidden {
             self.fullscreen_hidden = want_hidden;
             self.apply_pill_visibility();
@@ -1648,16 +2023,18 @@ impl AppState {
     }
 
     fn build_tray_tooltip(&self) -> String {
-        if self.tray_hover_mode {
+        Self::format_tray_tooltip(self.tray_hover_mode, &self.cached_today_key, &self.snapshot)
+    }
+
+    fn format_tray_tooltip(tray_hover_mode: bool, today_key: &str, snapshot: &ScanSnapshot) -> String {
+        if tray_hover_mode {
             // Suppress Windows' native gray text tooltip so it never covers our hover capsule flyout.
             return String::new();
         }
-        let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let tc = self
-            .snapshot
+        let tc = snapshot
             .agg
             .by_day
-            .get(&today_key)
+            .get(today_key)
             .copied()
             .unwrap_or_default();
         let mut tip = format!(
@@ -1665,7 +2042,7 @@ impl AppState {
             stats::fmt_compact(tc.total_tokens()),
             pricing::fmt_cost_compact(&tc.cost, tc.calls),
         );
-        if let Some(sl) = &self.snapshot.statusline {
+        if let Some(sl) = &snapshot.statusline {
             if let Some(b) = sl.tightest_bucket() {
                 if let Some(rp) = b.remaining_pct() {
                     tip.push_str(&format!(" · {} {:.0}%", b.label, rp));
@@ -1675,57 +2052,102 @@ impl AppState {
         tip
     }
 
-    fn sync_tray_and_alerts(&mut self) {
-        if self.self_test_mode {
-            return;
-        }
-        let tip = self.build_tray_tooltip();
-        if tip != self.last_tray_tip {
-            if let Some(tray) = &self.tray {
-                tray.update_tooltip(&tip);
-            }
-            self.last_tray_tip = tip;
-        }
-
-        let today_date = Local::now().date_naive();
-        let today_key = today_date.format("%Y-%m-%d").to_string();
+    fn compute_alert_events(
+        today_date: NaiveDate,
+        today_key: &str,
+        snapshot: &ScanSnapshot,
+    ) -> (Vec<quota::AlertEvent>, quota::AlertSeverity) {
         let week_key = stats::iso_week_key(today_date);
-        let today_usd = self
-            .snapshot
+        let today_usd = snapshot
             .agg
             .by_day
-            .get(&today_key)
+            .get(today_key)
             .map(|c| c.cost.total_usd())
             .unwrap_or(0.0);
-        let week_usd = self
-            .snapshot
+        let week_usd = snapshot
             .agg
             .by_week
             .get(&week_key)
             .map(|c| c.cost.total_usd())
             .unwrap_or(0.0);
         let events = quota::evaluate_alerts(
-            &self.snapshot.budget,
-            &today_key,
+            &snapshot.budget,
+            today_key,
             today_usd,
             &week_key,
             week_usd,
-            self.snapshot.statusline.as_ref(),
+            snapshot.statusline.as_ref(),
             Utc::now(),
         );
-        // Always sync the 3-state tray icon BEFORE the notifications_enabled early-return so
-        // muting balloon popups never freezes tray alert color feedback.
         let max_sev = events
             .iter()
             .map(|e| e.severity)
             .max()
             .unwrap_or(quota::AlertSeverity::Normal);
-        let target_icon = self.icons.tray_for_severity(max_sev);
-        if let Some(tray) = &mut self.tray {
-            tray.update_icon(target_icon);
-        }
+        (events, max_sev)
+    }
 
-        if !self.notifications_enabled {
+    fn compute_tray_alert_sig(
+        tray_hover_mode: bool,
+        notifications_enabled: bool,
+        tray_dpi: u32,
+        today_date: NaiveDate,
+        today_key: &str,
+        snapshot: &ScanSnapshot,
+    ) -> TrayAlertSig {
+        let tc = snapshot
+            .agg
+            .by_day
+            .get(today_key)
+            .copied()
+            .unwrap_or_default();
+        let week_key = stats::iso_week_key(today_date);
+        let week_usd = snapshot
+            .agg
+            .by_week
+            .get(&week_key)
+            .map(|c| c.cost.total_usd())
+            .unwrap_or(0.0);
+        let statusline_sig = snapshot.statusline.as_ref().map(|sl| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in &sl.buckets {
+                for &byte in b.label.as_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+                let rem_bits = b.remaining_pct().map(f64::to_bits).unwrap_or(u64::MAX);
+                h ^= rem_bits;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            (
+                sl.captured_at_utc.timestamp(),
+                Utc::now().timestamp() / 60,
+                sl.buckets.len(),
+                h,
+            )
+        });
+        let b = &snapshot.budget;
+        TrayAlertSig {
+            tray_hover_mode,
+            notifications_enabled,
+            tray_dpi,
+            today_date,
+            today_tokens: tc.total_tokens(),
+            today_calls: tc.calls,
+            today_usd_bits: tc.cost.total_usd().to_bits(),
+            week_usd_bits: week_usd.to_bits(),
+            budget_daily_bits: b.daily_usd.to_bits(),
+            budget_weekly_bits: b.weekly_usd.to_bits(),
+            budget_warn_bits: b.warn_pct.to_bits(),
+            budget_crit_bits: b.critical_pct.to_bits(),
+            quota_warn_bits: b.quota_warn_rem_pct.to_bits(),
+            quota_crit_bits: b.quota_crit_rem_pct.to_bits(),
+            statusline_sig,
+        }
+    }
+
+    fn dispatch_alert_balloons(&mut self, events: Vec<quota::AlertEvent>) {
+        if self.self_test_mode || !self.notifications_enabled {
             return;
         }
         for ev in events {
@@ -1742,6 +2164,46 @@ impl AppState {
         }
     }
 
+    fn sync_tray_and_alerts(&mut self) {
+        self.ensure_today_key();
+        let sig = Self::compute_tray_alert_sig(
+            self.tray_hover_mode,
+            self.notifications_enabled,
+            self.icons.tray_dpi,
+            self.cached_today_date,
+            &self.cached_today_key,
+            &self.snapshot,
+        );
+        if self.last_tray_alert_sig == Some(sig) {
+            return;
+        }
+        self.last_tray_alert_sig = Some(sig);
+
+        let (events, max_sev) =
+            Self::compute_alert_events(self.cached_today_date, &self.cached_today_key, &self.snapshot);
+        self.cached_alert_severity = max_sev;
+
+        if self.self_test_mode {
+            return;
+        }
+        let tip = self.build_tray_tooltip();
+        if tip != self.last_tray_tip {
+            if let Some(tray) = &self.tray {
+                tray.update_tooltip(&tip);
+            }
+            self.last_tray_tip = tip;
+        }
+
+        // Always sync the 3-state tray icon BEFORE the notifications_enabled early-return so
+        // muting balloon popups never freezes tray alert color feedback.
+        let target_icon = self.icons.tray_for_severity(max_sev);
+        if let Some(tray) = &mut self.tray {
+            tray.update_icon(target_icon);
+        }
+
+        self.dispatch_alert_balloons(events);
+    }
+
     fn invalidate_dashboard(&self) {
         if self.dash_visible {
             if let Some(hwnd) = self.dash_hwnd {
@@ -1752,39 +2214,134 @@ impl AppState {
         }
     }
 
-    fn refresh_tokens(&mut self, force: bool) {
-        let prev_running: HashMap<String, bool> = self
-            .snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.is_running_hint)
-            .map(|s| (s.conversation_id.clone(), true))
-            .collect();
-        let fresh = self.scanner.scan();
-        let running_changed = {
-            let mut cur_running_cnt = 0usize;
-            let mut diff = false;
-            for s in &fresh.sessions {
-                if s.is_running_hint {
-                    cur_running_cnt += 1;
-                    if !prev_running.contains_key(&s.conversation_id) {
-                        diff = true;
-                        break;
+    fn on_telemetry_tick(&mut self) -> bool {
+        if self.session_locked || self.display_off {
+            self.sync_timers();
+            return false;
+        }
+        let now = Instant::now();
+        let date_rolled = self.ensure_today_key();
+        if date_rolled {
+            if let Some(view) = &mut self.dash_view {
+                view.mark_data_dirty();
+            }
+            self.sync_tray_and_alerts();
+        }
+        let pill_vis = self.should_pill_be_visible();
+        let pill_needs_sys = (self.pill_items & (PILL_ITEM_CPU | PILL_ITEM_RAM)) != 0;
+        let sampled = self.dash_visible || (pill_vis && pill_needs_sys);
+        if sampled {
+            self.telemetry.sample();
+        }
+
+        let mut need_pill_redraw = (sampled && pill_needs_sys) || date_rolled;
+
+        // Zero-syscall O(active) expiry of stale running badges every 10s so TIMER_TOKENS can
+        // safely stay at 30s/60s when DirWatcher is healthy.
+        if now.duration_since(self.last_running_expire_check) >= Duration::from_secs(10) {
+            self.last_running_expire_check = now;
+            if self.scanner.expire_running_hints_only(&mut self.snapshot) {
+                self.snapshot_gen = self.snapshot_gen.wrapping_add(1);
+                if let Some(view) = &mut self.dash_view {
+                    view.mark_data_dirty();
+                }
+                self.invalidate_dashboard();
+                need_pill_redraw = true;
+            }
+        }
+
+        // Keep quota staleness fresh on minute rollover even if CPU/RAM telemetry is disabled.
+        if pill_vis && (self.pill_items & PILL_ITEM_QUOTA) != 0 && self.snapshot.statusline.is_some() {
+            let minute = Utc::now().timestamp() / 60;
+            if minute != self.last_quota_minute {
+                self.last_quota_minute = minute;
+                need_pill_redraw = true;
+            }
+        }
+
+        // Expire recent_activity_until cleanly so idle timer backoff & pill dot settle.
+        if self.recent_activity_until.is_some_and(|t| now >= t) {
+            self.recent_activity_until = None;
+            need_pill_redraw = true;
+        }
+
+        if self.tray_pin_retries > 0 {
+            self.sync_tray_taskbar_pin();
+        }
+        self.check_fullscreen_guard();
+        if need_pill_redraw && self.should_pill_be_visible() {
+            self.redraw_pill();
+        }
+        if self.dash_visible {
+            if let (Some(hwnd), Some(view)) = (self.dash_hwnd, &mut self.dash_view) {
+                if view.active_tab == Tab::System {
+                    self.telemetry.refresh_self_private_mb();
+                }
+                match view.on_telemetry_tick(&self.telemetry) {
+                    TelemetryRepaintMode::Skip => {}
+                    TelemetryRepaintMode::PartialHero => {
+                        let dpi = window_dpi_scale(hwnd) * 96.0;
+                        unsafe {
+                            let hdc = GetDC(hwnd);
+                            if !hdc.0.is_null() {
+                                let ok = view.repaint_hero_telemetry_only(
+                                    &self.factories,
+                                    &self.fonts,
+                                    hwnd,
+                                    hdc,
+                                    dpi,
+                                    &self.telemetry,
+                                    self.light_theme,
+                                );
+                                let _ = ReleaseDC(hwnd, hdc);
+                                if ok.is_err() {
+                                    let _ = InvalidateRect(hwnd, None, false);
+                                }
+                            } else {
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
+                        }
+                    }
+                    TelemetryRepaintMode::Full => {
+                        unsafe {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
                     }
                 }
             }
-            diff || cur_running_cnt != prev_running.len()
-        };
-        let changed = force
-            || fresh.pricing_changed
-            || fresh.statusline_changed
-            || fresh.budget_changed
-            || fresh.session_meta_changed
-            || fresh.files_reparsed > 0
-            || fresh.sessions.len() != self.snapshot.sessions.len()
-            || running_changed;
-        self.snapshot = fresh;
+        }
+        self.sync_timers();
+
+        // Throttle periodic Z-order health scan from 1s -> 5s (event-driven checks stay immediate).
+        if !self.dashboard_only
+            && self.is_pill_effectively_topmost()
+            && self.should_pill_be_visible()
+            && now.duration_since(self.last_topmost_check) >= Duration::from_secs(5)
+        {
+            self.last_topmost_check = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn schedule_watcher_refresh(&mut self, hwnd: HWND) {
+        if self.files_debounce_armed || self.self_test_mode || hwnd.0.is_null() {
+            return;
+        }
+        let debounce_ms: u32 = if self.dash_visible { 1_500 } else { 2_500 };
+        let elapsed_ms = self.last_scan_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let cooldown_rem_ms = 2_000u32.saturating_sub(elapsed_ms);
+        let delay_ms = debounce_ms.max(cooldown_rem_ms);
+        self.files_debounce_armed = true;
+        set_coalesced_timer(hwnd, TIMER_FILES_DEBOUNCE, delay_ms, 250);
+    }
+
+    fn apply_scan_delta(&mut self, delta: ScanDelta, force: bool, date_rolled: bool) {
+        self.last_scan_at = Instant::now();
+        let changed = force || date_rolled || delta.changed || delta.running_changed;
         if changed {
+            self.snapshot_gen = self.snapshot_gen.wrapping_add(1);
             let cur_tot = self.snapshot.agg.total.total_tokens();
             if cur_tot != self.last_total_tokens {
                 self.last_total_tokens = cur_tot;
@@ -1797,6 +2354,58 @@ impl AppState {
             self.redraw_pill();
             self.invalidate_dashboard();
         }
+        self.sync_timers();
+    }
+
+    fn on_files_debounce_timer(&mut self, hwnd: HWND) {
+        self.files_debounce_armed = false;
+        let elapsed_ms = self.last_scan_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        if elapsed_ms < 2_000 {
+            let rem = (2_000 - elapsed_ms).max(100);
+            self.files_debounce_armed = true;
+            set_coalesced_timer(hwnd, TIMER_FILES_DEBOUNCE, rem, 150);
+            return;
+        }
+        let watcher_hints = self
+            .dir_watcher
+            .as_ref()
+            .map(DirWatcher::drain_hints)
+            .unwrap_or(WatcherHints {
+                paths: Vec::new(),
+                overflow: true,
+                has_companion_change: false,
+            });
+        if watcher_hints.is_empty() {
+            return;
+        }
+        let scan_hints = ScanHints {
+            paths: watcher_hints.paths,
+            overflow: watcher_hints.overflow,
+            has_companion_change: watcher_hints.has_companion_change,
+        };
+        let date_rolled = self.ensure_today_key();
+        let delta = self.scanner.scan_with_hints(&mut self.snapshot, &scan_hints);
+        self.apply_scan_delta(delta, false, date_rolled);
+    }
+
+    fn refresh_tokens(&mut self, force: bool) {
+        if self.files_debounce_armed {
+            let owner = self.timer_owner_hwnd();
+            if !owner.0.is_null() {
+                unsafe {
+                    let _ = KillTimer(owner, TIMER_FILES_DEBOUNCE);
+                }
+            }
+            self.files_debounce_armed = false;
+        }
+        // Drain queued watcher hints BEFORE scanning so any file modified while scanning
+        // transitions the queue empty -> non-empty and posts a fresh wakeup.
+        if let Some(w) = &self.dir_watcher {
+            let _ = w.drain_hints();
+        }
+        let date_rolled = self.ensure_today_key();
+        let delta = self.scanner.scan_if_changed(&mut self.snapshot);
+        self.apply_scan_delta(delta, force, date_rolled);
     }
 
     fn lookup_session(&self, cid: &str) -> Option<stats::SessionInfo> {
@@ -1896,6 +2505,28 @@ impl AppState {
         }
     }
 
+    fn effective_terminal_config(&self) -> launcher::TerminalConfig {
+        let base = launcher::TerminalConfig {
+            preset: self.terminal_preset,
+            wt_profile: None,
+            wt_new_window: self.terminal_new_window,
+            keep_shell_open: self.terminal_keep_open,
+            custom: None,
+        };
+        launcher::load_effective_terminal_config(base)
+    }
+
+    fn sync_terminal_prefs_to_file_if_exists(&self) {
+        if let Some(path) = launcher::default_terminal_config_path() {
+            let _ = launcher::sync_ui_prefs_to_terminal_json_if_exists(
+                &path,
+                self.terminal_preset,
+                self.terminal_new_window,
+                self.terminal_keep_open,
+            );
+        }
+    }
+
     /// Launches a terminal to resume `cid`. Returns `true` when invoked from the dashboard and
     /// launch succeeds so the dashboard auto-hides (stays open on privacy block or launch error
     /// so the error toast remains visible; emits a quiet tray balloon on workspace fallback).
@@ -1924,7 +2555,8 @@ impl AppState {
             return false;
         }
         let had_ws_spec = launcher::normalize_workspace_path_str(&s.workspace).is_some();
-        match launcher::launch_resume_for_session(&s) {
+        let term_cfg = self.effective_terminal_config();
+        match launcher::launch_resume_for_session_with_config(&s, &term_cfg) {
             Ok(outcome) => {
                 if outcome.workspace_fallback && had_ws_spec {
                     let msg = format!(
@@ -1961,7 +2593,7 @@ impl AppState {
                 }
             }
             Err(err) => {
-                if launcher::resolve_cli_exe_for_source(s.source).is_none() {
+                if err.starts_with("未找到 ") {
                     if let Ok(cmd) = launcher::format_resume_command_for_session(&s) {
                         if copy_text_to_clipboard(hwnd, &cmd) {
                             let cli_name =
@@ -2264,6 +2896,7 @@ impl AppState {
         match self.scanner.save_budget(cfg) {
             Ok(()) => {
                 self.fired_alerts.clear();
+                self.last_tray_alert_sig = None;
                 self.refresh_tokens(true);
                 self.load_budget_into_editor();
                 if let Some(view) = &mut self.dash_view {
@@ -2285,6 +2918,7 @@ impl AppState {
         match self.scanner.save_budget(cfg) {
             Ok(()) => {
                 self.fired_alerts.clear();
+                self.last_tray_alert_sig = None;
                 self.refresh_tokens(true);
                 self.load_budget_into_editor();
                 if let Some(view) = &mut self.dash_view {
@@ -2358,7 +2992,8 @@ impl AppState {
             return;
         }
         let dpi = window_dpi_scale(hwnd) * 96.0;
-        let (is_pricing, is_budget, p_rects, b_rects, search_rect, date_rects, date_vals) =
+        let need_search_restore = self.pricing_edits.search_edit.0.is_null();
+        let (is_pricing, is_budget, p_rects, b_rects, search_rect, search_restore, date_rects, date_vals) =
             match &self.dash_view {
                 Some(v) => (
                     v.is_pricing_editor_active(),
@@ -2366,6 +3001,11 @@ impl AppState {
                     v.pricing_field_rects,
                     v.budget_field_rects,
                     if v.is_search_active() { v.search_field_rect } else { None },
+                    if need_search_restore && v.is_search_active() && !v.search_query.is_empty() {
+                        Some(v.search_query.clone())
+                    } else {
+                        None
+                    },
                     if v.is_custom_date_active() { v.custom_date_rects } else { None },
                     v.format_custom_date_fields(),
                 ),
@@ -2399,8 +3039,13 @@ impl AppState {
             self.pricing_edits.hide_five_edits(hwnd);
         }
 
-        self.pricing_edits
-            .sync_search_layout(hwnd, dpi, self.light_theme, search_rect);
+        self.pricing_edits.sync_search_layout(
+            hwnd,
+            dpi,
+            self.light_theme,
+            search_rect,
+            search_restore.as_deref().unwrap_or(""),
+        );
         self.pricing_edits
             .sync_date_layout(hwnd, dpi, self.light_theme, date_rects);
         if date_rects.is_some() && !self.pricing_edits.date_initialized {
@@ -2568,8 +3213,12 @@ fn show_session_context_menu_safe(hwnd: HWND, cid: String, anchor: Option<POINT>
         let title = s.title.clone();
         let source = s.source;
         let show_multi = app.snapshot.has_non_antigravity();
-        let resumable_parent_id = launcher::find_resumable_parent(&s, &app.snapshot.sessions)
-            .map(|p| p.conversation_id.clone());
+        let resumable_parent_id = if s.is_subagent {
+            launcher::find_resumable_parent(&s, &app.snapshot.sessions)
+                .map(|p| p.conversation_id.clone())
+        } else {
+            None
+        };
         let parent_id = resumable_parent_id.clone().or_else(|| match &cap {
             launcher::ResumeCapability::Subagent { parent_id, .. } => parent_id.clone(),
             _ => None,
@@ -2780,6 +3429,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
         } else {
             build_quick_session_menu_items(&app.snapshot)
         };
+        let eff_term = app.effective_terminal_config();
         (
             app.light_theme,
             app.topmost,
@@ -2793,6 +3443,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             app.dash_visible,
             app.pill_items,
             quick_sessions,
+            eff_term,
         )
     });
     if let Some((
@@ -2808,9 +3459,11 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
         local_vis,
         items,
         quick_sessions,
+        eff_term,
     )) = state
     {
         let autostart = is_autostart_enabled();
+        let term_avail = launcher::probe_terminal_availability();
         let dash_open = local_vis
             || unsafe {
                 FindWindowW(w!("GaugeDashboardClass"), None)
@@ -2832,6 +3485,10 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
             mon,
             items,
             &quick_sessions,
+            eff_term.preset,
+            eff_term.wt_new_window,
+            eff_term.keep_shell_open,
+            &term_avail,
         );
         with_app(|app| app.pill_menu_open = false);
         let mut handled_topmost = false;
@@ -2844,6 +3501,55 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                     if let Some(item) = quick_sessions.get(idx) {
                         with_app(|app| {
                             let _ = app.handle_resume_session(hwnd, &item.conversation_id, false);
+                        });
+                    }
+                }
+                c if (CMD_TERMINAL_PRESET_BASE..CMD_TERMINAL_PRESET_BASE + 8).contains(&c) => {
+                    let idx = (c - CMD_TERMINAL_PRESET_BASE) as usize;
+                    if let Some(&preset) = launcher::TerminalPreset::ALL.get(idx) {
+                        with_app(|app| {
+                            app.terminal_preset = preset;
+                            app.terminal_new_window = eff_term.wt_new_window;
+                            app.terminal_keep_open = eff_term.keep_shell_open;
+                            app.sync_terminal_prefs_to_file_if_exists();
+                            app.persist_and_sync(hwnd);
+                        });
+                    }
+                }
+                CMD_TERMINAL_TOGGLE_NEW_WIN => {
+                    with_app(|app| {
+                        app.terminal_preset = eff_term.preset;
+                        app.terminal_new_window = !eff_term.wt_new_window;
+                        app.terminal_keep_open = eff_term.keep_shell_open;
+                        app.sync_terminal_prefs_to_file_if_exists();
+                        app.persist_and_sync(hwnd);
+                    });
+                }
+                CMD_TERMINAL_TOGGLE_KEEP_OPEN => {
+                    with_app(|app| {
+                        app.terminal_preset = eff_term.preset;
+                        app.terminal_new_window = eff_term.wt_new_window;
+                        app.terminal_keep_open = !eff_term.keep_shell_open;
+                        app.sync_terminal_prefs_to_file_if_exists();
+                        app.persist_and_sync(hwnd);
+                    });
+                }
+                CMD_TERMINAL_OPEN_CONFIG => {
+                    let exe_dir = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+                    let res = match exe_dir {
+                        Some(dir) => launcher::ensure_default_terminal_json(&dir, &eff_term)
+                            .and_then(|path| launcher::open_file_in_shell(hwnd, &path)),
+                        None => Err("无法定位程序目录，无法生成 terminal.json".to_string()),
+                    };
+                    if let Err(err) = res {
+                        with_app(|app| {
+                            if app.notifications_enabled {
+                                if let Some(tray) = &app.tray {
+                                    tray.show_balloon("Gauge", &err, false, true);
+                                }
+                            }
                         });
                     }
                 }
@@ -2917,10 +3623,12 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                 CMD_TOGGLE_HIDE_FULLSCREEN => {
                     with_app(|app| {
                         app.hide_on_fullscreen = !app.hide_on_fullscreen;
+                        app.fullscreen_probe.invalidate();
                         if !app.hide_on_fullscreen && app.fullscreen_hidden {
                             app.fullscreen_hidden = false;
                             app.apply_pill_visibility();
                         }
+                        app.sync_timers();
                         app.persist_and_sync(hwnd);
                     });
                 }
@@ -2970,8 +3678,10 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                         app.fullscreen_hidden = false;
                         app.custom_pos = None;
                         app.pill_renderer.invalidate_position();
-                        app.apply_pill_visibility();
-                        app.redraw_pill();
+                        let redrew = app.apply_pill_visibility();
+                        if !redrew {
+                            app.redraw_pill();
+                        }
                         app.sync_tray_and_alerts();
                         app.persist_and_sync(hwnd);
                     });
@@ -2982,6 +3692,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                 }
                 CMD_QUIT => {
                     with_app(|app| {
+                        app.scanner.flush_archive();
                         if let Some(tray) = &mut app.tray {
                             tray.remove();
                         }
@@ -2997,6 +3708,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                         app.pill_items = PILL_ITEMS_DEFAULT;
                         app.pill_renderer.invalidate_position();
                         app.redraw_pill();
+                        app.sync_timers();
                         app.persist_and_sync(hwnd);
                     });
                 }
@@ -3008,6 +3720,7 @@ fn handle_pill_or_tray_context_menu(hwnd: HWND) {
                             app.pill_items = next;
                             app.pill_renderer.invalidate_position();
                             app.redraw_pill();
+                            app.sync_timers();
                             app.persist_and_sync(hwnd);
                         }
                     });
@@ -3056,8 +3769,10 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SETCURSOR => {
-            if let Ok(hand) = LoadCursorW(None, IDC_HAND) {
-                SetCursor(hand);
+            if let Some(hand) = with_app(|app| app.cursor_hand) {
+                if !hand.0.is_null() {
+                    SetCursor(hand);
+                }
             }
             LRESULT(1)
         }
@@ -3087,13 +3802,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_MOUSEMOVE => {
             let mut move_target: Option<(i32, i32)> = None;
-            let mut pt = POINT {
-                x: (lparam.0 & 0xFFFF) as i16 as i32,
-                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
-            };
-            let _ = ClientToScreen(hwnd, &mut pt);
             with_app(|app| {
                 if app.drag_down {
+                    let mut pt = POINT {
+                        x: (lparam.0 & 0xFFFF) as i16 as i32,
+                        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                    };
+                    let _ = ClientToScreen(hwnd, &mut pt);
                     let dx = pt.x - app.drag_start_cursor.0;
                     let dy = pt.y - app.drag_start_cursor.1;
                     if !app.dragging && (dx.abs() >= 4 || dy.abs() >= 4) {
@@ -3206,7 +3921,11 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     0,
                     SWP_NOSIZE | SWP_NOACTIVATE,
                 );
-                with_app(|app| app.redraw_pill());
+                let new_dpi = window_dpi_scale(hwnd) * 96.0;
+                with_app(|app| {
+                    app.pill_dpi = new_dpi;
+                    app.redraw_pill();
+                });
             }
             if !was_dragging {
                 with_app(|app| {
@@ -3240,6 +3959,12 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             .map(|t| Instant::now() < t)
                             .unwrap_or(false)
                         {
+                            return;
+                        }
+                        // Avoid cross-process Shell_NotifyIconGetRect RPC on every mousemove while
+                        // the hover flyout is already visible.
+                        if app.tray_hover_shown {
+                            app.tray_hover_leave_since = None;
                             return;
                         }
                         let icon_rect = app
@@ -3285,9 +4010,12 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 if app.tray_pin_retries > 0 {
                     app.sync_tray_taskbar_pin();
                 }
-                app.apply_pill_visibility();
+                let redrew = app.apply_pill_visibility();
                 app.sync_tray_and_alerts();
-                app.redraw_pill();
+                if !redrew {
+                    app.redraw_pill();
+                }
+                app.sync_timers();
             });
             set_pill_topmost_safe(top, false);
             LRESULT(0)
@@ -3299,19 +4027,75 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             });
             LRESULT(0)
         }
+        WM_APP_FILES_CHANGED => {
+            with_app(|app| app.schedule_watcher_refresh(hwnd));
+            LRESULT(0)
+        }
+        WM_WTSSESSION_CHANGE => {
+            let ev = wparam.0 as u32;
+            with_app(|app| {
+                if ev == WTS_SESSION_LOCK {
+                    app.session_locked = true;
+                    app.sync_timers();
+                } else if ev == WTS_SESSION_UNLOCK {
+                    app.session_locked = false;
+                    app.next_midnight_check = Instant::now();
+                    app.telemetry.reset_cpu_baseline();
+                    app.fullscreen_probe.invalidate();
+                    app.sync_timers();
+                    app.refresh_tokens(false);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            let ev = wparam.0 as u32;
+            with_app(|app| match ev {
+                PBT_APMSUSPEND => {
+                    app.display_off = true;
+                    app.scanner.flush_archive();
+                    app.sync_timers();
+                }
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                    app.display_off = false;
+                    app.next_midnight_check = Instant::now();
+                    app.telemetry.reset_cpu_baseline();
+                    app.fullscreen_probe.invalidate();
+                    app.sync_timers();
+                    app.refresh_tokens(false);
+                }
+                PBT_POWERSETTINGCHANGE => {
+                    if let Some(state) = parse_console_display_state(lparam) {
+                        if state == 0 {
+                            app.display_off = true;
+                            app.sync_timers();
+                        } else if app.display_off {
+                            app.display_off = false;
+                            app.next_midnight_check = Instant::now();
+                            app.telemetry.reset_cpu_baseline();
+                            app.fullscreen_probe.invalidate();
+                            app.sync_timers();
+                            app.refresh_tokens(false);
+                        }
+                    }
+                }
+                _ => {}
+            });
+            LRESULT(1)
+        }
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                with_app(|app| app.scanner.flush_archive());
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             match wparam.0 {
                 TIMER_TELEMETRY => {
-                    with_app(|app| {
-                        app.telemetry.sample();
-                        if app.tray_pin_retries > 0 {
-                            app.sync_tray_taskbar_pin();
-                        }
-                        app.check_fullscreen_guard();
-                        app.redraw_pill();
-                        app.invalidate_dashboard();
-                    });
-                    ensure_pill_topmost_if_needed(false);
+                    let check_topmost = with_app(|app| app.on_telemetry_tick()).unwrap_or(false);
+                    if check_topmost {
+                        ensure_pill_topmost_if_needed(false);
+                    }
                 }
                 TIMER_TOKENS => {
                     with_app(|app| {
@@ -3323,17 +4107,47 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         app.tick_tray_hover_guard();
                     });
                 }
+                TIMER_PILL_SURFACE_IDLE => {
+                    let _ = KillTimer(hwnd, TIMER_PILL_SURFACE_IDLE);
+                    let released = with_app(|app| {
+                        if !app.should_pill_be_visible() {
+                            app.pill_renderer.release_surface()
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                    if released {
+                        compact_heap_and_trim_working_set();
+                    }
+                }
+                TIMER_FILES_DEBOUNCE => {
+                    let _ = KillTimer(hwnd, TIMER_FILES_DEBOUNCE);
+                    with_app(|app| app.on_files_debounce_timer(hwnd));
+                }
+                TIMER_POST_HIDE_COMPACT => {
+                    let _ = KillTimer(hwnd, TIMER_POST_HIDE_COMPACT);
+                    let should_compact = with_app(|app| !app.dash_visible).unwrap_or(false);
+                    if should_compact {
+                        compact_heap_and_trim_working_set();
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
         }
         WM_DPICHANGED | WM_DISPLAYCHANGE => {
+            invalidate_monitors_cache();
             let sys_dpi = GetDpiForSystem().max(96);
+            let new_pill_dpi = window_dpi_scale(hwnd) * 96.0;
             let keep_top = with_app(|app| {
+                app.pill_dpi = new_pill_dpi;
                 if app.icons.reload_tray_for_dpi(sys_dpi) {
+                    app.last_tray_alert_sig = None;
                     app.sync_tray_and_alerts();
                 }
                 app.pill_renderer.invalidate_position();
+                app.pill_renderer.invalidate_render();
                 app.redraw_pill();
                 app.topmost
             })
@@ -3344,6 +4158,7 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_SETTINGCHANGE if wparam.0 == SPI_SETWORKAREA => {
+            invalidate_monitors_cache();
             let keep_top = with_app(|app| {
                 app.pill_renderer.invalidate_position();
                 app.redraw_pill();
@@ -3357,6 +4172,13 @@ unsafe extern "system" fn pill_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_DESTROY => {
             with_app(|app| {
+                app.scanner.flush_archive();
+                app.dir_watcher.take();
+                app.power_guard.take();
+                if !app.wts_registered_hwnd.0.is_null() {
+                    unregister_session_notifications(app.wts_registered_hwnd);
+                    app.wts_registered_hwnd = HWND::default();
+                }
                 if let Some(tray) = &mut app.tray {
                     tray.remove();
                 }
@@ -3421,6 +4243,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_DPICHANGED => {
+            invalidate_monitors_cache();
             let wp_dpi = (wparam.0 & 0xFFFF) as u32;
             let new_dpi = if wp_dpi >= 96 {
                 wp_dpi
@@ -3507,11 +4330,20 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_SETCURSOR => {
             if (lparam.0 & 0xFFFF) as u32 == 1 {
-                let hovering = with_app(|app| {
-                    app.dash_view.as_ref().map(|v| v.is_hovering_interactive()).unwrap_or(false)
+                let cur = with_app(|app| {
+                    let hovering = app
+                        .dash_view
+                        .as_ref()
+                        .map(|v| v.is_hovering_interactive())
+                        .unwrap_or(false);
+                    if hovering {
+                        app.cursor_hand
+                    } else {
+                        app.cursor_arrow
+                    }
                 })
-                .unwrap_or(false);
-                if let Ok(cur) = LoadCursorW(None, if hovering { IDC_HAND } else { IDC_ARROW }) {
+                .unwrap_or_default();
+                if !cur.0.is_null() {
                     SetCursor(cur);
                     return LRESULT(1);
                 }
@@ -3647,7 +4479,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         app.pricing_edits.hide_five_edits(hwnd);
                     }
                     if !s_act {
-                        app.pricing_edits.sync_search_layout(hwnd, 96.0, app.light_theme, None);
+                        app.pricing_edits.sync_search_layout(hwnd, 96.0, app.light_theme, None, "");
                     }
                     if !d_act {
                         app.pricing_edits.sync_date_layout(hwnd, 96.0, app.light_theme, None);
@@ -3868,7 +4700,7 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         app.pricing_edits.hide_five_edits(hwnd);
                     }
                     if !s_act {
-                        app.pricing_edits.sync_search_layout(hwnd, 96.0, app.light_theme, None);
+                        app.pricing_edits.sync_search_layout(hwnd, 96.0, app.light_theme, None, "");
                     }
                     if !d_act {
                         app.pricing_edits.sync_date_layout(hwnd, 96.0, app.light_theme, None);
@@ -3903,9 +4735,12 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let dpi = window_dpi_scale(hwnd) * 96.0;
             with_app(|app| {
                 if let Some(view) = &mut app.dash_view {
+                    if view.active_tab == Tab::System && app.telemetry.latest.self_mb <= 0.0 {
+                        app.telemetry.refresh_self_private_mb();
+                    }
                     let _ = view.render_to_hdc(
                         &app.factories,
-                        &app.fonts,
+                        &mut app.fonts,
                         hwnd,
                         Some(hdc),
                         dpi,
@@ -3925,9 +4760,12 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let dpi = window_dpi_scale(hwnd) * 96.0;
             with_app(|app| {
                 if let Some(view) = &mut app.dash_view {
+                    if view.active_tab == Tab::System && app.telemetry.latest.self_mb <= 0.0 {
+                        app.telemetry.refresh_self_private_mb();
+                    }
                     let _ = view.render_to_hdc(
                         &app.factories,
-                        &app.fonts,
+                        &mut app.fonts,
                         hwnd,
                         Some(hdc),
                         dpi,
@@ -3940,18 +4778,86 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             });
             LRESULT(0)
         }
+        WM_APP_FILES_CHANGED => {
+            with_app(|app| app.schedule_watcher_refresh(hwnd));
+            LRESULT(0)
+        }
+        WM_WTSSESSION_CHANGE => {
+            let ev = wparam.0 as u32;
+            with_app(|app| {
+                if app.dashboard_only {
+                    if ev == WTS_SESSION_LOCK {
+                        app.session_locked = true;
+                        app.sync_timers();
+                    } else if ev == WTS_SESSION_UNLOCK {
+                        app.session_locked = false;
+                        app.next_midnight_check = Instant::now();
+                        app.telemetry.reset_cpu_baseline();
+                        app.sync_timers();
+                        app.refresh_tokens(false);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            let ev = wparam.0 as u32;
+            with_app(|app| {
+                if app.dashboard_only {
+                    match ev {
+                        PBT_APMSUSPEND => {
+                            app.display_off = true;
+                            app.scanner.flush_archive();
+                            app.sync_timers();
+                        }
+                        PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                            app.display_off = false;
+                            app.next_midnight_check = Instant::now();
+                            app.telemetry.reset_cpu_baseline();
+                            app.sync_timers();
+                            app.refresh_tokens(false);
+                        }
+                        PBT_POWERSETTINGCHANGE => {
+                            if let Some(state) = parse_console_display_state(lparam) {
+                                if state == 0 {
+                                    app.display_off = true;
+                                    app.sync_timers();
+                                } else if app.display_off {
+                                    app.display_off = false;
+                                    app.next_midnight_check = Instant::now();
+                                    app.telemetry.reset_cpu_baseline();
+                                    app.sync_timers();
+                                    app.refresh_tokens(false);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            LRESULT(1)
+        }
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                with_app(|app| app.scanner.flush_archive());
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             match wparam.0 {
                 TIMER_TELEMETRY => {
                     with_app(|app| {
-                        app.telemetry.sample();
-                        app.invalidate_dashboard();
+                        let _ = app.on_telemetry_tick();
                     });
                 }
                 TIMER_TOKENS => {
                     with_app(|app| {
                         app.refresh_tokens(false);
                     });
+                }
+                TIMER_FILES_DEBOUNCE => {
+                    let _ = KillTimer(hwnd, TIMER_FILES_DEBOUNCE);
+                    with_app(|app| app.on_files_debounce_timer(hwnd));
                 }
                 _ => {}
             }
@@ -3970,10 +4876,22 @@ unsafe extern "system" fn dash_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_DESTROY => {
             let dash_only = with_app(|app| {
                 app.dash_visible = false;
+                app.cancel_post_hide_compact();
                 app.dash_hwnd = None;
+                app.fonts.release_dashboard_fonts();
                 app.dash_view = None;
                 app.pricing_edits.reset_handles();
+                app.pricing_edits.release_gdi();
                 app.icons.clear_dashboard_icons();
+                if app.dashboard_only {
+                    app.scanner.flush_archive();
+                    app.dir_watcher.take();
+                    app.power_guard.take();
+                    if !app.wts_registered_hwnd.0.is_null() {
+                        unregister_session_notifications(app.wts_registered_hwnd);
+                        app.wts_registered_hwnd = HWND::default();
+                    }
+                }
                 app.dashboard_only
             })
             .unwrap_or(false);
@@ -4173,6 +5091,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
     unsafe {
         let hinst = GetModuleHandleW(None)?;
         let arrow = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+        let hand = LoadCursorW(None, IDC_HAND).unwrap_or(arrow);
         let sys_dpi = GetDpiForSystem().max(96);
         let ((big_w, big_h), (sm_w, sm_h)) = system_icon_metrics_for_dpi(sys_dpi);
         let icon_big = load_res_icon(RES_ICON_NORMAL, big_w, big_h);
@@ -4180,7 +5099,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
             let sm = load_res_icon(RES_ICON_NORMAL, sm_w, sm_h);
             if !sm.0.is_null() { sm } else { icon_big }
         };
-        let icons = AppIcons::new(icon_sm, sys_dpi);
+        let mut icons = AppIcons::new(icon_sm, sys_dpi);
 
         let pill_cls = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -4249,10 +5168,32 @@ fn run_app(opts: CliOpts) -> Result<()> {
             )?
         };
 
+        let now_init = Instant::now();
+        let now_local_init = Local::now();
+        let today_date = now_local_init.date_naive();
+        let today_key = today_date.format("%Y-%m-%d").to_string();
+        let next_midnight_check = AppState::compute_next_midnight_check(now_init, now_local_init);
+        let (init_events, init_severity) =
+            AppState::compute_alert_events(today_date, &today_key, &snapshot);
+        let init_tip = AppState::format_tray_tooltip(prefs.tray_hover_mode, &today_key, &snapshot);
+        let init_sig = AppState::compute_tray_alert_sig(
+            prefs.tray_hover_mode,
+            prefs.notifications_enabled,
+            icons.tray_dpi,
+            today_date,
+            &today_key,
+            &snapshot,
+        );
+        let pill_dpi = if !pill_hwnd.0.is_null() {
+            window_dpi_scale(pill_hwnd) * 96.0
+        } else {
+            sys_dpi as f32
+        };
+
         let taskbar_created_msg = register_taskbar_created_msg();
         let tray = if !opts.dashboard_only && !opts.self_test && !pill_hwnd.0.is_null() {
-            let init_tip = if prefs.tray_hover_mode { "" } else { "Gauge · 初始化中" };
-            Some(TrayIcon::new(pill_hwnd, icons.tray_normal, init_tip))
+            let init_icon = icons.tray_for_severity(init_severity);
+            Some(TrayIcon::new(pill_hwnd, init_icon, &init_tip))
         } else {
             None
         };
@@ -4264,9 +5205,12 @@ fn run_app(opts: CliOpts) -> Result<()> {
             icons,
             scanner,
             snapshot,
+            snapshot_gen: 1,
             telemetry,
             pill_hwnd,
             pill_renderer: PillRenderer::new(),
+            pill_dpi,
+            tray_hover_dpi: pill_dpi,
             pill_pos: (0, 0),
             custom_pos: prefs.custom_pos,
             drag_down: false,
@@ -4297,13 +5241,37 @@ fn run_app(opts: CliOpts) -> Result<()> {
             date_scope: DateScope::from_u8(prefs.date_scope),
             pill_items: prefs.pill_items,
             monitor_index: prefs.monitor_index,
+            terminal_preset: launcher::TerminalPreset::from_u8(prefs.terminal_preset),
+            terminal_new_window: prefs.terminal_new_window,
+            terminal_keep_open: prefs.terminal_keep_open,
             last_total_tokens: initial_total,
             recent_activity_until: None,
             tray,
             taskbar_created_msg,
             fired_alerts: HashSet::new(),
-            last_tray_tip: String::new(),
+            last_tray_tip: init_tip,
             self_test_mode: opts.self_test,
+            cursor_arrow: arrow,
+            cursor_hand: hand,
+            cached_today_date: today_date,
+            cached_today_key: today_key,
+            cached_alert_severity: init_severity,
+            next_midnight_check,
+            last_running_expire_check: now_init,
+            last_tray_alert_sig: Some(init_sig),
+            last_quota_minute: Utc::now().timestamp() / 60,
+            fullscreen_probe: FullscreenProbe::new(),
+            last_topmost_check: now_init,
+            tray_hover_last_rect_refresh: now_init,
+            telemetry_timer_ms: 0,
+            tokens_timer_ms: 0,
+            session_locked: false,
+            display_off: false,
+            files_debounce_armed: false,
+            last_scan_at: now_init,
+            dir_watcher: None,
+            wts_registered_hwnd: HWND::default(),
+            power_guard: None,
             dash_owner_hwnd: None,
             dash_hwnd: None,
             dash_view: None,
@@ -4320,13 +5288,11 @@ fn run_app(opts: CliOpts) -> Result<()> {
 
         if opts.dashboard_only {
             create_dashboard_window_local();
-            if let Some(dh) = with_app(|app| app.dash_hwnd).flatten() {
-                let _ = SetTimer(dh, TIMER_TELEMETRY, 1000, None);
-                let _ = SetTimer(dh, TIMER_TOKENS, 3000, None);
-            }
         } else {
             with_app(|app| {
-                app.sync_tray_and_alerts();
+                // Initial tray tooltip, icon, and alert evaluation already ran above;
+                // only dispatch initial balloon alerts (if any) without duplicating formatting.
+                app.dispatch_alert_balloons(init_events);
                 app.sync_tray_taskbar_pin();
             });
             if (!prefs.tray_hover_mode && prefs.pill_visible) || opts.self_test {
@@ -4334,7 +5300,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                 let _ = ShowWindow(pill_hwnd, SW_SHOWNOACTIVATE);
                 ensure_pill_topmost_if_needed(true);
             }
-            trim_self_working_set();
+            compact_heap_and_trim_working_set();
             if opts.open_detail {
                 open_or_focus_dashboard_safe();
             }
@@ -4343,13 +5309,20 @@ fn run_app(opts: CliOpts) -> Result<()> {
         if opts.self_test {
             let cold_ms = with_app(|app| app.snapshot.scan_ms).unwrap_or(0.0);
             let idle_mb = read_self_private_mb();
-            let cached_ms = with_app(|app| app.scanner.scan().scan_ms).unwrap_or(0.0);
+            let t_cached = Instant::now();
+            with_app(|app| {
+                let _ = app.scanner.scan_if_changed(&mut app.snapshot);
+            });
+            let cached_ms = t_cached.elapsed().as_secs_f64() * 1000.0;
             let t_open = Instant::now();
             create_dashboard_window_local();
             let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
             for (cost_m, priv_m) in [(false, false), (true, false), (false, true)] {
                 for tab in [Tab::Overview, Tab::Daily, Tab::Weekly, Tab::Models, Tab::Sessions, Tab::Calls, Tab::System] {
                     with_app(|app| {
+                        if tab == Tab::System {
+                            app.telemetry.refresh_self_private_mb();
+                        }
                         if let (Some(hwnd), Some(view)) = (app.dash_hwnd, &mut app.dash_view) {
                             view.cost_mode = cost_m;
                             view.privacy_mode = priv_m;
@@ -4357,7 +5330,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                             let dpi = window_dpi_scale(hwnd) * 96.0;
                             let _ = view.render_to_hdc(
                                 &app.factories,
-                                &app.fonts,
+                                &mut app.fonts,
                                 hwnd,
                                 None,
                                 dpi,
@@ -4371,7 +5344,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.breakdown_mode = BreakdownMode::Workspace;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4384,7 +5357,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.breakdown_mode = BreakdownMode::Tools;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4396,7 +5369,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.breakdown_mode = BreakdownMode::Source;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4411,7 +5384,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.daily_view = DailyViewMode::Heatmap;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4426,7 +5399,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.model_view = ModelViewMode::Pricing;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4438,7 +5411,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.model_view = ModelViewMode::Budget;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4453,7 +5426,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.weekly_mode = WeeklyMode::Monthly;
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4469,7 +5442,7 @@ fn run_app(opts: CliOpts) -> Result<()> {
                                 view.mark_data_dirty();
                                 let _ = view.render_to_hdc(
                                     &app.factories,
-                                    &app.fonts,
+                                    &mut app.fonts,
                                     hwnd,
                                     None,
                                     dpi,
@@ -4521,10 +5494,35 @@ fn run_app(opts: CliOpts) -> Result<()> {
             return Ok(());
         }
 
-        if !opts.dashboard_only {
-            let _ = SetTimer(pill_hwnd, TIMER_TELEMETRY, 1000, None);
-            let _ = SetTimer(pill_hwnd, TIMER_TOKENS, 3000, None);
-        }
+        // Start event-driven directory watcher, session-lock & display-power notifications, and coalesced timers.
+        with_app(|app| {
+            let owner_hwnd = app.timer_owner_hwnd();
+            if !owner_hwnd.0.is_null() {
+                if register_session_notifications(owner_hwnd) {
+                    app.wts_registered_hwnd = owner_hwnd;
+                }
+                app.power_guard = ConsoleDisplayPowerGuard::register(owner_hwnd);
+
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+                let watched: Vec<(PathBuf, bool)> = app
+                    .scanner
+                    .watched_dirs()
+                    .into_iter()
+                    .map(|dir| {
+                        // Watch companion/config dirs non-recursively so unrelated sibling repos/builds never wake Gauge;
+                        // watch whitelisted agent log trees recursively.
+                        let is_exe_dir = exe_dir.as_ref().is_some_and(|e| e == &dir);
+                        let is_agent_tree = app.snapshot.data_dirs.iter().any(|(_, d)| dir.starts_with(d));
+                        let subtree = is_agent_tree && !is_exe_dir;
+                        (dir, subtree)
+                    })
+                    .collect();
+                app.dir_watcher = DirWatcher::start(watched, owner_hwnd, WM_APP_FILES_CHANGED);
+            }
+            app.sync_timers();
+        });
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -4631,6 +5629,15 @@ fn run_app(opts: CliOpts) -> Result<()> {
             DispatchMessageW(&msg);
         }
 
+        with_app(|app| {
+            app.scanner.flush_archive();
+            app.dir_watcher.take();
+            app.power_guard.take();
+            if !app.wts_registered_hwnd.0.is_null() {
+                unregister_session_notifications(app.wts_registered_hwnd);
+                app.wts_registered_hwnd = HWND::default();
+            }
+        });
         APP.with(|cell| *cell.borrow_mut() = None);
         CoUninitialize();
     }
@@ -4691,9 +5698,13 @@ mod tests {
             is_subagent,
             parent_id: None,
             parent_title: String::new(),
-            turns: Vec::new(),
+            turns: Vec::new().into(),
             counts: stats::TokenCounts::default(),
             models: BTreeSet::new(),
+            primary_model: stats::intern_str("-"),
+            active_duration_secs: 0,
+            compaction_count: 0,
+            thinking_turns: 0,
             first_time: now,
             last_time: now,
             last_file_mtime_utc: None,

@@ -8,10 +8,11 @@
 //!
 //! Never writes inside agent directories, never touches SQLite databases, never reads credentials.
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use chrono::{DateTime, Datelike, FixedOffset, Local, NaiveDate, Timelike, Utc};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::archive::UsageArchive;
 use crate::pricing::{CostBreakdown, ModelRate, PricingCatalog, PricingTableRow};
@@ -19,13 +20,91 @@ use crate::quota::{BudgetConfig, BudgetStore, StatuslineReader, StatuslineSnapsh
 use crate::session_meta::{SessionMetaStore, SessionUserMeta};
 use crate::sources::{
     build_adapter, default_antigravity_cli_dir, discover_antigravity_sources,
-    discover_default_sources, SourceAdapter,
+    discover_default_sources, path_eq_platform, relative_components_under, AdapterPoll,
+    ParsedSession, SourceAdapter,
 };
 
-pub use crate::sources::antigravity::parse_pbtxt_title;
+pub use crate::sources::antigravity::{parse_pbtxt_title, scan_antigravity_today_totals};
 pub use crate::sources::{
     compute_running_hint, SourceDiscoveryFilter, ACTIVE_MTIME_WINDOW_SECS, RUNNING_STEP_STALE_SECS,
 };
+
+const INTERN_CAP: usize = 4096;
+const ARCHIVE_PERSIST_DEBOUNCE: Duration = Duration::from_secs(120);
+
+/// Bounded process-wide string interner for low-cardinality strings (model names, tool names).
+/// If the table reaches `INTERN_CAP`, returns a fresh `Arc<str>` without unbounded memory growth.
+pub fn intern_str(s: &str) -> Arc<str> {
+    static INTERNER: OnceLock<RwLock<HashSet<Arc<str>>>> = OnceLock::new();
+    let lock = INTERNER.get_or_init(|| RwLock::new(HashSet::with_capacity(64)));
+    if let Ok(guard) = lock.read() {
+        if let Some(existing) = guard.get(s) {
+            return Arc::clone(existing);
+        }
+        if guard.len() >= INTERN_CAP {
+            return Arc::from(s);
+        }
+    }
+    if let Ok(mut guard) = lock.write() {
+        if let Some(existing) = guard.get(s) {
+            return Arc::clone(existing);
+        }
+        let arc: Arc<str> = Arc::from(s);
+        if guard.len() < INTERN_CAP {
+            guard.insert(Arc::clone(&arc));
+        }
+        return arc;
+    }
+    Arc::from(s)
+}
+
+/// Caches local timezone `FixedOffset` per 15-minute UTC bucket to eliminate thousands of
+/// redundant Win32 timezone syscalls during session pricing, filtering, and aggregation while
+/// remaining exact across DST transitions.
+#[derive(Debug, Clone)]
+pub struct LocalTzCache {
+    last_bucket: i64,
+    last_offset: FixedOffset,
+    offsets: HashMap<i64, FixedOffset>,
+}
+
+impl Default for LocalTzCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalTzCache {
+    pub fn new() -> Self {
+        let now_utc = Utc::now();
+        let bucket = now_utc.timestamp().div_euclid(900);
+        let offset = *now_utc.with_timezone(&Local).offset();
+        let mut offsets = HashMap::with_capacity(16);
+        offsets.insert(bucket, offset);
+        Self {
+            last_bucket: bucket,
+            last_offset: offset,
+            offsets,
+        }
+    }
+
+    #[inline]
+    pub fn to_local(&mut self, utc: DateTime<Utc>) -> DateTime<Local> {
+        let bucket = utc.timestamp().div_euclid(900);
+        let offset = if bucket == self.last_bucket {
+            self.last_offset
+        } else {
+            let off = *self
+                .offsets
+                .entry(bucket)
+                .or_insert_with(|| *utc.with_timezone(&Local).offset());
+            self.last_bucket = bucket;
+            self.last_offset = off;
+            off
+        };
+        DateTime::<Local>::from_naive_utc_and_offset(utc.naive_utc(), offset)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AgentFamily {
@@ -278,7 +357,7 @@ impl TokenCounts {
 pub struct TurnRecord {
     pub step_index: i64,
     pub timestamp_utc: Option<DateTime<Utc>>,
-    pub model: String,
+    pub model: Arc<str>,
     pub is_checkpoint: bool,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
@@ -288,7 +367,7 @@ pub struct TurnRecord {
     pub output_tokens: u64,
     /// Optional informational subset of `output_tokens` representing reasoning/thoughts tokens (NOT additive).
     pub reasoning_tokens: u64,
-    pub tool_names: Vec<String>,
+    pub tool_names: Box<[Arc<str>]>,
     pub thinking_chars: u64,
     /// Estimated wall-clock generation seconds (request start -> last tool call streamed out).
     /// `None` when not measurable (pure text replies, checkpoints, missing tool steps, non-AGY logs).
@@ -363,6 +442,75 @@ pub fn price_turn_record(
     cost
 }
 
+/// Dominant model by token volume, preferring real named models over compaction checkpoints.
+pub fn compute_primary_model(turns: &[TurnRecord]) -> Arc<str> {
+    let mut by_m: HashMap<&str, (bool, u64)> = HashMap::new();
+    for t in turns {
+        let entry = by_m.entry(t.model.as_ref()).or_insert((t.is_checkpoint, 0));
+        entry.0 &= t.is_checkpoint;
+        entry.1 = entry.1.saturating_add(t.total_input() + t.output_tokens);
+    }
+    by_m.into_iter()
+        .max_by(|(name_a, (cp_a, tok_a)), (name_b, (cp_b, tok_b))| {
+            // Non-checkpoint models always rank above pure checkpoint buckets
+            cp_b.cmp(cp_a)
+                .then_with(|| tok_a.cmp(tok_b))
+                .then_with(|| name_a.cmp(name_b))
+        })
+        .map(|(m, _)| intern_str(m))
+        .unwrap_or_else(|| intern_str("-"))
+}
+
+/// Effective active duration in seconds (sums consecutive turn intervals capped at 10 min idle).
+/// Uses a zero-allocation single-pass fast path when timestamps are monotonic.
+pub fn compute_active_duration_secs(turns: &[TurnRecord]) -> u64 {
+    let mut count = 0usize;
+    let mut prev: Option<DateTime<Utc>> = None;
+    let mut secs: u64 = 0;
+    let mut out_of_order = false;
+    for t in turns {
+        let Some(ts) = t.timestamp_utc else { continue };
+        count += 1;
+        if let Some(p) = prev {
+            if ts < p {
+                out_of_order = true;
+                break;
+            }
+            let delta = (ts - p).num_seconds();
+            if delta > 0 {
+                secs = secs.saturating_add((delta as u64).min(600));
+            }
+        }
+        prev = Some(ts);
+    }
+    if !out_of_order {
+        return if count == 0 {
+            0
+        } else if count == 1 {
+            15
+        } else {
+            secs.max(15)
+        };
+    }
+
+    let mut times: Vec<DateTime<Utc>> = turns.iter().filter_map(|t| t.timestamp_utc).collect();
+    if times.is_empty() {
+        return 0;
+    }
+    times.sort();
+    if times.len() == 1 {
+        return 15;
+    }
+    let mut secs: u64 = 0;
+    for w in times.windows(2) {
+        let delta = (w[1] - w[0]).num_seconds();
+        if delta > 0 {
+            secs = secs.saturating_add((delta as u64).min(600));
+        }
+    }
+    secs.max(15)
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -374,31 +522,33 @@ pub struct SessionInfo {
     pub is_subagent: bool,
     pub parent_id: Option<String>,
     pub parent_title: String,
-    pub turns: Vec<TurnRecord>,
+    pub turns: Arc<[TurnRecord]>,
     pub counts: TokenCounts,
     pub models: BTreeSet<String>,
     pub first_time: Option<DateTime<Local>>,
     pub last_time: Option<DateTime<Local>>,
     pub last_file_mtime_utc: Option<DateTime<Utc>>,
     pub is_running_hint: bool,
+    pub primary_model: Arc<str>,
+    pub active_duration_secs: u64,
+    pub compaction_count: u32,
+    pub thinking_turns: u32,
 }
 
 impl SessionInfo {
+    /// Recomputes precomputed summary fields (`primary_model`, `active_duration_secs`,
+    /// `compaction_count`, `thinking_turns`) from `self.turns`.
+    pub fn recompute_summary(&mut self) {
+        self.primary_model = compute_primary_model(&self.turns);
+        self.active_duration_secs = compute_active_duration_secs(&self.turns);
+        self.compaction_count = self.turns.iter().filter(|t| t.is_checkpoint).count() as u32;
+        self.thinking_turns = self.turns.iter().filter(|t| t.has_thinking()).count() as u32;
+    }
+
     /// Dominant model by token volume, preferring real named models over compaction checkpoints.
-    pub fn primary_model(&self) -> String {
-        let mut by_m: HashMap<&str, (bool, u64)> = HashMap::new();
-        for t in &self.turns {
-            let entry = by_m.entry(t.model.as_str()).or_insert((t.is_checkpoint, 0));
-            entry.0 &= t.is_checkpoint;
-            entry.1 = entry.1.saturating_add(t.total_input() + t.output_tokens);
-        }
-        by_m.into_iter()
-            .max_by(|(_, (cp_a, tok_a)), (_, (cp_b, tok_b))| {
-                // Non-checkpoint models always rank above pure checkpoint buckets
-                cp_b.cmp(cp_a).then_with(|| tok_a.cmp(tok_b))
-            })
-            .map(|(m, _)| m.to_string())
-            .unwrap_or_else(|| "-".to_string())
+    #[inline]
+    pub fn primary_model(&self) -> &str {
+        &self.primary_model
     }
 
     #[allow(dead_code)]
@@ -406,8 +556,9 @@ impl SessionInfo {
         workspace_short_name(&self.workspace)
     }
 
+    #[inline]
     pub fn compaction_count(&self) -> usize {
-        self.turns.iter().filter(|t| t.is_checkpoint).count()
+        self.compaction_count as usize
     }
 
     /// Count & uncached input volume of significant multi-turn prompt cache misses (>=30K ctx, <50% hit).
@@ -433,27 +584,14 @@ impl SessionInfo {
     }
 
     /// Effective active duration in seconds (sums consecutive turn intervals capped at 10 min idle).
+    #[inline]
     pub fn active_duration_secs(&self) -> u64 {
-        let mut times: Vec<DateTime<Utc>> = self.turns.iter().filter_map(|t| t.timestamp_utc).collect();
-        if times.is_empty() {
-            return 0;
-        }
-        times.sort();
-        if times.len() == 1 {
-            return 15;
-        }
-        let mut secs: u64 = 0;
-        for w in times.windows(2) {
-            let delta = (w[1] - w[0]).num_seconds();
-            if delta > 0 {
-                secs = secs.saturating_add((delta as u64).min(600));
-            }
-        }
-        secs.max(15)
+        self.active_duration_secs
     }
 
+    #[inline]
     pub fn thinking_turns(&self) -> usize {
-        self.turns.iter().filter(|t| t.has_thinking()).count()
+        self.thinking_turns as usize
     }
 
     pub fn total_thinking_chars(&self) -> u64 {
@@ -461,10 +599,14 @@ impl SessionInfo {
     }
 
     pub fn tool_counts(&self) -> BTreeMap<String, u64> {
-        let mut map = BTreeMap::new();
-        for t in &self.turns {
-            for name in &t.tool_names {
-                *map.entry(name.clone()).or_insert(0) += 1;
+        let mut map: BTreeMap<String, u64> = BTreeMap::new();
+        for t in self.turns.iter() {
+            for name in t.tool_names.iter() {
+                if let Some(cnt) = map.get_mut(name.as_ref()) {
+                    *cnt += 1;
+                } else {
+                    map.insert(name.to_string(), 1);
+                }
             }
         }
         map
@@ -647,15 +789,79 @@ pub enum SessionSort {
     HitRateLow,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ScanHints {
+    pub paths: Vec<PathBuf>,
+    pub overflow: bool,
+    pub has_companion_change: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanDelta {
+    pub changed: bool,
+    pub running_changed: bool,
+    pub files_reparsed: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPricedSession {
+    pricing_gen: u64,
+    last_step_running: bool,
+    session: SessionInfo,
+}
+
+#[derive(Debug, Default)]
+struct AdapterScanCache {
+    found_root: bool,
+    skipped_empty: usize,
+    skipped_lines: usize,
+    files_cached: usize,
+    sessions: HashMap<String, CachedPricedSession>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRunningEntry {
+    family: AgentFamily,
+    cid: String,
+    last_step_running: bool,
+    mtime_utc: Option<DateTime<Utc>>,
+}
+
 pub struct IncrementalScanner {
     sources: Vec<(SourceKind, PathBuf)>,
     adapters: Vec<Box<dyn SourceAdapter>>,
+    adapter_caches: Vec<AdapterScanCache>,
     pricing: PricingCatalog,
+    pricing_gen: u64,
+    pricing_dirty: bool,
     statusline: StatuslineReader,
     budget: BudgetStore,
+    budget_dirty: bool,
     archive: UsageArchive,
     archive_filter: SourceDiscoveryFilter,
     session_meta: SessionMetaStore,
+    has_scanned: bool,
+    has_persisted_archive: bool,
+    last_archive_persist: Option<Instant>,
+    last_live_sessions: Vec<SessionInfo>,
+    last_full_sessions: Vec<SessionInfo>,
+    last_agg: AggregatedStats,
+    active_running: Vec<ActiveRunningEntry>,
+    last_archived_count: usize,
+    last_skipped_empty: usize,
+    last_skipped_lines: usize,
+    last_files_cached: usize,
+    last_found_any_root: bool,
+    last_warning: Option<String>,
+    cached_model_rate_labels: HashMap<String, String>,
+    cached_pricing_rows: Vec<PricingTableRow>,
+    cached_pricing_date: Option<NaiveDate>,
+}
+
+impl Drop for IncrementalScanner {
+    fn drop(&mut self) {
+        self.flush_archive();
+    }
 }
 
 impl IncrementalScanner {
@@ -689,19 +895,42 @@ impl IncrementalScanner {
         } else {
             sources
         };
-        let adapters = sources
+        let adapters: Vec<Box<dyn SourceAdapter>> = sources
             .iter()
             .map(|(kind, path)| build_adapter(*kind, path.clone()))
+            .collect();
+        let adapter_caches = (0..adapters.len())
+            .map(|_| AdapterScanCache::default())
             .collect();
         Self {
             sources,
             adapters,
+            adapter_caches,
             pricing: PricingCatalog::new(pricing_override),
+            pricing_gen: 1,
+            pricing_dirty: false,
             statusline: StatuslineReader::new(statusline_path),
             budget: BudgetStore::new(budget_path),
+            budget_dirty: false,
             archive: UsageArchive::new(archive_path, archive_enabled),
             archive_filter: SourceDiscoveryFilter::All,
             session_meta: SessionMetaStore::new(None),
+            has_scanned: false,
+            has_persisted_archive: false,
+            last_archive_persist: None,
+            last_live_sessions: Vec::new(),
+            last_full_sessions: Vec::new(),
+            last_agg: AggregatedStats::default(),
+            active_running: Vec::new(),
+            last_archived_count: 0,
+            last_skipped_empty: 0,
+            last_skipped_lines: 0,
+            last_files_cached: 0,
+            last_found_any_root: false,
+            last_warning: None,
+            cached_model_rate_labels: HashMap::new(),
+            cached_pricing_rows: Vec::new(),
+            cached_pricing_date: None,
         }
     }
 
@@ -730,15 +959,27 @@ impl IncrementalScanner {
     }
 
     pub fn upsert_pricing_rule(&mut self, model: &str, rate: ModelRate) -> Result<(), String> {
-        self.pricing.upsert_custom_rule(model, rate)
+        let res = self.pricing.upsert_custom_rule(model, rate);
+        if res.is_ok() {
+            self.pricing_dirty = true;
+        }
+        res
     }
 
     pub fn remove_pricing_rule(&mut self, model: &str) -> Result<bool, String> {
-        self.pricing.remove_custom_rule(model)
+        let res = self.pricing.remove_custom_rule(model);
+        if matches!(res, Ok(true)) {
+            self.pricing_dirty = true;
+        }
+        res
     }
 
     pub fn save_budget(&mut self, cfg: BudgetConfig) -> Result<(), String> {
-        self.budget.save(cfg)
+        let res = self.budget.save(cfg);
+        if res.is_ok() {
+            self.budget_dirty = true;
+        }
+        res
     }
 
     pub fn with_session_meta(mut self, session_meta_path: Option<PathBuf>) -> Self {
@@ -748,6 +989,7 @@ impl IncrementalScanner {
 
     pub fn with_archive_filter(mut self, filter: SourceDiscoveryFilter) -> Self {
         self.archive_filter = filter;
+        self.has_scanned = false;
         self
     }
 
@@ -767,202 +1009,727 @@ impl IncrementalScanner {
         self.session_meta.force_reload()
     }
 
+    /// Immediately persists any debounced archive changes to disk (with `sync_data`).
+    pub fn flush_archive(&mut self) {
+        if self.archive.flush(&self.last_live_sessions, true) {
+            self.last_archive_persist = Some(Instant::now());
+            self.has_persisted_archive = true;
+        }
+    }
+
+    /// Returns deduplicated whitelisted directories to monitor with `ReadDirectoryChangesW`.
+    /// Never includes SQLite WAL directories (such as `~/.gemini/.../conversations/`).
+    pub fn watched_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut push_unique = |p: PathBuf| {
+            let key = if cfg!(windows) {
+                p.to_string_lossy().to_ascii_lowercase()
+            } else {
+                p.to_string_lossy().into_owned()
+            };
+            if seen.insert(key) {
+                dirs.push(p);
+            }
+        };
+        for adapter in &self.adapters {
+            for d in adapter.watched_dirs() {
+                push_unique(d);
+            }
+        }
+        for opt_path in [
+            self.pricing.override_path(),
+            self.statusline.path(),
+            self.budget.path(),
+            self.session_meta.path(),
+        ] {
+            if let Some(parent) = opt_path.and_then(Path::parent) {
+                if parent.is_dir() {
+                    push_unique(parent.to_path_buf());
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Zero-syscall O(active) check that clears expired `is_running_hint` badges in place.
+    /// Returns `true` if any session's running status flipped `true -> false`.
+    pub fn expire_running_hints_only(&mut self, current: &mut ScanSnapshot) -> bool {
+        self.refresh_running_hints_in_place(Utc::now(), Some(current))
+    }
+
+    /// Targeted event-driven refresh driven by `ReadDirectoryChangesW` hints.
+    /// - On `hints.overflow` or before initial scan: falls back cleanly to `scan_if_changed`.
+    /// - On companion-only hints (`statusline_state.json`, `pricing.json`, `budget.json`,
+    ///   `session_meta.json`): refreshes only companion configs in place (`< 0.1 ms`, 0 adapter calls).
+    /// - On targeted agent paths: invokes `SourceAdapter::poll_hinted` so single-file appends only
+    ///   stat & tail the 1 modified file instead of walking all 220+ sessions.
+    pub fn scan_with_hints(&mut self, current: &mut ScanSnapshot, hints: &ScanHints) -> ScanDelta {
+        let started = Instant::now();
+        let scan_now_utc = Utc::now();
+        if !self.has_scanned || hints.overflow {
+            return self.scan_if_changed(current);
+        }
+        if !hints.has_companion_change
+            && hints.paths.is_empty()
+            && !self.pricing_dirty
+            && !self.budget_dirty
+        {
+            self.maybe_flush_debounced_archive();
+            let running_changed = self.refresh_running_hints_in_place(scan_now_utc, Some(current));
+            current.files_reparsed = 0;
+            current.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+            return ScanDelta {
+                changed: false,
+                running_changed,
+                files_reparsed: 0,
+            };
+        }
+
+        let mut check_companion =
+            hints.has_companion_change || self.pricing_dirty || self.budget_dirty;
+        let mut per_adapter: Vec<Vec<PathBuf>> = vec![Vec::new(); self.adapters.len()];
+
+        for p in &hints.paths {
+            let is_companion = [
+                self.pricing.override_path(),
+                self.statusline.path(),
+                self.budget.path(),
+                self.session_meta.path(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|cp| path_eq_platform(cp, p));
+            if is_companion {
+                check_companion = true;
+                continue;
+            }
+            let mut matched_adapter = false;
+            for (idx, adapter) in self.adapters.iter().enumerate() {
+                if relative_components_under(adapter.root(), p).is_some() {
+                    per_adapter[idx].push(p.clone());
+                    matched_adapter = true;
+                    break;
+                }
+            }
+            if !matched_adapter {
+                return self.scan_if_changed(current);
+            }
+        }
+
+        let (pricing_changed, statusline_changed, budget_changed, session_meta_changed) =
+            if check_companion {
+                let pc = self.pricing.refresh() || std::mem::take(&mut self.pricing_dirty);
+                if pc {
+                    self.pricing_gen = self.pricing_gen.wrapping_add(1);
+                }
+                let sc = self.statusline.refresh();
+                let bc = self.budget.refresh() || std::mem::take(&mut self.budget_dirty);
+                let smc = self.session_meta.refresh();
+                (pc, sc, bc, smc)
+            } else {
+                (false, false, false, false)
+            };
+
+        let mut any_adapter_changed = false;
+        let mut files_reparsed = 0usize;
+        let mut tz_cache: Option<LocalTzCache> = None;
+
+        for idx in 0..self.adapters.len() {
+            if !per_adapter[idx].is_empty() {
+                let poll = self.adapters[idx]
+                    .poll_hinted(&per_adapter[idx], scan_now_utc)
+                    .unwrap_or_else(|| self.adapters[idx].poll_changes(scan_now_utc));
+                let (changed, reparsed) =
+                    self.apply_adapter_poll(idx, poll, pricing_changed, &mut tz_cache);
+                if changed {
+                    any_adapter_changed = true;
+                }
+                files_reparsed += reparsed;
+            } else if pricing_changed {
+                self.reprice_adapter_cache(idx, &mut tz_cache);
+            }
+        }
+
+        let files_cached: usize = self.adapter_caches.iter().map(|c| c.files_cached).sum();
+        self.last_files_cached = files_cached;
+
+        if any_adapter_changed || pricing_changed {
+            let prev_running: HashSet<(AgentFamily, String)> = current
+                .sessions
+                .iter()
+                .filter(|s| s.is_running_hint)
+                .map(|s| (s.source.agent_family(), s.conversation_id.clone()))
+                .collect();
+
+            self.rebuild_sessions_and_agg(scan_now_utc);
+
+            let new_running: HashSet<(AgentFamily, String)> = self
+                .last_full_sessions
+                .iter()
+                .filter(|s| s.is_running_hint)
+                .map(|s| (s.source.agent_family(), s.conversation_id.clone()))
+                .collect();
+            let running_changed = prev_running != new_running;
+
+            *current = self.build_snapshot(
+                started,
+                pricing_changed,
+                statusline_changed,
+                budget_changed,
+                session_meta_changed,
+                files_reparsed,
+            );
+            return ScanDelta {
+                changed: true,
+                running_changed,
+                files_reparsed,
+            };
+        }
+
+        // Fast companion-only or unchanged-hint path: zero session/agg rebuilds!
+        self.maybe_flush_debounced_archive();
+        let running_changed = self.refresh_running_hints_in_place(scan_now_utc, Some(current));
+
+        let today_local = Local::now().date_naive();
+        let date_rolled = self.cached_pricing_date != Some(today_local);
+        if date_rolled {
+            self.refresh_pricing_tables(today_local);
+            current.model_rate_labels = self.cached_model_rate_labels.clone();
+            current.pricing_rows = self.cached_pricing_rows.clone();
+        }
+
+        current.statusline_changed = statusline_changed;
+        if statusline_changed {
+            current.statusline = self.statusline.snapshot().cloned();
+        }
+        current.budget_changed = budget_changed;
+        if budget_changed {
+            current.budget = self.budget.config();
+        }
+        current.session_meta_changed = session_meta_changed;
+        if session_meta_changed {
+            current.session_meta = self.session_meta.entries().clone();
+        }
+        current.pricing_changed = false;
+        current.files_cached = files_cached;
+        current.files_reparsed = 0;
+        current.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        ScanDelta {
+            changed: statusline_changed || budget_changed || session_meta_changed || date_rolled,
+            running_changed,
+            files_reparsed: 0,
+        }
+    }
+
+    /// Polls all sources incrementally and updates `current` in place when anything changed.
+    /// When no files or configs changed, performs zero `SessionInfo` / `TurnRecord` / `AggregatedStats`
+    /// allocations and only expires active `is_running_hint` badges or flushes a due debounced archive.
+    pub fn scan_if_changed(&mut self, current: &mut ScanSnapshot) -> ScanDelta {
+        let started = Instant::now();
+        let scan_now_utc = Utc::now();
+        if !self.has_scanned {
+            let snap = self.scan();
+            let reparsed = snap.files_reparsed;
+            *current = snap;
+            return ScanDelta {
+                changed: true,
+                running_changed: true,
+                files_reparsed: reparsed,
+            };
+        }
+
+        let pricing_changed = self.pricing.refresh() || std::mem::take(&mut self.pricing_dirty);
+        if pricing_changed {
+            self.pricing_gen = self.pricing_gen.wrapping_add(1);
+        }
+        let statusline_changed = self.statusline.refresh();
+        let budget_changed = self.budget.refresh() || std::mem::take(&mut self.budget_dirty);
+        let session_meta_changed = self.session_meta.refresh();
+
+        let (any_adapter_changed, files_reparsed, files_cached) =
+            self.poll_adapters(scan_now_utc, pricing_changed);
+
+        if any_adapter_changed || pricing_changed {
+            let prev_running: HashSet<(AgentFamily, String)> = current
+                .sessions
+                .iter()
+                .filter(|s| s.is_running_hint)
+                .map(|s| (s.source.agent_family(), s.conversation_id.clone()))
+                .collect();
+
+            self.rebuild_sessions_and_agg(scan_now_utc);
+
+            let new_running: HashSet<(AgentFamily, String)> = self
+                .last_full_sessions
+                .iter()
+                .filter(|s| s.is_running_hint)
+                .map(|s| (s.source.agent_family(), s.conversation_id.clone()))
+                .collect();
+            let running_changed = prev_running != new_running;
+
+            *current = self.build_snapshot(
+                started,
+                pricing_changed,
+                statusline_changed,
+                budget_changed,
+                session_meta_changed,
+                files_reparsed,
+            );
+            return ScanDelta {
+                changed: true,
+                running_changed,
+                files_reparsed,
+            };
+        }
+
+        // Fast idle path: zero adapter changes and zero pricing changes.
+        self.maybe_flush_debounced_archive();
+        let running_changed = self.refresh_running_hints_in_place(scan_now_utc, Some(current));
+
+        let today_local = Local::now().date_naive();
+        let date_rolled = self.cached_pricing_date != Some(today_local);
+        if date_rolled {
+            self.refresh_pricing_tables(today_local);
+            current.model_rate_labels = self.cached_model_rate_labels.clone();
+            current.pricing_rows = self.cached_pricing_rows.clone();
+        }
+
+        current.statusline_changed = statusline_changed;
+        if statusline_changed {
+            current.statusline = self.statusline.snapshot().cloned();
+        }
+        current.budget_changed = budget_changed;
+        if budget_changed {
+            current.budget = self.budget.config();
+        }
+        current.session_meta_changed = session_meta_changed;
+        if session_meta_changed {
+            current.session_meta = self.session_meta.entries().clone();
+        }
+        current.pricing_changed = false;
+        current.files_cached = files_cached;
+        current.files_reparsed = 0;
+        current.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        ScanDelta {
+            changed: statusline_changed || budget_changed || session_meta_changed || date_rolled,
+            running_changed,
+            files_reparsed: 0,
+        }
+    }
+
     pub fn scan(&mut self) -> ScanSnapshot {
         let started = Instant::now();
         let scan_now_utc = Utc::now();
-        let pricing_changed = self.pricing.refresh();
+        let pricing_changed = self.pricing.refresh() || std::mem::take(&mut self.pricing_dirty);
+        if pricing_changed {
+            self.pricing_gen = self.pricing_gen.wrapping_add(1);
+        }
         let statusline_changed = self.statusline.refresh();
-        let budget_changed = self.budget.refresh();
+        let budget_changed = self.budget.refresh() || std::mem::take(&mut self.budget_dirty);
         let session_meta_changed = self.session_meta.refresh();
 
-        let mut sessions_by_key: HashMap<(AgentFamily, String), SessionInfo> = HashMap::new();
+        let (any_adapter_changed, files_reparsed, _files_cached) =
+            self.poll_adapters(scan_now_utc, pricing_changed);
+
+        if !self.has_scanned || any_adapter_changed || pricing_changed {
+            self.rebuild_sessions_and_agg(scan_now_utc);
+        } else {
+            self.maybe_flush_debounced_archive();
+            self.refresh_running_hints_in_place(scan_now_utc, None);
+            let today_local = Local::now().date_naive();
+            if self.cached_pricing_date != Some(today_local) {
+                self.refresh_pricing_tables(today_local);
+            }
+        }
+
+        self.build_snapshot(
+            started,
+            pricing_changed,
+            statusline_changed,
+            budget_changed,
+            session_meta_changed,
+            files_reparsed,
+        )
+    }
+
+    fn reprice_adapter_cache(&mut self, idx: usize, tz_cache: &mut Option<LocalTzCache>) {
+        if self.adapter_caches[idx].sessions.is_empty() {
+            return;
+        }
+        let tz = tz_cache.get_or_insert_with(LocalTzCache::new);
+        let pricing_gen = self.pricing_gen;
+        for (cid, cached) in self.adapter_caches[idx].sessions.iter_mut() {
+            if cached.pricing_gen != pricing_gen {
+                let old_turns = Arc::clone(&cached.session.turns);
+                reprice_session_info(&mut cached.session, &self.pricing, tz);
+                cached.pricing_gen = pricing_gen;
+                self.adapters[idx].adopt_priced_turns(cid, &old_turns, &cached.session.turns);
+            }
+        }
+    }
+
+    fn apply_adapter_poll(
+        &mut self,
+        idx: usize,
+        poll: AdapterPoll,
+        pricing_changed: bool,
+        tz_cache: &mut Option<LocalTzCache>,
+    ) -> (bool, usize) {
+        match poll {
+            AdapterPoll::Unchanged {
+                found_root,
+                files_cached,
+                skipped_empty,
+                skipped_lines,
+            } => {
+                {
+                    let cache = &mut self.adapter_caches[idx];
+                    cache.found_root = found_root;
+                    cache.files_cached = files_cached;
+                    cache.skipped_empty = skipped_empty;
+                    cache.skipped_lines = skipped_lines;
+                }
+                if pricing_changed {
+                    self.reprice_adapter_cache(idx, tz_cache);
+                }
+                (false, 0)
+            }
+            AdapterPoll::Delta {
+                updated_sessions,
+                removed_cids,
+                files_cached,
+                files_reparsed,
+                skipped_empty,
+                skipped_lines,
+            } => {
+                let tz = tz_cache.get_or_insert_with(LocalTzCache::new);
+                let pricing_gen = self.pricing_gen;
+                let mut touched_cids: HashSet<String> =
+                    HashSet::with_capacity(updated_sessions.len());
+
+                for cid in removed_cids {
+                    self.adapter_caches[idx].sessions.remove(&cid);
+                }
+                for parsed in updated_sessions {
+                    let cid = parsed.conversation_id.clone();
+                    if parsed.turns.is_empty() {
+                        self.adapter_caches[idx].sessions.remove(&cid);
+                        continue;
+                    }
+                    touched_cids.insert(cid.clone());
+                    let reuse = self.adapter_caches[idx].sessions.get(&cid).is_some_and(|prev| {
+                        prev.pricing_gen == pricing_gen
+                            && Arc::ptr_eq(&prev.session.turns, &parsed.turns)
+                    });
+                    if reuse {
+                        if let Some(prev) = self.adapter_caches[idx].sessions.get_mut(&cid) {
+                            prev.session.title = parsed.title;
+                            prev.session.workspace = parsed.workspace;
+                            prev.session.source = parsed.source;
+                            prev.session.is_subagent = parsed.is_subagent;
+                            prev.session.parent_id = parsed.parent_id;
+                            prev.session.parent_title = parsed.parent_title;
+                            prev.session.last_file_mtime_utc = parsed.last_file_mtime_utc;
+                            prev.session.is_running_hint = parsed.is_running_hint;
+                            prev.last_step_running = parsed.last_step_running;
+                        }
+                    } else {
+                        let old_turns = Arc::clone(&parsed.turns);
+                        let last_step_running = parsed.last_step_running;
+                        let sess = build_priced_session(parsed, &self.pricing, tz);
+                        // Hand single shared priced Arc<[TurnRecord]> back to adapter immediately.
+                        self.adapters[idx].adopt_priced_turns(&cid, &old_turns, &sess.turns);
+                        self.adapter_caches[idx].sessions.insert(
+                            cid,
+                            CachedPricedSession {
+                                pricing_gen,
+                                last_step_running,
+                                session: sess,
+                            },
+                        );
+                    }
+                }
+                if pricing_changed {
+                    for (cid, cached) in self.adapter_caches[idx].sessions.iter_mut() {
+                        if !touched_cids.contains(cid) && cached.pricing_gen != pricing_gen {
+                            let old_turns = Arc::clone(&cached.session.turns);
+                            reprice_session_info(&mut cached.session, &self.pricing, tz);
+                            cached.pricing_gen = pricing_gen;
+                            self.adapters[idx].adopt_priced_turns(
+                                cid,
+                                &old_turns,
+                                &cached.session.turns,
+                            );
+                        }
+                    }
+                }
+                let cache = &mut self.adapter_caches[idx];
+                cache.found_root = true;
+                cache.files_cached = files_cached;
+                cache.skipped_empty = skipped_empty;
+                cache.skipped_lines = skipped_lines;
+                (true, files_reparsed)
+            }
+            AdapterPoll::Changed(res) => {
+                let tz = tz_cache.get_or_insert_with(LocalTzCache::new);
+                let pricing_gen = self.pricing_gen;
+                let mut prev_map = std::mem::take(&mut self.adapter_caches[idx].sessions);
+                let mut next_map: HashMap<String, CachedPricedSession> =
+                    HashMap::with_capacity(res.sessions.len());
+                let mut extra_empty = 0usize;
+
+                for parsed in res.sessions {
+                    if parsed.turns.is_empty() {
+                        extra_empty += 1;
+                        continue;
+                    }
+                    let cid = parsed.conversation_id.clone();
+                    let priced_entry = match prev_map.remove(&cid) {
+                        Some(mut prev)
+                            if prev.pricing_gen == pricing_gen
+                                && Arc::ptr_eq(&prev.session.turns, &parsed.turns) =>
+                        {
+                            // Turns and pricing unchanged: update metadata only, zero turn clones!
+                            prev.session.title = parsed.title;
+                            prev.session.workspace = parsed.workspace;
+                            prev.session.source = parsed.source;
+                            prev.session.is_subagent = parsed.is_subagent;
+                            prev.session.parent_id = parsed.parent_id;
+                            prev.session.parent_title = parsed.parent_title;
+                            prev.session.last_file_mtime_utc = parsed.last_file_mtime_utc;
+                            prev.session.is_running_hint = parsed.is_running_hint;
+                            prev.last_step_running = parsed.last_step_running;
+                            prev
+                        }
+                        _ => {
+                            let old_turns = Arc::clone(&parsed.turns);
+                            let last_step_running = parsed.last_step_running;
+                            let sess = build_priced_session(parsed, &self.pricing, tz);
+                            // Adopt priced Arc<[TurnRecord]> back into adapter so zero duplicate
+                            // unpriced turn buffers remain in RAM (~4.5 MiB saved!).
+                            self.adapters[idx].adopt_priced_turns(&cid, &old_turns, &sess.turns);
+                            CachedPricedSession {
+                                pricing_gen,
+                                last_step_running,
+                                session: sess,
+                            }
+                        }
+                    };
+
+                    let replace = match next_map.get(&cid) {
+                        None => true,
+                        Some(existing) => {
+                            priced_entry.session.turns.len() > existing.session.turns.len()
+                                || (priced_entry.session.turns.len()
+                                    == existing.session.turns.len()
+                                    && priced_entry.session.last_time
+                                        > existing.session.last_time)
+                        }
+                    };
+                    if replace {
+                        next_map.insert(cid, priced_entry);
+                    }
+                }
+
+                let cache = &mut self.adapter_caches[idx];
+                cache.found_root = res.found_root;
+                cache.skipped_empty = res.skipped_empty + extra_empty;
+                cache.skipped_lines = res.skipped_lines;
+                cache.files_cached = res.files_cached;
+                cache.sessions = next_map;
+                (true, res.files_reparsed)
+            }
+        }
+    }
+
+    fn poll_adapters(
+        &mut self,
+        scan_now_utc: DateTime<Utc>,
+        pricing_changed: bool,
+    ) -> (bool, usize, usize) {
+        let mut any_changed = false;
+        let mut total_reparsed = 0usize;
+        let mut tz_cache: Option<LocalTzCache> = None;
+
+        for idx in 0..self.adapters.len() {
+            let poll = self.adapters[idx].poll_changes(scan_now_utc);
+            let (changed, reparsed) =
+                self.apply_adapter_poll(idx, poll, pricing_changed, &mut tz_cache);
+            if changed {
+                any_changed = true;
+            }
+            total_reparsed += reparsed;
+        }
+
+        let total_cached: usize = self.adapter_caches.iter().map(|c| c.files_cached).sum();
+        self.last_files_cached = total_cached;
+        (any_changed, total_reparsed, total_cached)
+    }
+
+    fn rebuild_sessions_and_agg(&mut self, scan_now_utc: DateTime<Utc>) {
+        let mut sessions_by_key: HashMap<(AgentFamily, String), (SessionInfo, bool)> =
+            HashMap::new();
         let mut skipped_empty = 0usize;
         let mut skipped_lines = 0usize;
         let mut files_cached = 0usize;
-        let mut files_reparsed = 0usize;
         let mut found_any_root = false;
 
-        for adapter in &mut self.adapters {
-            let res = adapter.scan(scan_now_utc);
-            if res.found_root {
+        for cache in &self.adapter_caches {
+            if cache.found_root {
                 found_any_root = true;
             }
-            skipped_empty += res.skipped_empty;
-            skipped_lines += res.skipped_lines;
-            files_cached += res.files_cached;
-            files_reparsed += res.files_reparsed;
+            skipped_empty += cache.skipped_empty;
+            skipped_lines += cache.skipped_lines;
+            files_cached += cache.files_cached;
 
-            for parsed in res.sessions {
-                if parsed.turns.is_empty() {
-                    skipped_empty += 1;
-                    continue;
-                }
-
-                let mut counts = TokenCounts::default();
-                let mut models = BTreeSet::new();
-                let mut first_time: Option<DateTime<Local>> = None;
-                let mut last_time: Option<DateTime<Local>> = None;
-
-                let fallback_model = dominant_real_model(&parsed.turns);
-                let mut last_real_model: Option<String> = None;
-                let mut priced_turns = parsed.turns;
-
-                for t in &mut priced_turns {
-                    let eff_model = if !t.is_checkpoint
-                        && !is_compaction_model(&t.model)
-                        && t.model != "unknown"
-                    {
-                        last_real_model = Some(t.model.clone());
-                        t.model.as_str()
-                    } else if !is_compaction_model(&t.model) && t.model != "unknown" {
-                        t.model.as_str()
-                    } else if let Some(prev) = last_real_model.as_deref() {
-                        prev
-                    } else {
-                        fallback_model.as_deref().unwrap_or(t.model.as_str())
-                    };
-                    let local_date = t.timestamp_utc.map(|u| u.with_timezone(&Local).date_naive());
-                    t.cost = price_turn_record(&self.pricing, eff_model, t, local_date);
-
-                    counts.add_call_with_cost(
-                        t.input_tokens,
-                        t.cache_read_tokens,
-                        t.cache_write_tokens,
-                        t.output_tokens,
-                        t.cost,
+            for cached in cache.sessions.values() {
+                let mut sess = cached.session.clone();
+                // Keep running hint accurate even for unchanged adapters whose files aged out.
+                if sess.is_running_hint {
+                    sess.is_running_hint = compute_running_hint(
+                        cached.last_step_running,
+                        sess.last_file_mtime_utc,
+                        scan_now_utc,
                     );
-                    models.insert(t.model.clone());
-                    if let Some(ts_utc) = t.timestamp_utc {
-                        let ts_local = ts_utc.with_timezone(&Local);
-                        first_time = Some(match first_time {
-                            Some(prev) if prev <= ts_local => prev,
-                            _ => ts_local,
-                        });
-                        last_time = Some(match last_time {
-                            Some(prev) if prev >= ts_local => prev,
-                            _ => ts_local,
-                        });
-                    }
                 }
-
-                let family = parsed.source.agent_family();
-                let key = (family, parsed.conversation_id.clone());
-                let sess = SessionInfo {
-                    conversation_id: parsed.conversation_id,
-                    title: parsed.title,
-                    workspace: parsed.workspace,
-                    source: parsed.source,
-                    is_archived: false,
-                    is_subagent: parsed.is_subagent,
-                    parent_id: parsed.parent_id,
-                    parent_title: parsed.parent_title,
-                    turns: priced_turns,
-                    counts,
-                    models,
-                    first_time,
-                    last_time,
-                    last_file_mtime_utc: parsed.last_file_mtime_utc,
-                    is_running_hint: parsed.is_running_hint,
-                };
-
-                // Deduplicate within the same AgentFamily (e.g. Antigravity CLI/App/IDE sharing UUIDs):
-                // keep session with more turns (or newer last_time).
+                let family = sess.source.agent_family();
+                let key = (family, sess.conversation_id.clone());
                 let replace = match sessions_by_key.get(&key) {
                     None => true,
-                    Some(prev) => {
+                    Some((prev, _)) => {
                         sess.turns.len() > prev.turns.len()
-                            || (sess.turns.len() == prev.turns.len() && sess.last_time > prev.last_time)
+                            || (sess.turns.len() == prev.turns.len()
+                                && sess.last_time > prev.last_time)
                     }
                 };
                 if replace {
-                    sessions_by_key.insert(key, sess);
+                    sessions_by_key.insert(key, (sess, cached.last_step_running));
                 }
             }
         }
 
-        let mut sessions: Vec<SessionInfo> = sessions_by_key.into_values().collect();
+        let mut live_sessions: Vec<SessionInfo> = Vec::with_capacity(sessions_by_key.len());
+        let mut active_running: Vec<ActiveRunningEntry> = Vec::new();
+        for ((family, cid), (sess, last_step_running)) in sessions_by_key {
+            if sess.is_running_hint {
+                active_running.push(ActiveRunningEntry {
+                    family,
+                    cid,
+                    last_step_running,
+                    mtime_utc: sess.last_file_mtime_utc,
+                });
+            }
+            live_sessions.push(sess);
+        }
 
         // Link subagent sessions to their parent within the SAME AgentFamily so they inherit
         // workspace and parent title without ever cross-linking across different agents.
-        let parent_lookup: HashMap<(AgentFamily, String), (String, String)> = sessions
-            .iter()
-            .map(|s| {
-                (
-                    (s.source.agent_family(), s.conversation_id.clone()),
-                    (s.title.clone(), s.workspace.clone()),
-                )
-            })
-            .collect();
-        for s in &mut sessions {
-            if !s.is_subagent {
-                continue;
-            }
-            let Some(pid) = s.parent_id.clone() else { continue };
-            let family = s.source.agent_family();
-            let resolved = if let Some((ptitle, pws)) = parent_lookup.get(&(family, pid.clone())) {
-                Some((ptitle.clone(), pws.clone()))
-            } else {
-                let mut found = None;
-                for adapter in &mut self.adapters {
-                    if adapter.kind().agent_family() != family {
-                        continue;
+        if live_sessions.iter().any(|s| s.is_subagent) {
+            let parent_lookup: HashMap<(AgentFamily, String), (String, String)> = live_sessions
+                .iter()
+                .map(|s| {
+                    (
+                        (s.source.agent_family(), s.conversation_id.clone()),
+                        (s.title.clone(), s.workspace.clone()),
+                    )
+                })
+                .collect();
+            for s in &mut live_sessions {
+                if !s.is_subagent {
+                    continue;
+                }
+                let Some(pid) = s.parent_id.clone() else { continue };
+                let family = s.source.agent_family();
+                let resolved = if let Some((ptitle, pws)) = parent_lookup.get(&(family, pid.clone())) {
+                    Some((ptitle.clone(), pws.clone()))
+                } else {
+                    let mut found = None;
+                    for adapter in &mut self.adapters {
+                        if adapter.kind().agent_family() != family {
+                            continue;
+                        }
+                        if let Some(hint) = adapter.lookup_session_hint(&pid) {
+                            found = Some(hint);
+                            break;
+                        }
                     }
-                    if let Some(hint) = adapter.lookup_session_hint(&pid) {
-                        found = Some(hint);
-                        break;
+                    found
+                };
+                if let Some((ptitle, pws)) = resolved {
+                    if !ptitle.is_empty() && s.parent_title.is_empty() {
+                        s.parent_title = ptitle.clone();
                     }
-                }
-                found
-            };
-            if let Some((ptitle, pws)) = resolved {
-                if !ptitle.is_empty() && s.parent_title.is_empty() {
-                    s.parent_title = ptitle.clone();
-                }
-                if (s.workspace.is_empty()
-                    || s.workspace == "(未知工作区)"
-                    || s.workspace == "(unknown)")
-                    && !pws.is_empty()
-                    && pws != "(未知工作区)"
-                    && pws != "(unknown)"
-                {
-                    s.workspace = pws;
-                }
-                if (s.title == "(子会话)" || s.title == "(未命名会话)") && !ptitle.is_empty() {
-                    s.title = format!("子任务 · {}", ptitle);
+                    if (s.workspace.is_empty()
+                        || s.workspace == "(未知工作区)"
+                        || s.workspace == "(unknown)")
+                        && !pws.is_empty()
+                        && pws != "(未知工作区)"
+                        && pws != "(unknown)"
+                    {
+                        s.workspace = pws;
+                    }
+                    if (s.title == "(子会话)" || s.title == "(未命名会话)") && !ptitle.is_empty()
+                    {
+                        s.title = format!("子任务 · {}", ptitle);
+                    }
                 }
             }
         }
 
-        // Sync live sessions into local app-directory archive & backfill any pruned historical sessions.
-        let archived_backfill = self.archive.sync_and_backfill_filtered(
-            &sessions,
+        // If any previously-live session disappeared from disk while debounced archive changes
+        // were pending in memory, flush the previous live set first so zero turns are lost.
+        let any_vanished = if !self.last_live_sessions.is_empty() {
+            let new_keys: HashSet<(AgentFamily, &str)> = live_sessions
+                .iter()
+                .map(|s| (s.source.agent_family(), s.conversation_id.as_str()))
+                .collect();
+            self.last_live_sessions
+                .iter()
+                .any(|old| !new_keys.contains(&(old.source.agent_family(), old.conversation_id.as_str())))
+        } else {
+            false
+        };
+        if any_vanished && self.archive.is_dirty() {
+            if self.archive.flush(&self.last_live_sessions, false) {
+                self.last_archive_persist = Some(Instant::now());
+                self.has_persisted_archive = true;
+            }
+        }
+
+        // Debounce periodic archive writes to 120s; persist immediately on first dirty scan or removal.
+        let allow_persist = !self.has_persisted_archive
+            || any_vanished
+            || self
+                .last_archive_persist
+                .map(|t| t.elapsed() >= ARCHIVE_PERSIST_DEBOUNCE)
+                .unwrap_or(true);
+
+        let was_dirty_before = self.archive.is_dirty();
+        let archived_backfill = self.archive.sync_and_backfill_cached(
+            &live_sessions,
             &self.pricing,
-            true,
+            self.pricing_gen,
+            allow_persist,
+            false,
             &self.archive_filter,
         );
-        let archived_sessions_count = archived_backfill.len();
-        sessions.extend(archived_backfill);
+        if allow_persist && (was_dirty_before || !self.has_persisted_archive) && !self.archive.is_dirty() {
+            self.last_archive_persist = Some(Instant::now());
+            self.has_persisted_archive = true;
+        }
 
+        let archived_sessions_count = archived_backfill.len();
+        self.last_live_sessions = live_sessions.clone();
+
+        let mut sessions = live_sessions;
+        sessions.extend(archived_backfill);
         sessions.sort_by(|a, b| b.last_time.cmp(&a.last_time));
 
         let agg = aggregate_sessions(&sessions);
 
-        let today_local = Local::now().date_naive();
-        let mut model_rate_labels = HashMap::new();
-        let mut observed_ranked: Vec<(String, u64)> = agg
-            .by_model
-            .iter()
-            .filter(|(name, _)| !is_compaction_model(name) && name.as_str() != "unknown")
-            .map(|(name, c)| (name.clone(), c.total_tokens()))
-            .collect();
-        observed_ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let observed_names: Vec<String> = observed_ranked.into_iter().map(|(n, _)| n).collect();
-        for name in agg.by_model.keys() {
-            if let Some(lbl) = self.pricing.rate_label(name, Some(today_local)) {
-                model_rate_labels.insert(name.clone(), lbl);
-            }
-        }
-        let pricing_rows = self.pricing.build_table(&observed_names, today_local);
         let warning = if !found_any_root && archived_sessions_count == 0 {
             if self.sources.len() == 1
                 && self.sources[0].0.agent_family() == AgentFamily::Antigravity
@@ -985,11 +1752,113 @@ impl IncrementalScanner {
             None
         };
 
+        self.last_full_sessions = sessions;
+        self.last_agg = agg;
+        self.active_running = active_running;
+        self.last_archived_count = archived_sessions_count;
+        self.last_skipped_empty = skipped_empty;
+        self.last_skipped_lines = skipped_lines;
+        self.last_files_cached = files_cached;
+        self.last_found_any_root = found_any_root;
+        self.last_warning = warning;
+        self.has_scanned = true;
+
+        let today_local = Local::now().date_naive();
+        self.refresh_pricing_tables(today_local);
+    }
+
+    fn refresh_pricing_tables(&mut self, today_local: NaiveDate) {
+        let mut model_rate_labels = HashMap::new();
+        let mut observed_ranked: Vec<(String, u64)> = self
+            .last_agg
+            .by_model
+            .iter()
+            .filter(|(name, _)| !is_compaction_model(name) && name.as_str() != "unknown")
+            .map(|(name, c)| (name.clone(), c.total_tokens()))
+            .collect();
+        observed_ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let observed_names: Vec<String> = observed_ranked.into_iter().map(|(n, _)| n).collect();
+        for name in self.last_agg.by_model.keys() {
+            if let Some(lbl) = self.pricing.rate_label(name, Some(today_local)) {
+                model_rate_labels.insert(name.clone(), lbl);
+            }
+        }
+        self.cached_pricing_rows = self.pricing.build_table(&observed_names, today_local);
+        self.cached_model_rate_labels = model_rate_labels;
+        self.cached_pricing_date = Some(today_local);
+    }
+
+    fn maybe_flush_debounced_archive(&mut self) {
+        if self.archive.is_dirty()
+            && self
+                .last_archive_persist
+                .map(|t| t.elapsed() >= ARCHIVE_PERSIST_DEBOUNCE)
+                .unwrap_or(true)
+        {
+            if self.archive.flush(&self.last_live_sessions, false) {
+                self.last_archive_persist = Some(Instant::now());
+                self.has_persisted_archive = true;
+            }
+        }
+    }
+
+    fn refresh_running_hints_in_place(
+        &mut self,
+        scan_now_utc: DateTime<Utc>,
+        mut current: Option<&mut ScanSnapshot>,
+    ) -> bool {
+        if self.active_running.is_empty() {
+            return false;
+        }
+        let mut expired: Vec<(AgentFamily, String)> = Vec::new();
+        self.active_running.retain(|entry| {
+            let still_running =
+                compute_running_hint(entry.last_step_running, entry.mtime_utc, scan_now_utc);
+            if !still_running {
+                expired.push((entry.family, entry.cid.clone()));
+            }
+            still_running
+        });
+        if expired.is_empty() {
+            return false;
+        }
+        for (family, cid) in &expired {
+            for s in &mut self.last_full_sessions {
+                if s.is_running_hint
+                    && s.source.agent_family() == *family
+                    && s.conversation_id == *cid
+                {
+                    s.is_running_hint = false;
+                }
+            }
+            if let Some(snap) = current.as_deref_mut() {
+                for s in &mut snap.sessions {
+                    if s.is_running_hint
+                        && s.source.agent_family() == *family
+                        && s.conversation_id == *cid
+                    {
+                        s.is_running_hint = false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn build_snapshot(
+        &self,
+        started: Instant,
+        pricing_changed: bool,
+        statusline_changed: bool,
+        budget_changed: bool,
+        session_meta_changed: bool,
+        files_reparsed: usize,
+    ) -> ScanSnapshot {
         ScanSnapshot {
             data_dir: self.sources[0].1.clone(),
             data_dirs: self.sources.clone(),
-            sessions,
-            agg,
+            sessions: self.last_full_sessions.clone(),
+            agg: self.last_agg.clone(),
             statusline: self.statusline.snapshot().cloned(),
             statusline_changed,
             budget: self.budget.config(),
@@ -998,36 +1867,164 @@ impl IncrementalScanner {
             session_meta: self.session_meta.entries().clone(),
             session_meta_changed,
             session_meta_path: self.session_meta.path().map(Path::to_path_buf),
-            archived_sessions_count,
+            archived_sessions_count: self.last_archived_count,
             archive_enabled: self.archive.is_enabled(),
             archive_path: self.archive.path().map(Path::to_path_buf),
-            model_rate_labels,
-            pricing_rows,
+            model_rate_labels: self.cached_model_rate_labels.clone(),
+            pricing_rows: self.cached_pricing_rows.clone(),
             pricing_path: self.pricing.override_path().map(Path::to_path_buf),
             custom_pricing_count: self.pricing.custom_rules_count(),
             pricing_changed,
-            skipped_empty,
-            skipped_lines,
-            files_cached,
+            skipped_empty: self.last_skipped_empty,
+            skipped_lines: self.last_skipped_lines,
+            files_cached: self.last_files_cached,
             files_reparsed,
             scan_ms: started.elapsed().as_secs_f64() * 1000.0,
-            warning,
+            warning: self.last_warning.clone(),
         }
     }
 }
 
-fn dominant_real_model(turns: &[TurnRecord]) -> Option<String> {
+fn build_priced_session(
+    parsed: ParsedSession,
+    pricing: &PricingCatalog,
+    tz_cache: &mut LocalTzCache,
+) -> SessionInfo {
+    let mut counts = TokenCounts::default();
+    let mut models = BTreeSet::new();
+    let mut first_time: Option<DateTime<Local>> = None;
+    let mut last_time: Option<DateTime<Local>> = None;
+    let mut compaction_count: u32 = 0;
+    let mut thinking_turns: u32 = 0;
+
+    let fallback_model = dominant_real_model(&parsed.turns);
+    let mut last_real_model: Option<Arc<str>> = None;
+    let mut priced_turns: Vec<TurnRecord> = parsed.turns.to_vec();
+
+    for t in &mut priced_turns {
+        let eff_model: &str = if !t.is_checkpoint
+            && !is_compaction_model(&t.model)
+            && t.model.as_ref() != "unknown"
+        {
+            last_real_model = Some(Arc::clone(&t.model));
+            &t.model
+        } else if !is_compaction_model(&t.model) && t.model.as_ref() != "unknown" {
+            &t.model
+        } else if let Some(prev) = last_real_model.as_deref() {
+            prev
+        } else {
+            fallback_model.as_deref().unwrap_or(&t.model)
+        };
+
+        let ts_local = t.timestamp_utc.map(|u| tz_cache.to_local(u));
+        let local_date = ts_local.map(|dt| dt.date_naive());
+        t.cost = price_turn_record(pricing, eff_model, t, local_date);
+
+        counts.add_call_with_cost(
+            t.input_tokens,
+            t.cache_read_tokens,
+            t.cache_write_tokens,
+            t.output_tokens,
+            t.cost,
+        );
+        if !models.contains(t.model.as_ref()) {
+            models.insert(t.model.to_string());
+        }
+        if t.is_checkpoint {
+            compaction_count = compaction_count.saturating_add(1);
+        }
+        if t.has_thinking() {
+            thinking_turns = thinking_turns.saturating_add(1);
+        }
+        if let Some(ts_l) = ts_local {
+            first_time = Some(match first_time {
+                Some(prev) if prev <= ts_l => prev,
+                _ => ts_l,
+            });
+            last_time = Some(match last_time {
+                Some(prev) if prev >= ts_l => prev,
+                _ => ts_l,
+            });
+        }
+    }
+
+    let primary_model = compute_primary_model(&priced_turns);
+    let active_duration_secs = compute_active_duration_secs(&priced_turns);
+
+    SessionInfo {
+        conversation_id: parsed.conversation_id,
+        title: parsed.title,
+        workspace: parsed.workspace,
+        source: parsed.source,
+        is_archived: false,
+        is_subagent: parsed.is_subagent,
+        parent_id: parsed.parent_id,
+        parent_title: parsed.parent_title,
+        turns: priced_turns.into(),
+        counts,
+        models,
+        first_time,
+        last_time,
+        last_file_mtime_utc: parsed.last_file_mtime_utc,
+        is_running_hint: parsed.is_running_hint,
+        primary_model,
+        active_duration_secs,
+        compaction_count,
+        thinking_turns,
+    }
+}
+
+fn reprice_session_info(
+    sess: &mut SessionInfo,
+    pricing: &PricingCatalog,
+    tz_cache: &mut LocalTzCache,
+) {
+    let fallback_model = dominant_real_model(&sess.turns);
+    let mut last_real_model: Option<Arc<str>> = None;
+    let mut priced_turns: Vec<TurnRecord> = sess.turns.to_vec();
+    let mut counts = TokenCounts::default();
+
+    for t in &mut priced_turns {
+        let eff_model: &str = if !t.is_checkpoint
+            && !is_compaction_model(&t.model)
+            && t.model.as_ref() != "unknown"
+        {
+            last_real_model = Some(Arc::clone(&t.model));
+            &t.model
+        } else if !is_compaction_model(&t.model) && t.model.as_ref() != "unknown" {
+            &t.model
+        } else if let Some(prev) = last_real_model.as_deref() {
+            prev
+        } else {
+            fallback_model.as_deref().unwrap_or(&t.model)
+        };
+        let local_date = t.timestamp_utc.map(|u| tz_cache.to_local(u).date_naive());
+        t.cost = price_turn_record(pricing, eff_model, t, local_date);
+        counts.add_call_with_cost(
+            t.input_tokens,
+            t.cache_read_tokens,
+            t.cache_write_tokens,
+            t.output_tokens,
+            t.cost,
+        );
+    }
+
+    sess.turns = priced_turns.into();
+    sess.counts = counts;
+}
+
+fn dominant_real_model(turns: &[TurnRecord]) -> Option<Arc<str>> {
     let mut by_m: HashMap<&str, u64> = HashMap::new();
     for t in turns {
-        if t.is_checkpoint || is_compaction_model(&t.model) || t.model == "unknown" {
+        if t.is_checkpoint || is_compaction_model(&t.model) || t.model.as_ref() == "unknown" {
             continue;
         }
-        let entry = by_m.entry(t.model.as_str()).or_insert(0);
+        let entry = by_m.entry(t.model.as_ref()).or_insert(0);
         *entry = entry.saturating_add(t.total_input() + t.output_tokens);
     }
     by_m.into_iter()
-        .max_by_key(|&(_, tok)| tok)
-        .map(|(m, _)| m.to_string())
+        .max_by(|(na, ta), (nb, tb)| ta.cmp(tb).then_with(|| na.cmp(nb)))
+        .map(|(m, _)| intern_str(m))
 }
 
 pub fn filter_snapshot(snapshot: &ScanSnapshot, scope: DateScope) -> (Vec<SessionInfo>, AggregatedStats) {
@@ -1052,17 +2049,41 @@ pub fn filter_snapshot_range(
     if since.is_none() && until.is_none() {
         return (snapshot.sessions.clone(), snapshot.agg.clone());
     }
+    let mut tz_cache = LocalTzCache::new();
     let mut filtered = Vec::new();
     for s in &snapshot.sessions {
+        // O(1) disjoint session prune via cached (first_time, last_time).
+        let (Some(s_first), Some(s_last)) = (s.first_time, s.last_time) else {
+            continue;
+        };
+        let first_d = s_first.date_naive();
+        let last_d = s_last.date_naive();
+        if since.is_some_and(|min_d| last_d < min_d) {
+            continue;
+        }
+        if until.is_some_and(|max_d| first_d > max_d) {
+            continue;
+        }
+
+        // O(1) whole-session Arc reuse when the entire session lies within [since, until].
+        let wholly_in_range = since.map_or(true, |min_d| first_d >= min_d)
+            && until.map_or(true, |max_d| last_d <= max_d);
+        if wholly_in_range && s.turns.iter().all(|t| t.timestamp_utc.is_some()) {
+            filtered.push(s.clone());
+            continue;
+        }
+
         let mut turns = Vec::new();
         let mut counts = TokenCounts::default();
         let mut models = BTreeSet::new();
         let mut first_time: Option<DateTime<Local>> = None;
         let mut last_time: Option<DateTime<Local>> = None;
+        let mut compaction_count: u32 = 0;
+        let mut thinking_turns: u32 = 0;
 
-        for t in &s.turns {
+        for t in s.turns.iter() {
             let Some(ts_utc) = t.timestamp_utc else { continue };
-            let ts_local = ts_utc.with_timezone(&Local);
+            let ts_local = tz_cache.to_local(ts_utc);
             let d = ts_local.date_naive();
             if let Some(min_d) = since {
                 if d < min_d {
@@ -1081,7 +2102,15 @@ pub fn filter_snapshot_range(
                 t.output_tokens,
                 t.cost,
             );
-            models.insert(t.model.clone());
+            if !models.contains(t.model.as_ref()) {
+                models.insert(t.model.to_string());
+            }
+            if t.is_checkpoint {
+                compaction_count = compaction_count.saturating_add(1);
+            }
+            if t.has_thinking() {
+                thinking_turns = thinking_turns.saturating_add(1);
+            }
             first_time = Some(match first_time {
                 Some(prev) if prev <= ts_local => prev,
                 _ => ts_local,
@@ -1093,6 +2122,8 @@ pub fn filter_snapshot_range(
             turns.push(t.clone());
         }
         if !turns.is_empty() {
+            let primary_model = compute_primary_model(&turns);
+            let active_duration_secs = compute_active_duration_secs(&turns);
             filtered.push(SessionInfo {
                 conversation_id: s.conversation_id.clone(),
                 title: s.title.clone(),
@@ -1102,13 +2133,17 @@ pub fn filter_snapshot_range(
                 is_subagent: s.is_subagent,
                 parent_id: s.parent_id.clone(),
                 parent_title: s.parent_title.clone(),
-                turns,
+                turns: turns.into(),
                 counts,
                 models,
                 first_time,
                 last_time,
                 last_file_mtime_utc: s.last_file_mtime_utc,
                 is_running_hint: s.is_running_hint,
+                primary_model,
+                active_duration_secs,
+                compaction_count,
+                thinking_turns,
             });
         }
     }
@@ -1119,17 +2154,18 @@ pub fn filter_snapshot_range(
 
 pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
     let mut agg = AggregatedStats::default();
-    let mut week_day_sets: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut tz_cache = LocalTzCache::new();
+    let mut by_date: BTreeMap<NaiveDate, TokenCounts> = BTreeMap::new();
 
     for s in sessions {
         agg.total.merge(&s.counts);
         agg.total_active_secs = agg.total_active_secs.saturating_add(s.active_duration_secs());
-        let ws = agg
-            .by_workspace
-            .entry(s.workspace.clone())
-            .or_insert((0, TokenCounts::default()));
-        ws.0 += 1;
-        ws.1.merge(&s.counts);
+        if let Some(ws) = agg.by_workspace.get_mut(s.workspace.as_str()) {
+            ws.0 += 1;
+            ws.1.merge(&s.counts);
+        } else {
+            agg.by_workspace.insert(s.workspace.clone(), (1, s.counts));
+        }
         let src = agg
             .by_source
             .entry(s.source)
@@ -1147,21 +2183,41 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
             if t.has_thinking() {
                 agg.total_thinking_turns += 1;
             }
-            for tool in &t.tool_names {
-                *agg.by_tool.entry(tool.clone()).or_insert(0) += 1;
+            for tool in t.tool_names.iter() {
+                if let Some(cnt) = agg.by_tool.get_mut(tool.as_ref()) {
+                    *cnt += 1;
+                } else {
+                    agg.by_tool.insert(tool.to_string(), 1);
+                }
             }
-            agg.by_model
-                .entry(t.model.clone())
-                .or_default()
-                .add_call_with_cost(
+            let model_str = t.model.as_ref();
+            if let Some(mc) = agg.by_model.get_mut(model_str) {
+                mc.add_call_with_cost(
                     t.input_tokens,
                     t.cache_read_tokens,
                     t.cache_write_tokens,
                     t.output_tokens,
                     t.cost,
                 );
+            } else {
+                let mut tc = TokenCounts::default();
+                tc.add_call_with_cost(
+                    t.input_tokens,
+                    t.cache_read_tokens,
+                    t.cache_write_tokens,
+                    t.output_tokens,
+                    t.cost,
+                );
+                agg.by_model.insert(model_str.to_string(), tc);
+            }
 
-            let mcs = agg.by_model_cache.entry(t.model.clone()).or_default();
+            let mcs = if let Some(m) = agg.by_model_cache.get_mut(model_str) {
+                m
+            } else {
+                agg.by_model_cache
+                    .entry(model_str.to_string())
+                    .or_default()
+            };
             if t.output_tps().is_some() {
                 mcs.speed_calls += 1;
                 mcs.speed_output_tokens = mcs.speed_output_tokens.saturating_add(t.output_tokens);
@@ -1182,44 +2238,17 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
             }
 
             if let Some(ts_utc) = t.timestamp_utc {
-                let ts = ts_utc.with_timezone(&Local);
+                let ts = tz_cache.to_local(ts_utc);
                 let d = ts.date_naive();
-                let day_key = d.format("%Y-%m-%d").to_string();
-                let wk_key = iso_week_key(d);
-                let month_key = d.format("%Y-%m").to_string();
                 let hour = (ts.hour() as usize).min(23);
 
-                agg.by_day
-                    .entry(day_key.clone())
-                    .or_default()
-                    .add_call_with_cost(
-                        t.input_tokens,
-                        t.cache_read_tokens,
-                        t.cache_write_tokens,
-                        t.output_tokens,
-                        t.cost,
-                    );
-                agg.by_week
-                    .entry(wk_key.clone())
-                    .or_default()
-                    .add_call_with_cost(
-                        t.input_tokens,
-                        t.cache_read_tokens,
-                        t.cache_write_tokens,
-                        t.output_tokens,
-                        t.cost,
-                    );
-                week_day_sets.entry(wk_key).or_default().insert(day_key);
-                agg.by_month
-                    .entry(month_key)
-                    .or_default()
-                    .add_call_with_cost(
-                        t.input_tokens,
-                        t.cache_read_tokens,
-                        t.cache_write_tokens,
-                        t.output_tokens,
-                        t.cost,
-                    );
+                by_date.entry(d).or_default().add_call_with_cost(
+                    t.input_tokens,
+                    t.cache_read_tokens,
+                    t.cache_write_tokens,
+                    t.output_tokens,
+                    t.cost,
+                );
                 agg.by_hour[hour].add_call_with_cost(
                     t.input_tokens,
                     t.cache_read_tokens,
@@ -1231,9 +2260,26 @@ pub fn aggregate_sessions(sessions: &[SessionInfo]) -> AggregatedStats {
         }
     }
 
-    for (wk, set) in week_day_sets {
-        agg.week_active_days.insert(wk, set.len());
+    // Format day / ISO-week / month strings once per unique NaiveDate (~30 vs 50,000+ allocs).
+    for (d, day_tc) in by_date {
+        let day_key = format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day());
+        let wk_key = iso_week_key(d);
+        let month_key = format!("{:04}-{:02}", d.year(), d.month());
+
+        agg.by_day.insert(day_key, day_tc);
+        if let Some(wk) = agg.by_week.get_mut(&wk_key) {
+            wk.merge(&day_tc);
+        } else {
+            agg.by_week.insert(wk_key.clone(), day_tc);
+        }
+        *agg.week_active_days.entry(wk_key).or_insert(0) += 1;
+        if let Some(mo) = agg.by_month.get_mut(&month_key) {
+            mo.merge(&day_tc);
+        } else {
+            agg.by_month.insert(month_key, day_tc);
+        }
     }
+
     agg
 }
 
@@ -1372,7 +2418,7 @@ mod tests {
         let mk_turn = |model: &str, cw: u64, cw1h: u64, out: u64, rt: u64, th: u64| TurnRecord {
             step_index: 1,
             timestamp_utc: None,
-            model: model.into(),
+            model: intern_str(model),
             is_checkpoint: false,
             input_tokens: 1_000,
             cache_read_tokens: 0,
@@ -1380,7 +2426,7 @@ mod tests {
             cache_write_1h_tokens: cw1h,
             output_tokens: out,
             reasoning_tokens: rt,
-            tool_names: Vec::new(),
+            tool_names: Box::new([]),
             thinking_chars: th,
             gen_secs: None,
             cost: CostBreakdown::default(),
@@ -1406,14 +2452,19 @@ mod tests {
             is_subagent: false,
             parent_id: None,
             parent_title: String::new(),
-            turns: vec![t_plain],
+            turns: vec![t_plain].into(),
             counts: TokenCounts::default(),
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
             last_file_mtime_utc: None,
             is_running_hint: false,
+            primary_model: intern_str("-"),
+            active_duration_secs: 0,
+            compaction_count: 0,
+            thinking_turns: 0,
         };
+        s_agy.recompute_summary();
         s_agy.counts.add_call(1_000, 0, 0, 200);
 
         let mut s_codex = SessionInfo {
@@ -1425,14 +2476,19 @@ mod tests {
             is_subagent: false,
             parent_id: None,
             parent_title: String::new(),
-            turns: vec![t_codex],
+            turns: vec![t_codex].into(),
             counts: TokenCounts::default(),
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
             last_file_mtime_utc: None,
             is_running_hint: false,
+            primary_model: intern_str("-"),
+            active_duration_secs: 0,
+            compaction_count: 0,
+            thinking_turns: 0,
         };
+        s_codex.recompute_summary();
         s_codex.counts.add_call(1_000, 0, 0, 800);
 
         assert_eq!(s_codex.thinking_turns(), 1);
@@ -1446,7 +2502,7 @@ mod tests {
 
     #[test]
     fn test_primary_model_and_workspace_short() {
-        let s = SessionInfo {
+        let mut s = SessionInfo {
             conversation_id: "abc".into(),
             title: "t".into(),
             workspace: "C:/Users/qingz/agent-home/".into(),
@@ -1459,7 +2515,7 @@ mod tests {
                 TurnRecord {
                     step_index: 1,
                     timestamp_utc: None,
-                    model: "(上下文压缩)".into(),
+                    model: intern_str("(上下文压缩)"),
                     is_checkpoint: true,
                     input_tokens: 5_000,
                     cache_read_tokens: 500_000,
@@ -1467,7 +2523,7 @@ mod tests {
                     cache_write_1h_tokens: 0,
                     output_tokens: 6_000,
                     reasoning_tokens: 0,
-                    tool_names: Vec::new(),
+                    tool_names: Box::new([]),
                     thinking_chars: 0,
                     gen_secs: None,
                     cost: CostBreakdown::default(),
@@ -1475,7 +2531,7 @@ mod tests {
                 TurnRecord {
                     step_index: 2,
                     timestamp_utc: None,
-                    model: "gemini-4-neon-xhigh".into(),
+                    model: intern_str("gemini-4-neon-xhigh"),
                     is_checkpoint: false,
                     input_tokens: 1_000,
                     cache_read_tokens: 100_000,
@@ -1483,7 +2539,7 @@ mod tests {
                     cache_write_1h_tokens: 0,
                     output_tokens: 500,
                     reasoning_tokens: 0,
-                    tool_names: vec!["read_file".into()],
+                    tool_names: vec![intern_str("read_file")].into_boxed_slice(),
                     thinking_chars: 80,
                     gen_secs: None,
                     cost: CostBreakdown::default(),
@@ -1491,7 +2547,7 @@ mod tests {
                 TurnRecord {
                     step_index: 3,
                     timestamp_utc: None,
-                    model: "gemini-4-neon-high".into(),
+                    model: intern_str("gemini-4-neon-high"),
                     is_checkpoint: false,
                     input_tokens: 500,
                     cache_read_tokens: 10_000,
@@ -1499,19 +2555,25 @@ mod tests {
                     cache_write_1h_tokens: 0,
                     output_tokens: 200,
                     reasoning_tokens: 0,
-                    tool_names: Vec::new(),
+                    tool_names: Box::new([]),
                     thinking_chars: 0,
                     gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
-            ],
+            ]
+            .into(),
             counts: TokenCounts::default(),
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
             last_file_mtime_utc: None,
             is_running_hint: false,
+            primary_model: intern_str("-"),
+            active_duration_secs: 0,
+            compaction_count: 0,
+            thinking_turns: 0,
         };
+        s.recompute_summary();
         assert_eq!(s.primary_model(), "gemini-4-neon-xhigh");
         assert_eq!(s.workspace_short(), "agent-home");
         assert_eq!(s.compaction_count(), 1);
@@ -1523,7 +2585,7 @@ mod tests {
 
     #[test]
     fn test_cache_miss_stats() {
-        let s = SessionInfo {
+        let mut s = SessionInfo {
             conversation_id: "m".into(),
             title: "m".into(),
             workspace: "".into(),
@@ -1537,7 +2599,7 @@ mod tests {
                 TurnRecord {
                     step_index: 1,
                     timestamp_utc: None,
-                    model: "m".into(),
+                    model: intern_str("m"),
                     is_checkpoint: false,
                     input_tokens: 40_000,
                     cache_read_tokens: 0,
@@ -1545,7 +2607,7 @@ mod tests {
                     cache_write_1h_tokens: 0,
                     output_tokens: 500,
                     reasoning_tokens: 0,
-                    tool_names: Vec::new(),
+                    tool_names: Box::new([]),
                     thinking_chars: 0,
                     gen_secs: None,
                     cost: CostBreakdown::default(),
@@ -1554,7 +2616,7 @@ mod tests {
                 TurnRecord {
                     step_index: 2,
                     timestamp_utc: None,
-                    model: "m".into(),
+                    model: intern_str("m"),
                     is_checkpoint: false,
                     input_tokens: 2_000,
                     cache_read_tokens: 40_000,
@@ -1562,7 +2624,7 @@ mod tests {
                     cache_write_1h_tokens: 0,
                     output_tokens: 500,
                     reasoning_tokens: 0,
-                    tool_names: Vec::new(),
+                    tool_names: Box::new([]),
                     thinking_chars: 0,
                     gen_secs: None,
                     cost: CostBreakdown::default(),
@@ -1571,7 +2633,7 @@ mod tests {
                 TurnRecord {
                     step_index: 3,
                     timestamp_utc: None,
-                    model: "m".into(),
+                    model: intern_str("m"),
                     is_checkpoint: false,
                     input_tokens: 180_000,
                     cache_read_tokens: 5_000,
@@ -1579,19 +2641,25 @@ mod tests {
                     cache_write_1h_tokens: 0,
                     output_tokens: 800,
                     reasoning_tokens: 0,
-                    tool_names: Vec::new(),
+                    tool_names: Box::new([]),
                     thinking_chars: 0,
                     gen_secs: None,
                     cost: CostBreakdown::default(),
                 },
-            ],
+            ]
+            .into(),
             counts: TokenCounts::default(),
             models: BTreeSet::new(),
             first_time: None,
             last_time: None,
             last_file_mtime_utc: None,
             is_running_hint: false,
+            primary_model: intern_str("-"),
+            active_duration_secs: 0,
+            compaction_count: 0,
+            thinking_turns: 0,
         };
+        s.recompute_summary();
         assert_eq!(s.cache_miss_stats(), (1, 180_000));
         assert_eq!(s.latest_context(), 185_000);
 
@@ -2044,6 +3112,437 @@ mod tests {
         let snap4 = scanner.scan();
         assert!(snap4.session_meta_changed);
         assert!(snap4.session_meta.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_local_tz_cache_and_intern_str() {
+        let a = intern_str("gemini-4-neon-xhigh");
+        let b = intern_str("gemini-4-neon-xhigh");
+        assert!(Arc::ptr_eq(&a, &b));
+
+        let mut tz = LocalTzCache::new();
+        for ts_str in [
+            "2026-01-15T00:00:00Z",
+            "2026-03-08T09:59:59Z",
+            "2026-03-08T10:00:00Z",
+            "2026-07-01T18:30:45Z",
+            "2026-11-01T08:30:00Z",
+            "2026-11-27T04:15:12Z",
+        ] {
+            let utc = DateTime::parse_from_rfc3339(ts_str)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(tz.to_local(utc), utc.with_timezone(&Local));
+        }
+    }
+
+    #[test]
+    fn test_scan_if_changed_noop_append_and_running_decay() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join(format!(
+            "agy_gauge_scan_delta_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let cid = "delta-sess-1";
+        let logs = base
+            .join("brain")
+            .join(cid)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let t_path = logs.join("transcript.jsonl");
+        let line1 = r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T04:00:00Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":2000,"output_tokens":300}"#;
+        fs::write(&t_path, format!("{line1}\n")).unwrap();
+
+        let meta_path = base.join("session_meta.json");
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None)
+            .with_session_meta(Some(meta_path));
+
+        let mut snap = scanner.scan();
+        assert_eq!(snap.sessions.len(), 1);
+        assert_eq!(snap.agg.total.calls, 1);
+        let turns_ptr_before = Arc::as_ptr(&snap.sessions[0].turns);
+
+        // Zero-change poll -> no-op delta, identical Arc pointer!
+        let d_noop = scanner.scan_if_changed(&mut snap);
+        assert_eq!(
+            d_noop,
+            ScanDelta {
+                changed: false,
+                running_changed: false,
+                files_reparsed: 0,
+            }
+        );
+        assert_eq!(Arc::as_ptr(&snap.sessions[0].turns), turns_ptr_before);
+
+        // Pin session via session_meta -> updates in place without reparsing files!
+        assert!(scanner.toggle_session_pin(cid).unwrap());
+        let d_meta = scanner.scan_if_changed(&mut snap);
+        assert!(d_meta.changed);
+        assert_eq!(d_meta.files_reparsed, 0);
+        assert!(snap.session_meta.get(cid).is_some_and(|m| m.pinned));
+        assert_eq!(Arc::as_ptr(&snap.sessions[0].turns), turns_ptr_before);
+
+        // Append turn 2 -> detected via byte-offset tailing, files_reparsed == 1.
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&t_path).unwrap();
+            writeln!(
+                f,
+                r#"{{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T04:01:00Z","model":"gemini-4-neon-xhigh","input_tokens":500,"cache_read_tokens":3000,"output_tokens":200}}"#
+            )
+            .unwrap();
+        }
+        let d_append = scanner.scan_if_changed(&mut snap);
+        assert!(d_append.changed);
+        assert_eq!(d_append.files_reparsed, 1);
+        assert_eq!(snap.agg.total.calls, 2);
+        assert_eq!(snap.sessions[0].active_duration_secs(), 60);
+
+        // Simulate running-hint expiry in place without any file modification.
+        assert!(snap.sessions[0].is_running_hint);
+        scanner.active_running[0].mtime_utc =
+            Some(Utc::now() - chrono::Duration::seconds(RUNNING_STEP_STALE_SECS + 60));
+        let d_decay = scanner.scan_if_changed(&mut snap);
+        assert!(!d_decay.changed);
+        assert!(d_decay.running_changed);
+        assert_eq!(d_decay.files_reparsed, 0);
+        assert!(!snap.sessions[0].is_running_hint);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_archive_debounce_flush_and_watched_dirs() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join(format!(
+            "agy_gauge_debounce_watch_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("antigravity-cli");
+        let logs = root
+            .join("brain")
+            .join("deb-sess")
+            .join(".system_generated")
+            .join("logs");
+        let convs_sqlite_dir = root.join("conversations");
+        let companion_dir = base.join("companion");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&convs_sqlite_dir).unwrap();
+        fs::create_dir_all(&companion_dir).unwrap();
+
+        let t_path = logs.join("transcript.jsonl");
+        let arch_path = companion_dir.join("archive.json");
+        let pricing_path = companion_dir.join("pricing.json");
+        fs::write(
+            &t_path,
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-26T04:00:00Z\",\"model\":\"gemini-4-neon-xhigh\",\"input_tokens\":1000,\"cache_read_tokens\":0,\"output_tokens\":100}\n",
+        )
+        .unwrap();
+
+        let mut scanner = IncrementalScanner::new_multi(
+            vec![(SourceKind::Cli, root.clone())],
+            Some(pricing_path),
+            None,
+            None,
+            Some(arch_path.clone()),
+            true,
+        );
+
+        // watched_dirs must include brain + companion dir, and NEVER conversations/ (SQLite WAL)!
+        let watched = scanner.watched_dirs();
+        assert!(watched.iter().any(|p| p == &root.join("brain")));
+        assert!(watched.iter().any(|p| p == &companion_dir));
+        assert!(!watched.iter().any(|p| p == &convs_sqlite_dir));
+
+        // First dirty scan persists archive.json immediately.
+        let mut snap = scanner.scan();
+        assert_eq!(snap.agg.total.calls, 1);
+        let raw1: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&arch_path).unwrap()).unwrap();
+        assert_eq!(raw1["schema_version"], 1);
+        assert_eq!(raw1["sessions"]["deb-sess"]["turns"].as_array().unwrap().len(), 1);
+
+        // Append turn 2 immediately (<120s debounce): in-memory snapshot updates, disk write deferred!
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&t_path).unwrap();
+            writeln!(
+                f,
+                r#"{{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T04:02:00Z","model":"gemini-4-neon-xhigh","input_tokens":500,"cache_read_tokens":1000,"output_tokens":50}}"#
+            )
+            .unwrap();
+        }
+        let d = scanner.scan_if_changed(&mut snap);
+        assert!(d.changed);
+        assert_eq!(snap.agg.total.calls, 2);
+        let raw2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&arch_path).unwrap()).unwrap();
+        assert_eq!(
+            raw2["sessions"]["deb-sess"]["turns"].as_array().unwrap().len(),
+            1,
+            "second write within 120s should be debounced"
+        );
+
+        // Explicit flush_archive writes turn 2 immediately!
+        scanner.flush_archive();
+        let raw3: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&arch_path).unwrap()).unwrap();
+        assert_eq!(raw3["sessions"]["deb-sess"]["turns"].as_array().unwrap().len(), 2);
+
+        drop(scanner);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_filter_snapshot_range_pruning_and_arc_reuse() {
+        let base = std::env::temp_dir().join(format!(
+            "agy_gauge_filter_arc_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let s1_logs = base
+            .join("brain")
+            .join("sess-whole")
+            .join(".system_generated")
+            .join("logs");
+        let s2_logs = base
+            .join("brain")
+            .join("sess-straddle")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&s1_logs).unwrap();
+        fs::create_dir_all(&s2_logs).unwrap();
+
+        fs::write(
+            s1_logs.join("transcript.jsonl"),
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-20T06:00:00Z\",\"model\":\"gemini-4-neon-xhigh\",\"input_tokens\":1000,\"cache_read_tokens\":0,\"output_tokens\":200}\n",
+        )
+        .unwrap();
+        fs::write(
+            s2_logs.join("transcript.jsonl"),
+            [
+                r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-18T06:00:00Z","model":"claude-opus-5-5","input_tokens":500,"cache_read_tokens":0,"output_tokens":100}"#,
+                r#"{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T08:00:00Z","model":"gemini-4-neon-xhigh","input_tokens":800,"cache_read_tokens":0,"output_tokens":150,"thinking":"yes"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut scanner = IncrementalScanner::new_with_pricing(base.clone(), None);
+        let snap = scanner.scan();
+        let orig_whole = snap
+            .sessions
+            .iter()
+            .find(|s| s.conversation_id == "sess-whole")
+            .unwrap();
+
+        let d20 = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let (filtered, f_agg) =
+            filter_snapshot_range(&snap, DateScope::Custom, Some(d20), Some(d20));
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(f_agg.total.calls, 2);
+
+        let f_whole = filtered
+            .iter()
+            .find(|s| s.conversation_id == "sess-whole")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&orig_whole.turns, &f_whole.turns),
+            "wholly-in-range session should reuse Arc<[TurnRecord]> without cloning turns"
+        );
+
+        let f_straddle = filtered
+            .iter()
+            .find(|s| s.conversation_id == "sess-straddle")
+            .unwrap();
+        assert_eq!(f_straddle.turns.len(), 1);
+        assert_eq!(f_straddle.primary_model(), "gemini-4-neon-xhigh");
+        assert_eq!(f_straddle.thinking_turns(), 1);
+        assert_eq!(f_straddle.active_duration_secs(), 15);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_scan_with_hints_single_file_companion_delete_overflow_and_expire_only() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join(format!(
+            "agy_gauge_hints_r2_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("antigravity-cli");
+        let s1_logs = root
+            .join("brain")
+            .join("hint-s1")
+            .join(".system_generated")
+            .join("logs");
+        let s2_logs = root
+            .join("brain")
+            .join("hint-s2")
+            .join(".system_generated")
+            .join("logs");
+        let ann_dir = root.join("annotations");
+        let comp_dir = base.join("companion");
+        fs::create_dir_all(&s1_logs).unwrap();
+        fs::create_dir_all(&s2_logs).unwrap();
+        fs::create_dir_all(&ann_dir).unwrap();
+        fs::create_dir_all(&comp_dir).unwrap();
+
+        let t1 = s1_logs.join("transcript.jsonl");
+        let t2 = s2_logs.join("transcript.jsonl");
+        let sl_path = comp_dir.join("statusline_state.json");
+        let meta_path = comp_dir.join("session_meta.json");
+
+        fs::write(
+            &t1,
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-27T01:00:00Z\",\"model\":\"gemini-4-neon-xhigh\",\"input_tokens\":1000,\"cache_read_tokens\":0,\"output_tokens\":200}\n",
+        )
+        .unwrap();
+        fs::write(
+            &t2,
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-27T01:05:00Z\",\"model\":\"claude-opus-5-5\",\"input_tokens\":500,\"cache_read_tokens\":0,\"output_tokens\":100}\n",
+        )
+        .unwrap();
+
+        let mut scanner = IncrementalScanner::new_multi(
+            vec![(SourceKind::Cli, root.clone())],
+            None,
+            Some(sl_path.clone()),
+            None,
+            None,
+            false,
+        )
+        .with_session_meta(Some(meta_path));
+
+        let mut snap = scanner.scan();
+        assert_eq!(snap.sessions.len(), 2);
+        assert_eq!(snap.agg.total.calls, 2);
+        let s2_turns_ptr = Arc::as_ptr(
+            &snap
+                .sessions
+                .iter()
+                .find(|s| s.conversation_id == "hint-s2")
+                .unwrap()
+                .turns,
+        );
+
+        // 1) Companion-only hint (`has_companion_change: true`, empty `paths`):
+        // refreshes statusline in place with 0 adapter scans!
+        fs::write(
+            &sl_path,
+            r#"{"schema_version":1,"captured_at":"2026-11-27T01:10:00Z","payload":{"model":{"display_name":"Gemini 4 Neon"},"context_window":{"used_percentage":42.0},"quota":{}}}"#,
+        )
+        .unwrap();
+        let d_comp = scanner.scan_with_hints(
+            &mut snap,
+            &ScanHints {
+                paths: Vec::new(),
+                overflow: false,
+                has_companion_change: true,
+            },
+        );
+        assert!(d_comp.changed);
+        assert_eq!(d_comp.files_reparsed, 0);
+        assert!(snap.statusline_changed);
+        assert_eq!(
+            snap.statusline.as_ref().map(|s| s.model_display.as_str()),
+            Some("Gemini 4 Neon")
+        );
+
+        // 2) Targeted single-file append hint on s1 -> reparses ONLY s1 via AdapterPoll::Delta,
+        // leaving s2's single shared priced Arc<[TurnRecord]> pointer untouched!
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&t1).unwrap();
+            writeln!(
+                f,
+                r#"{{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-27T01:12:00Z","model":"gemini-4-neon-xhigh","input_tokens":800,"cache_read_tokens":1000,"output_tokens":150}}"#
+            )
+            .unwrap();
+        }
+        let d_single = scanner.scan_with_hints(
+            &mut snap,
+            &ScanHints {
+                paths: vec![t1.clone()],
+                overflow: false,
+                has_companion_change: false,
+            },
+        );
+        assert!(d_single.changed);
+        assert_eq!(d_single.files_reparsed, 1);
+        assert_eq!(snap.agg.total.calls, 3);
+        let s2_after_ptr = Arc::as_ptr(
+            &snap
+                .sessions
+                .iter()
+                .find(|s| s.conversation_id == "hint-s2")
+                .unwrap()
+                .turns,
+        );
+        assert_eq!(s2_turns_ptr, s2_after_ptr);
+
+        // 3) Targeted annotation update on s1 -> updates title via Delta with 0 transcript reparses!
+        let ann1 = ann_dir.join("hint-s1.pbtxt");
+        fs::write(&ann1, "title:\"Hinted Title\"\n").unwrap();
+        let d_ann = scanner.scan_with_hints(
+            &mut snap,
+            &ScanHints {
+                paths: vec![ann1],
+                overflow: false,
+                has_companion_change: false,
+            },
+        );
+        assert!(d_ann.changed);
+        assert_eq!(d_ann.files_reparsed, 0);
+        assert_eq!(
+            snap.sessions
+                .iter()
+                .find(|s| s.conversation_id == "hint-s1")
+                .unwrap()
+                .title,
+            "Hinted Title"
+        );
+
+        // 4) Zero-syscall expire_running_hints_only clears stale running hints in place!
+        assert!(snap.sessions.iter().any(|s| s.is_running_hint));
+        for e in &mut scanner.active_running {
+            e.mtime_utc = Some(Utc::now() - chrono::Duration::seconds(RUNNING_STEP_STALE_SECS + 60));
+        }
+        assert!(scanner.expire_running_hints_only(&mut snap));
+        assert!(snap.sessions.iter().all(|s| !s.is_running_hint));
+        assert!(!scanner.expire_running_hints_only(&mut snap));
+
+        // 5) Deletion hint falls back cleanly to full sweep and evicts deleted s2!
+        fs::remove_file(&t2).unwrap();
+        let d_del = scanner.scan_with_hints(
+            &mut snap,
+            &ScanHints {
+                paths: vec![t2],
+                overflow: false,
+                has_companion_change: false,
+            },
+        );
+        assert!(d_del.changed);
+        assert_eq!(snap.sessions.len(), 1);
+        assert_eq!(snap.sessions[0].conversation_id, "hint-s1");
+
+        // 6) Overflow hint falls back cleanly to scan_if_changed (no-op when nothing changed).
+        let d_ov = scanner.scan_with_hints(
+            &mut snap,
+            &ScanHints {
+                paths: Vec::new(),
+                overflow: true,
+                has_companion_change: false,
+            },
+        );
+        assert!(!d_ov.changed);
+        assert_eq!(d_ov.files_reparsed, 0);
 
         let _ = fs::remove_dir_all(&base);
     }
