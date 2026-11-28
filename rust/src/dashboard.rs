@@ -2268,13 +2268,13 @@ impl DashboardView {
                 fmt_duration_short(g as u64)
             ),
             (None, _) if s.source.agent_family() != AgentFamily::Antigravity => {
-                "- (当前日志无生成耗时记录)".to_string()
+                "- (当前日志无总耗时记录)".to_string()
             }
             (None, _) => "- (纯回复 / 压缩步骤无结束时间)".to_string(),
         };
         let thinking_disp = format_turn_thinking(t).unwrap_or_else(|| "无".to_string());
         format!(
-            "调用明细 · {} · Step #{}\n- 时间: {} | 来源: {} | 会话: {} | 模型: {}{}\n- 估算 API 费用: {}\n- 总 Token: {} | 新输入: {} | 输出: {} | 缓存读: {} (命中 {:.1}%) | 缓存写: {}\n- 生成耗时: {}\n- 工具({}): {} | 思考: {} | 距上一步: {}",
+            "调用明细 · {} · Step #{}\n- 时间: {} | 来源: {} | 会话: {} | 模型: {}{}\n- 估算 API 费用: {}\n- 总 Token: {} | 新输入: {} | 输出: {} | 缓存读: {} (命中 {:.1}%) | 缓存写: {}\n- 总耗时: {}\n- 工具({}): {} | 思考: {} | 距上一步: {}",
             self.format_session_title(s),
             t.step_index,
             time,
@@ -7781,8 +7781,8 @@ impl DashboardView {
                         format!("缓存读 : {} ({:.1}%)", fmt_commas(t.cache_read_tokens), t.cache_hit_rate()),
                     ];
                     match (t.gen_secs, t.output_tps()) {
-                        (Some(g), Some(v)) => tip.push(format!("生成   : {} ({:.0} tok/s)", fmt_duration_short(g as u64), v)),
-                        (Some(g), None) => tip.push(format!("生成   : {}", fmt_duration_short(g as u64))),
+                        (Some(g), Some(v)) => tip.push(format!("总耗时 : {} ({:.0} tok/s)", fmt_duration_short(g as u64), v)),
+                        (Some(g), None) => tip.push(format!("总耗时 : {}", fmt_duration_short(g as u64))),
                         (None, _) => {}
                     }
                     if !t.tool_names.is_empty() {
@@ -7898,7 +7898,7 @@ impl DashboardView {
             (CallSort::Total, "总Token", 54.0),
             (CallSort::Input, "新输入", 46.0),
             (CallSort::Output, "输出", 38.0),
-            (CallSort::Duration, "耗时", 38.0),
+            (CallSort::Duration, "总耗时", 46.0),
         ];
         let mut sx = top_c.right - 14.0;
         for (so, lbl, sw) in sorts.iter().rev() {
@@ -7977,7 +7977,7 @@ impl DashboardView {
         let scroll_rows = self.scroll_rows;
 
         const MCOLS: [(&str, f32, f32); 7] = [
-            ("耗时", 40.0, 4.0),
+            ("总耗时", 48.0, 4.0),
             ("tok/s", 42.0, 10.0),
             ("总Token", 62.0, 4.0),
             ("新输入", 56.0, 4.0),
@@ -8093,9 +8093,9 @@ impl DashboardView {
                 let mut line_cost = format!("{} · {} · {}", time, t.model, cost);
                 match (t.gen_secs, t.output_tps()) {
                     (Some(g), Some(v)) => {
-                        line_cost.push_str(&format!(" · 生成 {} · {:.0} tok/s", fmt_duration_short(g as u64), v))
+                        line_cost.push_str(&format!(" · 总耗时 {} · {:.0} tok/s", fmt_duration_short(g as u64), v))
                     }
-                    (Some(g), None) => line_cost.push_str(&format!(" · 生成 {}", fmt_duration_short(g as u64))),
+                    (Some(g), None) => line_cost.push_str(&format!(" · 总耗时 {}", fmt_duration_short(g as u64))),
                     (None, _) => {}
                 }
                 if let Some(g) = r.gap_secs.map(fmt_gap).filter(|g| !g.is_empty()) {
@@ -9737,15 +9737,15 @@ mod tests {
         assert!(!t_plain.has_thinking());
         assert_eq!(format_turn_thinking(&t_plain), None);
 
-        // Clipboard notes: non-AGY turn with gen_secs=None uses "当前日志无生成耗时记录" & reasoning tokens
+        // Clipboard notes: non-AGY turn with gen_secs=None uses "当前日志无总耗时记录" & reasoning tokens
         let view = DashboardView::new(false, DateScope::All, false, true, false);
         let codex_clip = view.format_call_detail_clipboard(&s_codex, &s_codex.turns[0], None);
-        assert!(codex_clip.contains("当前日志无生成耗时记录"));
+        assert!(codex_clip.contains("- 总耗时: - (当前日志无总耗时记录)"));
         assert!(codex_clip.contains("思考: 1,250 tok"));
         assert!(!codex_clip.contains("1,250 字"));
 
         let agy_clip = view.format_call_detail_clipboard(&s_agy, &s_agy.turns[0], None);
-        assert!(agy_clip.contains("纯回复 / 压缩步骤无结束时间"));
+        assert!(agy_clip.contains("- 总耗时: - (纯回复 / 压缩步骤无结束时间)"));
         assert!(agy_clip.contains("思考: 420 字"));
     }
 
